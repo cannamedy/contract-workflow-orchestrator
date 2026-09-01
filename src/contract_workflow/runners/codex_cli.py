@@ -37,7 +37,7 @@ class CodexCliRunner:
             merged_env.update(env)
         try:
             with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
-                process = subprocess.Popen(command, cwd=str(cwd), stdin=stdin, stdout=stdout, stderr=stderr, env=merged_env)
+                process = subprocess.Popen(command, cwd=str(cwd), stdin=stdin, stdout=stdout, stderr=stderr, env=merged_env, text=True, encoding="utf-8")
                 try:
                     process.communicate(None if stdin is None else prompt, timeout=timeout)
                 except subprocess.TimeoutExpired:

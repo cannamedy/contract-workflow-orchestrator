@@ -14,7 +14,7 @@ from contract_workflow.models import Stage, Verdict, WorkflowState
 from contract_workflow.orchestrator import Orchestrator
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
-from contract_workflow.runners import MockRunner
+from contract_workflow.runners import CodexCliRunner, MockRunner
 from contract_workflow.state_machine import transition_after_outcome
 from contract_workflow.state_store import StateStore, StateStoreError
 
@@ -138,6 +138,29 @@ groups:
         self.assertIn("ORCHESTRATOR OUTPUT CONTRACT", prompt)
         self.assertIn("CURRENT STAGE: TASK_EXECUTION", prompt)
         self.assertIn("outcome.json", prompt)
+        self.assertIn("Use APPROVED when the requested implementation and tests are complete", prompt)
+
+    def test_prompt_builder_expands_task_scope_and_keeps_review_independent(self):
+        config = self.workflow()
+        task = config.groups[0].tasks[0].__class__("t", ("calculator.py",), ("tests/**",))
+        config = config.__class__(**{**config.__dict__, "groups": (config.groups[0].__class__("g", (task,)),)})
+        execution = WorkflowState(project="test-project", current_stage=Stage.TASK_EXECUTION.value, current_group="g", current_task="t", last_outcome={"summary": "untrusted execution prose"})
+        execution_prompt = PromptBuilder().build(config, execution, self.root / "run" / "outcome.json")
+        self.assertIn("- calculator.py", execution_prompt)
+        self.assertIn("- tests/**", execution_prompt)
+        review = WorkflowState(project="test-project", current_stage=Stage.TASK_INDEPENDENT_REVIEW.value, current_group="g", current_task="t", last_outcome={"summary": "untrusted execution prose"})
+        review_prompt = PromptBuilder().build(config, review, self.root / "review" / "outcome.json")
+        self.assertIn("not provided to preserve review independence", review_prompt)
+        self.assertNotIn("untrusted execution prose", review_prompt)
+
+    def test_codex_cli_runner_passes_text_prompt_over_stdin(self):
+        run_dir = self.root / "codex-run"
+        run_dir.mkdir()
+        runner = CodexCliRunner(command=f'{os.sys.executable} -c "import sys; sys.stdin.read(); print(\'ok\')"')
+        result = runner.run(self.project, "prompt text", run_dir, timeout=5)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
+        self.assertEqual((run_dir / "stdout.log").read_text(encoding="utf-8").strip(), "ok")
 
     def test_plan_task_defect_e2e_stops_at_plan_freeze(self):
         outcomes = "    TASK_EXECUTION: {verdict: APPROVED}\n    TASK_INDEPENDENT_REVIEW: {verdict: PLAN_TASK_DEFECT}\n    PLAN_DEFECT_RESOLUTION: {verdict: APPROVED}\n    PLAN_REVISION_REVIEW: {verdict: APPROVED}\n    FINAL_VERIFICATION: {verdict: COMPLETED}\n"
