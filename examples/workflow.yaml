@@ -1,0 +1,27 @@
+version: "1"
+project:
+  name: generic-example
+  path: .
+mode: gated
+authoritative_sources: []
+skills: {}
+runner:
+  type: mock
+  mock_outcomes:
+    TASK_EXECUTION: {verdict: APPROVED}
+    TASK_INDEPENDENT_REVIEW: {verdict: APPROVED}
+    FINAL_VERIFICATION: {verdict: COMPLETED}
+policy:
+  auto_patch: true
+  auto_rereview: true
+  auto_plan_defect_resolution: true
+  auto_plan_revision_review: true
+  auto_commit_checkpoint: false
+  auto_push: false
+  auto_tag: false
+  max_attempts_per_stage: 3
+  max_total_steps: 100
+groups:
+  - id: example
+    tasks:
+      - id: example-task

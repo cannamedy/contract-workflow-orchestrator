@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CWO Agent Outcome",
+  "type": "object",
+  "required": ["schema_version", "run_id", "stage", "verdict", "blocking", "project", "group", "task", "issues", "changed_files", "tests", "next_action", "summary"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "run_id": {"type": "string", "minLength": 1},
+    "stage": {"type": "string"},
+    "verdict": {"enum": ["APPROVED", "REQUIRES_PATCH", "PLAN_TASK_DEFECT", "OPEN_CONTRACT_ISSUE", "ARCHITECTURE_DECISION_REQUIRED", "PLAN_EXPANSION_REQUIRED", "SECURITY_SENSITIVE_ACTION", "DESTRUCTIVE_ACTION_REQUIRED", "UNAUTHORIZED_EXTERNAL_SIDE_EFFECT", "FROZEN_SOURCE_MISMATCH", "RUNNER_FAILURE", "INVALID_OUTCOME", "COMPLETED"]},
+    "blocking": {"type": "boolean"},
+    "project": {"type": "string"}, "group": {"type": ["string", "null"]}, "task": {"type": ["string", "null"]},
+    "issues": {"type": "array", "items": {"type": "object", "required": ["type", "severity", "requirement_ids", "message", "blocking", "recommended_stage"]}},
+    "changed_files": {"type": "array"}, "tests": {"type": "array"}, "next_action": {"type": "string"}, "summary": {"type": "string"}
+  },
+  "additionalProperties": true
+}

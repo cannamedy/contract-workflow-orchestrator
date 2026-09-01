@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contract-workflow-orchestrator"
+version = "0.1.0"
+description = "A project-neutral, safety-first contract workflow orchestrator."
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0"]
+
+[project.scripts]
+cwo = "contract_workflow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
