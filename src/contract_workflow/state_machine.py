@@ -35,8 +35,8 @@ def _next_task(config: WorkflowConfig, group: str | None, task: str | None) -> t
     return tasks[index] if index < len(tasks) else None
 
 
-def _enter_hard_stop(state: WorkflowState, reason: str) -> StepResult:
-    new_state = _update(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason)
+def _enter_hard_stop(state: WorkflowState, reason: str, stop_code: str = "HARD_STOP", recoverable: bool = False) -> StepResult:
+    new_state = _update(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code=stop_code, blocked_stage=state.current_stage, recoverable=recoverable)
     return StepResult(new_state, "hard_stop")
 
 
@@ -45,18 +45,18 @@ def transition_after_outcome(config: WorkflowConfig, state: WorkflowState, outco
     verdict = Verdict(outcome["verdict"])
     stage = Stage(state.current_stage)
     if verdict in BLOCKING_VERDICTS:
-        return _enter_hard_stop(state, f"{verdict.value}: {outcome.get('summary', '')}".strip())
+        return _enter_hard_stop(state, f"{verdict.value}: {outcome.get('summary', '')}".strip(), stop_code=verdict.value)
     if stage == Stage.TASK_EXECUTION:
         if verdict == Verdict.APPROVED:
             return StepResult(_update(state, current_stage=Stage.TASK_INDEPENDENT_REVIEW.value, last_successful_stage=stage.value, run_id=None, attempt=0, last_outcome=outcome), "transition")
     elif stage == Stage.TASK_INDEPENDENT_REVIEW:
         if verdict == Verdict.REQUIRES_PATCH:
             if not config.policy.auto_patch:
-                return _enter_hard_stop(state, "REQUIRES_PATCH but auto_patch is disabled")
+                return _enter_hard_stop(state, "REQUIRES_PATCH but auto_patch is disabled", stop_code="AUTO_PATCH_DISABLED")
             return StepResult(_update(state, current_stage=Stage.TASK_PATCH.value, last_successful_stage=stage.value, run_id=None, attempt=0, last_outcome=outcome), "transition")
         if verdict == Verdict.PLAN_TASK_DEFECT:
             if not config.policy.auto_plan_defect_resolution:
-                return _enter_hard_stop(state, "PLAN_TASK_DEFECT requires plan defect resolution")
+                return _enter_hard_stop(state, "PLAN_TASK_DEFECT requires plan defect resolution", stop_code="PLAN_DEFECT_RESOLUTION_DISABLED")
             return StepResult(_update(state, current_stage=Stage.PLAN_DEFECT_RESOLUTION.value, last_successful_stage=stage.value, run_id=None, attempt=0, last_outcome=outcome), "transition")
         if verdict == Verdict.APPROVED:
             if config.mode == "gated":
@@ -74,7 +74,7 @@ def transition_after_outcome(config: WorkflowConfig, state: WorkflowState, outco
     elif stage == Stage.PLAN_REVISION_REVIEW:
         if verdict == Verdict.REQUIRES_PATCH:
             if not config.policy.auto_plan_revision_review:
-                return _enter_hard_stop(state, "plan revision review patch is disabled")
+                return _enter_hard_stop(state, "plan revision review patch is disabled", stop_code="PLAN_REVIEW_PATCH_DISABLED")
             return StepResult(_update(state, current_stage=Stage.PLAN_DEFECT_RESOLUTION.value, run_id=None, attempt=0, last_outcome=outcome), "transition")
         if verdict == Verdict.APPROVED:
             return StepResult(_update(state, current_stage=Stage.HUMAN_PLAN_FREEZE.value, pending_human_gate=Stage.HUMAN_PLAN_FREEZE.value, status=WorkflowStatus.WAITING_HUMAN.value, last_successful_stage=stage.value, run_id=None, attempt=0, last_outcome=outcome), "human_gate")
@@ -83,7 +83,7 @@ def transition_after_outcome(config: WorkflowConfig, state: WorkflowState, outco
             if config.mode == "gated":
                 return StepResult(_update(state, current_stage=Stage.HUMAN_FINAL_ACCEPTANCE.value, pending_human_gate=Stage.HUMAN_FINAL_ACCEPTANCE.value, status=WorkflowStatus.WAITING_HUMAN.value, last_successful_stage=stage.value, run_id=None, attempt=0, last_outcome=outcome), "human_gate")
             return StepResult(_update(state, current_stage=Stage.COMPLETED.value, status=WorkflowStatus.COMPLETED.value, last_successful_stage=stage.value, run_id=None, attempt=0, last_outcome=outcome), "completed")
-    return _enter_hard_stop(state, f"unsupported verdict {verdict.value} for stage {stage.value}")
+    return _enter_hard_stop(state, f"unsupported verdict {verdict.value} for stage {stage.value}", stop_code="UNSUPPORTED_VERDICT")
 
 
 def transition_ready(config: WorkflowConfig, state: WorkflowState) -> StepResult:

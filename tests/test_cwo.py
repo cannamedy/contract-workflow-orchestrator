@@ -11,7 +11,7 @@ from pathlib import Path
 from contract_workflow.config import load_workflow
 from contract_workflow.git_audit import GitClassification, audit_git
 from contract_workflow.models import Stage, Verdict, WorkflowState
-from contract_workflow.orchestrator import Orchestrator
+from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
 from contract_workflow.runners import CodexCliRunner, MockRunner
@@ -200,6 +200,36 @@ groups:
         state = Orchestrator(config, runner=runner).run()
         self.assertEqual(state.current_stage, Stage.HARD_STOP.value)
         self.assertEqual(runner.calls.count(Stage.TASK_EXECUTION.value), 2)
+
+    def test_recoverable_unrelated_change_preserves_blocked_stage_and_recovers(self):
+        config = self.workflow()
+        store = StateStore(self.state)
+        store.save(WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest, current_stage=Stage.FINAL_VERIFICATION.value, current_group="g", current_task="t"))
+        (self.project / "unexpected.tmp").write_text("fixture contamination", encoding="utf-8")
+        orchestrator = Orchestrator(config, store=store, runner=MockRunner())
+        stopped = orchestrator.step().state
+        self.assertEqual(stopped.current_stage, Stage.HARD_STOP.value)
+        self.assertEqual(stopped.stop_code, "UNEXPECTED_UNRELATED_CHANGE")
+        self.assertEqual(stopped.blocked_stage, Stage.FINAL_VERIFICATION.value)
+        self.assertTrue(stopped.recoverable)
+        self.assertEqual(orchestrator.recover().current_stage, Stage.HARD_STOP.value)
+        (self.project / "unexpected.tmp").unlink()
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+        self.assertEqual(recovered.current_stage, Stage.FINAL_VERIFICATION.value)
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertIsNone(recovered.stop_code)
+        self.assertFalse(recovered.recoverable)
+        resumed = Orchestrator(config, store=store, runner=MockRunner()).step().state
+        self.assertEqual(resumed.current_stage, Stage.HUMAN_FINAL_ACCEPTANCE.value)
+
+    def test_recovery_rejects_nonrecoverable_stops(self):
+        config = self.workflow()
+        store = StateStore(self.state)
+        for code in ("OPEN_CONTRACT_ISSUE", "ARCHITECTURE_DECISION_REQUIRED", "RECOVERY_UNCERTAIN"):
+            with self.subTest(code=code):
+                store.save(WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest, current_stage=Stage.HARD_STOP.value, blocked_stage=Stage.FINAL_VERIFICATION.value, stop_code=code, stop_reason=code, recoverable=False, status="HARD_STOPPED"))
+                with self.assertRaises(OrchestratorError):
+                    Orchestrator(config, store=store).recover()
 
     def test_crash_recovery_reconciles_completed_outcome_without_runner(self):
         config = self.workflow()

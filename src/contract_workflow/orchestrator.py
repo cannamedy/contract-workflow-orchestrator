@@ -63,7 +63,7 @@ class Orchestrator:
         else:
             self.logger.emit("state_recovered", stage=state.current_stage, run_id=state.run_id)
             if state.workflow_digest != self.config.digest:
-                state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="workflow digest changed; hot reload is not supported", updated_at=now_iso())
+                state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="workflow digest changed; hot reload is not supported", stop_code="WORKFLOW_DIGEST_CHANGED", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
                 self.store.save(state)
                 self.logger.emit("hard_stop_entered", reason=state.stop_reason)
         return state
@@ -81,7 +81,7 @@ class Orchestrator:
     def step(self) -> StepResult:
         state = self._load_or_initialize()
         if state.total_steps >= self.config.policy.max_total_steps and state.status == WorkflowStatus.RUNNING.value:
-            state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, stop_reason="max_total_steps exceeded", updated_at=now_iso())
+            state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, stop_reason="max_total_steps exceeded", stop_code="MAX_TOTAL_STEPS", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
             return StepResult(self._save(state), "hard_stop")
         if state.status in {WorkflowStatus.COMPLETED.value, WorkflowStatus.HARD_STOPPED.value, WorkflowStatus.FAILED.value, WorkflowStatus.STOPPED.value} or state.current_stage in HUMAN_GATES:
             return StepResult(state, "waiting")
@@ -89,7 +89,8 @@ class Orchestrator:
         audit, integrity = self._audit_gate()
         if integrity or audit.blocking:
             reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
-            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason or audit.error or "Git audit blocked", updated_at=now_iso())
+            stop_code = "FROZEN_SOURCE_MISMATCH" if integrity else ("UNEXPECTED_UNRELATED_CHANGE" if any(item.classification.value == "UNEXPECTED_UNRELATED_CHANGE" for item in audit.changes) else ("MERGE_CONFLICT" if any(item.classification.value == "MERGE_CONFLICT" for item in audit.changes) else "GIT_AUDIT_BLOCKED"))
+            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason or audit.error or "Git audit blocked", stop_code=stop_code, blocked_stage=state.current_stage, recoverable=stop_code == "UNEXPECTED_UNRELATED_CHANGE", updated_at=now_iso())
             self.logger.emit("hard_stop_entered", reason=new_state.stop_reason)
             return StepResult(self._save(new_state), "hard_stop")
 
@@ -112,7 +113,7 @@ class Orchestrator:
                 self.logger.emit("state_recovered", run_id=state.run_id, stage=stage, reason="valid outcome reconciled")
                 return self._apply_outcome(state, outcome)
             if metadata.get("status") == "running" and not outcome_path.exists():
-                new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="RECOVERY_UNCERTAIN: prior Agent invocation has no completed artifact", updated_at=now_iso())
+                new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="RECOVERY_UNCERTAIN: prior Agent invocation has no completed artifact", stop_code="RECOVERY_UNCERTAIN", blocked_stage=stage, recoverable=False, updated_at=now_iso())
                 self.logger.emit("hard_stop_entered", reason=new_state.stop_reason)
                 return StepResult(self._save(new_state), "hard_stop")
             return self._invalid_or_failed(state, errors or ["invalid outcome"])
@@ -147,7 +148,7 @@ class Orchestrator:
     def _invalid_or_failed(self, state: WorkflowState, errors: list[str]) -> StepResult:
         self.logger.emit("outcome_invalid", run_id=state.run_id, stage=state.current_stage, errors=errors)
         if state.attempt >= self.config.policy.max_attempts_per_stage:
-            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="; ".join(errors), updated_at=now_iso())
+            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="; ".join(errors), stop_code="RETRY_EXHAUSTED", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
             self.logger.emit("hard_stop_entered", reason=new_state.stop_reason)
             return StepResult(self._save(new_state), "hard_stop")
         delay = min(self.config.policy.retry_max_delay_seconds, self.config.policy.retry_backoff_seconds * (2 ** max(0, state.attempt - 1)))
@@ -181,6 +182,26 @@ class Orchestrator:
     def stop(self, reason: str = "stopped by operator") -> WorkflowState:
         state = self._load_or_initialize()
         return self._save(stop(state, reason))
+
+    def recover(self) -> WorkflowState:
+        state = self._load_or_initialize()
+        self.logger.emit("recovery_requested", stop_code=state.stop_code, blocked_stage=state.blocked_stage)
+        if state.current_stage != Stage.HARD_STOP.value or not state.recoverable or state.stop_code != "UNEXPECTED_UNRELATED_CHANGE":
+            self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
+            raise OrchestratorError("hard stop is not recoverable")
+        if not state.blocked_stage or state.run_id is not None:
+            self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
+            raise OrchestratorError("recovery uncertainty prevents resume")
+        audit, integrity = self._audit_gate()
+        if integrity or audit.blocking:
+            reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
+            self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason or audit.error or "Git audit blocked")
+            return state
+        restored_stage = state.blocked_stage
+        self.logger.emit("recovery_validation_passed", stop_code=state.stop_code, blocked_stage=restored_stage)
+        new_state = replace(state, current_stage=restored_stage, status=WorkflowStatus.RUNNING.value, pending_human_gate=None, run_id=None, attempt=0, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False, updated_at=now_iso())
+        self.logger.emit("hard_stop_recovered", stop_code=state.stop_code, restored_stage=restored_stage)
+        return self._save(new_state)
 
     def status(self) -> WorkflowState:
         return self._load_or_initialize()

@@ -154,6 +154,9 @@ class WorkflowState:
     updated_at: str = field(default_factory=now_iso)
     status: str = WorkflowStatus.RUNNING.value
     stop_reason: str | None = None
+    stop_code: str | None = None
+    blocked_stage: str | None = None
+    recoverable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()

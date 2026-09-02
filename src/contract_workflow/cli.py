@@ -14,7 +14,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)
-    for name in ("doctor", "status", "step", "run", "resume", "approve", "stop"):
+    for name in ("doctor", "status", "step", "run", "resume", "recover", "approve", "stop"):
         command = sub.add_parser(name)
         command.add_argument("project", type=Path)
         if name == "run":
@@ -55,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
             _dump(orchestrator.status())
         elif args.command == "resume":
             _dump(orchestrator.run())
+        elif args.command == "recover":
+            _dump(orchestrator.recover())
         elif args.command == "step":
             _dump(orchestrator.step().state)
         elif args.command == "run":
