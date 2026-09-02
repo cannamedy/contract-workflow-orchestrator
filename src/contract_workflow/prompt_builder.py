@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import Stage, WorkflowConfig, WorkflowState
+from .outcome import render_outcome_contract
 
 
 DEFAULT_TEMPLATES = {
@@ -62,6 +63,7 @@ class PromptBuilder:
         values = {
             "project_path": config.project_path, "project": config.project_name, "stage": stage,
             "group": state.current_group or "", "task": state.current_task or "",
+            "run_id": state.run_id or outcome_path.parent.name,
             "skill_path": skill.path if skill else "(no Skill configured)", "frozen_authority": frozen,
             "outcome_path": str(outcome_path), "allowed_scope": allowed,
             "hard_stops": ", ".join(config.hard_stops) or "OPEN_CONTRACT_ISSUE, ARCHITECTURE_DECISION_REQUIRED, SECURITY_SENSITIVE_ACTION, DESTRUCTIVE_ACTION_REQUIRED, FROZEN_SOURCE_MISMATCH",
@@ -72,7 +74,7 @@ class PromptBuilder:
             body = template.format(**values)
         except (KeyError, ValueError):
             body = template
-        context = f"PROJECT: {config.project_name}\nPROJECT PATH: {config.project_path}\nCURRENT STAGE: {stage}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {state.run_id or outcome_path.parent.name}"
+        context = f"PROJECT: {config.project_name}\nPROJECT PATH: {config.project_path}\nCURRENT STAGE: {stage}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {values['run_id']}"
         return context + "\n\n" + body.rstrip() + "\n\n" + self._contract(values)
 
     @staticmethod
@@ -92,7 +94,8 @@ Hard stops: {values['hard_stops']}
 Stage verdict guidance: {values['verdict_guidance']}
 Previous issue summary: {values['previous_issue_summary']}
 
-The outcome must contain `schema_version`, `run_id`, `stage`, `verdict`, `blocking`, `project`, `group`, `task`, `issues`, `changed_files`, `tests`, `next_action`, and `summary`. Do not include private chain-of-thought.'''
+{render_outcome_contract(values['run_id'], values['stage'], values['project'], values['group'], values['task'])}
+Do not include private chain-of-thought.'''
 
 
 def _previous_issues(state: WorkflowState) -> str:

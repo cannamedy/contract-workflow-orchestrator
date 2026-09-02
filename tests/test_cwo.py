@@ -140,6 +140,51 @@ groups:
         self.assertIn("outcome.json", prompt)
         self.assertIn("Use APPROVED when the requested implementation and tests are complete", prompt)
 
+    def test_review_prompt_contains_complete_nested_issue_schema(self):
+        config = self.workflow()
+        run_id = "exact-review-run"
+        state = WorkflowState(project="test-project", current_stage=Stage.TASK_INDEPENDENT_REVIEW.value, current_group="g", current_task="t", run_id=run_id)
+        prompt = PromptBuilder().build(config, state, self.root / "run" / "outcome.json")
+        for field in ("type", "severity", "requirement_ids", "message", "blocking", "recommended_stage"):
+            self.assertIn(f'"{field}"', prompt)
+        self.assertIn(f'run_id=\"{run_id}\"', prompt)
+        self.assertIn('"stage": "TASK_INDEPENDENT_REVIEW"', prompt)
+        self.assertIn("issues: []", prompt)
+
+    def test_validate_outcome_accepts_complete_issue(self):
+        path = self.root / "outcome.json"
+        issue = {
+            "type": "IMPLEMENTATION_DEFECT",
+            "severity": "medium",
+            "requirement_ids": ["REQ-001"],
+            "message": "specific issue",
+            "blocking": False,
+            "recommended_stage": "TASK_PATCH",
+        }
+        value = make_outcome("r", Stage.TASK_INDEPENDENT_REVIEW.value, "p", "REQUIRES_PATCH", issues=[issue])
+        path.write_text(json.dumps(value), encoding="utf-8")
+        self.assertEqual(validate_outcome(path, "r", Stage.TASK_INDEPENDENT_REVIEW.value)[0], True)
+
+    def test_validate_outcome_rejects_issue_missing_each_required_field(self):
+        required = ("type", "severity", "requirement_ids", "message", "blocking", "recommended_stage")
+        for missing in required:
+            with self.subTest(missing=missing):
+                path = self.root / f"outcome-{missing}.json"
+                issue = {
+                    "type": "IMPLEMENTATION_DEFECT",
+                    "severity": "medium",
+                    "requirement_ids": ["REQ-001"],
+                    "message": "specific issue",
+                    "blocking": False,
+                    "recommended_stage": "TASK_PATCH",
+                }
+                issue.pop(missing)
+                value = make_outcome("r", Stage.TASK_INDEPENDENT_REVIEW.value, "p", "REQUIRES_PATCH", issues=[issue])
+                path.write_text(json.dumps(value), encoding="utf-8")
+                valid, _, errors = validate_outcome(path, "r", Stage.TASK_INDEPENDENT_REVIEW.value)
+                self.assertFalse(valid)
+                self.assertIn(f"issues[0] missing field: {missing}", errors)
+
     def test_prompt_builder_expands_task_scope_and_keeps_review_independent(self):
         config = self.workflow()
         task = config.groups[0].tasks[0].__class__("t", ("calculator.py",), ("tests/**",))
@@ -221,6 +266,60 @@ groups:
         self.assertFalse(recovered.recoverable)
         resumed = Orchestrator(config, store=store, runner=MockRunner()).step().state
         self.assertEqual(resumed.current_stage, Stage.HUMAN_FINAL_ACCEPTANCE.value)
+
+    def test_schema_recovery_restores_exact_read_only_stage_without_coding(self):
+        config = self.workflow()
+        store = StateStore(self.state)
+        run_id = "invalid-review-run"
+        run_dir = store.run_dir(run_id)
+        invalid = make_outcome(
+            run_id, Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name, "REQUIRES_PATCH",
+            group="g", task="t", issues=[{"severity": "medium", "requirement_ids": [], "blocking": True}],
+        )
+        run_dir.joinpath("outcome.json").write_text(json.dumps(invalid), encoding="utf-8")
+        run_dir.joinpath("metadata.json").write_text(json.dumps({
+            "run_id": run_id, "stage": Stage.TASK_INDEPENDENT_REVIEW.value, "status": "completed",
+            "started_at": "2026-01-01T00:00:00+00:00", "finished_at": "2026-01-01T00:01:00+00:00",
+            "exit_code": 0, "timed_out": False,
+        }), encoding="utf-8")
+        state = WorkflowState(
+            project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file,
+            workflow_digest=config.digest, current_stage=Stage.HARD_STOP.value,
+            current_group="g", current_task="t", run_id=run_id, attempt=3,
+            last_successful_stage=Stage.TASK_EXECUTION.value,
+            last_outcome=make_outcome("prior", Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name, "INVALID_OUTCOME"),
+            stop_code="RETRY_EXHAUSTED", stop_reason="issues[0] missing field: type", status="HARD_STOPPED",
+        )
+        store.save(state)
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+        self.assertEqual(recovered.current_stage, Stage.TASK_INDEPENDENT_REVIEW.value)
+        self.assertEqual(recovered.attempt, 0)
+        self.assertIsNone(recovered.run_id)
+        self.assertEqual(recovered.status, "RUNNING")
+
+    def test_schema_recovery_rejects_running_or_non_schema_latest_run(self):
+        config = self.workflow()
+        for status, exit_code, timed_out in (("running", 0, False), ("completed", 1, False)):
+            with self.subTest(status=status, exit_code=exit_code):
+                store = StateStore(self.state / f"{status}-{exit_code}")
+                run_id = "unsafe-run"
+                run_dir = store.run_dir(run_id)
+                run_dir.joinpath("outcome.json").write_text(json.dumps(make_outcome(run_id, Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name, "REQUIRES_PATCH", issues=[])), encoding="utf-8")
+                run_dir.joinpath("metadata.json").write_text(json.dumps({
+                    "run_id": run_id, "stage": Stage.TASK_INDEPENDENT_REVIEW.value, "status": status,
+                    "started_at": "2026-01-01T00:00:00+00:00", "finished_at": "2026-01-01T00:01:00+00:00",
+                    "exit_code": exit_code, "timed_out": timed_out,
+                }), encoding="utf-8")
+                store.save(WorkflowState(
+                    project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file,
+                    workflow_digest=config.digest, current_stage=Stage.HARD_STOP.value,
+                    blocked_stage=Stage.TASK_INDEPENDENT_REVIEW.value, run_id=run_id, attempt=3,
+                    last_successful_stage=Stage.TASK_EXECUTION.value,
+                    last_outcome=make_outcome("prior", Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name, "INVALID_OUTCOME"),
+                    stop_code="RETRY_EXHAUSTED", stop_reason="schema validation failed", status="HARD_STOPPED",
+                ))
+                with self.assertRaises(OrchestratorError):
+                    Orchestrator(config, store=store).recover()
 
     def test_recovery_rejects_nonrecoverable_stops(self):
         config = self.workflow()

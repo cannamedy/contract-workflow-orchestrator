@@ -23,6 +23,13 @@ class OrchestratorError(RuntimeError):
     pass
 
 
+READ_ONLY_RECOVERY_STAGES = frozenset({
+    Stage.TASK_INDEPENDENT_REVIEW.value,
+    Stage.PLAN_REVISION_REVIEW.value,
+    Stage.FINAL_VERIFICATION.value,
+})
+
+
 def state_root(project: Path) -> Path:
     configured = os.environ.get("CWO_STATE_DIR")
     if configured:
@@ -186,22 +193,111 @@ class Orchestrator:
     def recover(self) -> WorkflowState:
         state = self._load_or_initialize()
         self.logger.emit("recovery_requested", stop_code=state.stop_code, blocked_stage=state.blocked_stage)
-        if state.current_stage != Stage.HARD_STOP.value or not state.recoverable or state.stop_code != "UNEXPECTED_UNRELATED_CHANGE":
+        legacy_recovery = (
+            state.recoverable
+            and state.stop_code == "UNEXPECTED_UNRELATED_CHANGE"
+        )
+        schema_recovery = state.stop_code == "RETRY_EXHAUSTED"
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or schema_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
-        if not state.blocked_stage or state.run_id is not None:
+
+        if schema_recovery:
+            safety_errors = self._schema_recovery_errors(state)
+            if safety_errors:
+                reason = "; ".join(safety_errors)
+                self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+                raise OrchestratorError(reason)
+        elif not state.blocked_stage or state.run_id is not None:
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
+
         audit, integrity = self._audit_gate()
-        if integrity or audit.blocking:
+        if integrity or audit.blocking or not audit.is_repository or audit.error:
             reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
-            self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason or audit.error or "Git audit blocked")
+            reason = reason or audit.error or "Git audit blocked"
+            self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+            if schema_recovery:
+                raise OrchestratorError(reason)
             return state
         restored_stage = state.blocked_stage
+        if schema_recovery and restored_stage is None:
+            restored_stage = self._latest_completed_stage()
         self.logger.emit("recovery_validation_passed", stop_code=state.stop_code, blocked_stage=restored_stage)
         new_state = replace(state, current_stage=restored_stage, status=WorkflowStatus.RUNNING.value, pending_human_gate=None, run_id=None, attempt=0, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False, updated_at=now_iso())
         self.logger.emit("hard_stop_recovered", stop_code=state.stop_code, restored_stage=restored_stage)
         return self._save(new_state)
+
+    def _latest_completed_stage(self) -> str | None:
+        records = []
+        for metadata_path in self.store.runs_path.glob("*/metadata.json"):
+            metadata = _read_json(metadata_path)
+            if metadata:
+                records.append(metadata)
+        if not records:
+            return None
+        latest = max(
+            records,
+            key=lambda metadata: (
+                str(metadata.get("finished_at") or metadata.get("started_at") or ""),
+                str(metadata.get("run_id") or ""),
+            ),
+        )
+        stage = latest.get("stage")
+        return stage if isinstance(stage, str) else None
+
+    def _schema_recovery_errors(self, state: WorkflowState) -> list[str]:
+        errors: list[str] = []
+        blocked_stage = state.blocked_stage or self._latest_completed_stage()
+        if blocked_stage not in READ_ONLY_RECOVERY_STAGES:
+            errors.append("RETRY_EXHAUSTED recovery requires a read-only verification stage")
+        if blocked_stage == state.last_successful_stage or blocked_stage == Stage.TASK_EXECUTION.value:
+            errors.append("recovery cannot rerun the last successful mutating stage")
+        if state.stop_code == "RECOVERY_UNCERTAIN" or "RECOVERY_UNCERTAIN" in (state.stop_reason or ""):
+            errors.append("RECOVERY_UNCERTAIN prevents resume")
+        if state.workflow_digest != self.config.digest:
+            errors.append("workflow digest changed; hot reload is not supported")
+        if state.last_outcome is None or state.last_outcome.get("verdict") != Verdict.INVALID_OUTCOME.value:
+            errors.append("RETRY_EXHAUSTED recovery requires an INVALID_OUTCOME failure verdict")
+
+        records = []
+        for metadata_path in self.store.runs_path.glob("*/metadata.json"):
+            metadata = _read_json(metadata_path)
+            if metadata:
+                records.append((metadata_path, metadata))
+        if any(metadata.get("status") == "running" for _, metadata in records):
+            errors.append("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+        if not records:
+            errors.append("RECOVERY_UNCERTAIN: no run metadata found")
+            return errors
+        latest_path, latest = max(
+            records,
+            key=lambda item: (
+                str(item[1].get("finished_at") or item[1].get("started_at") or ""),
+                str(item[1].get("run_id") or ""),
+            ),
+        )
+        latest_run_id = latest.get("run_id")
+        if latest.get("status") != "completed":
+            errors.append("RECOVERY_UNCERTAIN: latest run metadata is not completed")
+        if latest.get("stage") != blocked_stage:
+            errors.append("latest completed run does not match the blocked read-only stage")
+        if state.run_id is not None and state.run_id != latest_run_id:
+            errors.append("latest completed run does not match the state run_id")
+        if not isinstance(latest_run_id, str) or not latest_run_id:
+            errors.append("RECOVERY_UNCERTAIN: latest run metadata has no run_id")
+            return errors
+        if latest.get("exit_code") != 0 or latest.get("timed_out") is not False:
+            errors.append("latest Agent run did not complete successfully")
+        outcome_path = latest_path.parent / "outcome.json"
+        valid, outcome, validation_errors = validate_outcome(outcome_path, latest_run_id, blocked_stage)
+        if not outcome_path.is_file() or outcome is None:
+            errors.append("RECOVERY_UNCERTAIN: latest completed run has no outcome artifact")
+        elif valid:
+            errors.append("latest run outcome is valid; schema recovery is not applicable")
+        elif not validation_errors:
+            errors.append("latest run outcome failed validation without a deterministic schema error")
+        return errors
 
     def status(self) -> WorkflowState:
         return self._load_or_initialize()
