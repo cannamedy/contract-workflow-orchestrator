@@ -203,6 +203,43 @@ class Orchestrator:
             raise OrchestratorError("hard stop is not recoverable")
 
         if schema_recovery:
+            late_outcome, late_errors, late_detected = self._late_outcome_check(state)
+            if late_detected:
+                self.logger.emit(
+                    "late_outcome_detected",
+                    run_id=state.run_id,
+                    blocked_stage=state.blocked_stage,
+                    verdict=late_outcome.get("verdict") if late_outcome else None,
+                    resulting_stage=None,
+                )
+                if late_errors:
+                    reason = "; ".join(late_errors)
+                    self.logger.emit("late_outcome_validated", run_id=state.run_id, blocked_stage=state.blocked_stage, verdict=late_outcome.get("verdict") if late_outcome else None, resulting_stage=None, valid=False, reason=reason)
+                    self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+                    raise OrchestratorError(reason)
+                audit, integrity = self._audit_gate()
+                if integrity or audit.blocking or not audit.is_repository or audit.error:
+                    reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
+                    reason = reason or audit.error or "Git audit blocked"
+                    self.logger.emit("late_outcome_validated", run_id=state.run_id, blocked_stage=state.blocked_stage, verdict=late_outcome["verdict"], resulting_stage=None, valid=False, reason=reason)
+                    self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+                    raise OrchestratorError(reason)
+                reconciled = replace(
+                    state,
+                    current_stage=state.blocked_stage,
+                    status=WorkflowStatus.RUNNING.value,
+                    pending_human_gate=None,
+                    stop_reason=None,
+                    stop_code=None,
+                    blocked_stage=None,
+                    recoverable=False,
+                )
+                result = transition_after_outcome(self.config, reconciled, late_outcome)
+                self.logger.emit("late_outcome_validated", run_id=state.run_id, blocked_stage=reconciled.current_stage, verdict=late_outcome["verdict"], resulting_stage=result.state.current_stage, valid=True)
+                self.logger.emit("transition", from_stage=reconciled.current_stage, to_stage=result.state.current_stage, verdict=late_outcome["verdict"])
+                saved = self._save(result.state)
+                self.logger.emit("late_outcome_reconciled", run_id=state.run_id, blocked_stage=reconciled.current_stage, verdict=late_outcome["verdict"], resulting_stage=saved.current_stage)
+                return saved
             safety_errors = self._schema_recovery_errors(state)
             if safety_errors:
                 reason = "; ".join(safety_errors)
@@ -227,6 +264,50 @@ class Orchestrator:
         new_state = replace(state, current_stage=restored_stage, status=WorkflowStatus.RUNNING.value, pending_human_gate=None, run_id=None, attempt=0, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False, updated_at=now_iso())
         self.logger.emit("hard_stop_recovered", stop_code=state.stop_code, restored_stage=restored_stage)
         return self._save(new_state)
+
+    def _late_outcome_check(self, state: WorkflowState) -> tuple[dict[str, Any] | None, list[str], bool]:
+        if not state.run_id or not state.blocked_stage:
+            return None, [], False
+        runs_root = self.store.runs_path.resolve()
+        run_dir = (runs_root / state.run_id).resolve()
+        if not run_dir.is_relative_to(runs_root):
+            return None, ["RECOVERY_UNCERTAIN: late outcome run_id is outside the state store"], True
+        outcome_path = run_dir / "outcome.json"
+        if not outcome_path.is_file():
+            return None, [], False
+        valid, outcome, validation_errors = validate_outcome(outcome_path, state.run_id, state.blocked_stage)
+        if not valid or outcome is None:
+            identity_errors = {"run_id mismatch", "stage mismatch"}
+            if identity_errors.intersection(validation_errors):
+                return None, validation_errors, True
+            return None, [], False
+
+        errors: list[str] = []
+        if state.blocked_stage not in READ_ONLY_RECOVERY_STAGES:
+            errors.append("late outcome reconciliation requires a read-only verification stage")
+        if state.workflow_digest != self.config.digest:
+            errors.append("workflow digest changed; hot reload is not supported")
+        if state.stop_code == "RECOVERY_UNCERTAIN" or "RECOVERY_UNCERTAIN" in (state.stop_reason or ""):
+            errors.append("RECOVERY_UNCERTAIN prevents late outcome reconciliation")
+
+        metadata = _read_json(run_dir / "metadata.json")
+        if not metadata:
+            errors.append("RECOVERY_UNCERTAIN: late outcome run metadata is missing")
+        elif metadata.get("run_id") != state.run_id:
+            errors.append("late outcome metadata run_id mismatch")
+        elif metadata.get("stage") != state.blocked_stage:
+            errors.append("late outcome metadata stage mismatch")
+        if metadata.get("status") == "running":
+            errors.append("RECOVERY_UNCERTAIN: the late outcome Agent invocation is still running")
+        elif metadata and (metadata.get("status") != "completed" or metadata.get("exit_code") != 0 or metadata.get("timed_out") is not False):
+            errors.append("late outcome run did not complete successfully")
+
+        for metadata_path in self.store.runs_path.glob("*/metadata.json"):
+            record = _read_json(metadata_path)
+            if record.get("status") == "running":
+                errors.append("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+                break
+        return outcome, errors, True
 
     def _latest_completed_stage(self) -> str | None:
         records = []

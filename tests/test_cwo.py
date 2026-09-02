@@ -321,6 +321,80 @@ groups:
                 with self.assertRaises(OrchestratorError):
                     Orchestrator(config, store=store).recover()
 
+    def _late_recovery_fixture(self, config, stage, outcome, *, run_id="late-run", store_name="late"):
+        store = StateStore(self.state / store_name)
+        run_dir = store.run_dir(run_id)
+        run_dir.joinpath("outcome.json").write_text(json.dumps(outcome), encoding="utf-8")
+        run_dir.joinpath("metadata.json").write_text(json.dumps({
+            "run_id": run_id, "stage": stage, "status": "completed",
+            "started_at": "2026-01-01T00:00:00+00:00", "finished_at": "2026-01-01T00:01:00+00:00",
+            "exit_code": 0, "timed_out": False,
+        }), encoding="utf-8")
+        store.save(WorkflowState(
+            project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file,
+            workflow_digest=config.digest, current_stage=Stage.HARD_STOP.value,
+            current_group="g", current_task="t", run_id=run_id, attempt=3,
+            last_successful_stage=Stage.TASK_EXECUTION.value,
+            last_outcome=make_outcome("prior", stage, config.project_name, "INVALID_OUTCOME"),
+            stop_code="RETRY_EXHAUSTED", stop_reason="outcome.json is missing", status="HARD_STOPPED",
+            blocked_stage=stage,
+        ))
+        return store
+
+    def test_late_valid_review_outcome_reconciles_through_canonical_transition(self):
+        config = self.workflow()
+        run_id = "late-review-patch"
+        issue = {
+            "type": "IMPLEMENTATION_DEFECT", "severity": "high", "requirement_ids": ["REQ-001"],
+            "message": "patch this defect", "blocking": True, "recommended_stage": "TASK_PATCH",
+        }
+        outcome = make_outcome(run_id, Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name, "REQUIRES_PATCH", issues=[issue])
+        store = self._late_recovery_fixture(config, Stage.TASK_INDEPENDENT_REVIEW.value, outcome, run_id=run_id)
+        runner = MockRunner()
+        recovered = Orchestrator(config, store=store, runner=runner).recover()
+        self.assertEqual(recovered.current_stage, Stage.TASK_PATCH.value)
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertIsNone(recovered.run_id)
+        self.assertEqual(recovered.last_outcome["verdict"], Verdict.REQUIRES_PATCH.value)
+        self.assertEqual(runner.calls, [])
+        events = [json.loads(line)["event"] for line in store.events_path.read_text(encoding="utf-8").splitlines()]
+        self.assertIn("late_outcome_detected", events)
+        self.assertIn("late_outcome_validated", events)
+        self.assertIn("late_outcome_reconciled", events)
+
+    def test_late_valid_approved_review_outcome_uses_normal_next_stage(self):
+        config = self.workflow()
+        run_id = "late-review-approved"
+        outcome = make_outcome(run_id, Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name, "APPROVED")
+        store = self._late_recovery_fixture(config, Stage.TASK_INDEPENDENT_REVIEW.value, outcome, run_id=run_id, store_name="late-approved")
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+        self.assertEqual(recovered.current_stage, Stage.HUMAN_GROUP_APPROVAL.value)
+        self.assertEqual(recovered.status, "WAITING_HUMAN")
+        self.assertEqual(recovered.last_outcome["verdict"], Verdict.APPROVED.value)
+
+    def test_late_outcome_rejects_run_id_and_stage_mismatch(self):
+        config = self.workflow()
+        cases = (
+            ("late-run-id-mismatch", make_outcome("other-run", Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name, "APPROVED")),
+            ("late-stage-mismatch", make_outcome("late-stage-mismatch", Stage.TASK_PATCH.value, config.project_name, "APPROVED")),
+        )
+        for store_name, outcome in cases:
+            with self.subTest(store_name=store_name):
+                run_id = "late-run-id-mismatch" if store_name == "late-run-id-mismatch" else store_name
+                store = self._late_recovery_fixture(config, Stage.TASK_INDEPENDENT_REVIEW.value, outcome, run_id=run_id, store_name=store_name)
+                with self.assertRaises(OrchestratorError):
+                    Orchestrator(config, store=store).recover()
+                self.assertEqual(store.load().current_stage, Stage.HARD_STOP.value)
+
+    def test_late_valid_mutating_stage_outcome_is_rejected(self):
+        config = self.workflow()
+        run_id = "late-execution"
+        outcome = make_outcome(run_id, Stage.TASK_EXECUTION.value, config.project_name, "APPROVED")
+        store = self._late_recovery_fixture(config, Stage.TASK_EXECUTION.value, outcome, run_id=run_id, store_name="late-execution")
+        with self.assertRaises(OrchestratorError):
+            Orchestrator(config, store=store).recover()
+        self.assertEqual(store.load().current_stage, Stage.HARD_STOP.value)
+
     def test_recovery_rejects_nonrecoverable_stops(self):
         config = self.workflow()
         store = StateStore(self.state)
