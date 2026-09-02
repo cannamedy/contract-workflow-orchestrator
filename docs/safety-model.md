@@ -1,6 +1,6 @@
 # Safety Model
 
-Automatic actions are bounded Agent invocation, outcome validation, deterministic stage transitions, retry with exponential backoff, and runtime artifact creation. The tool never automatically commits, pushes, tags, merges, publishes, or rewrites Contract/Plan artifacts. A normal authority revision is recorded outside the target repository and requires structured impact analysis before propagation.
+Automatic actions are bounded Agent invocation, outcome validation, deterministic stage transitions, retry with exponential backoff, and runtime candidate artifact creation. The tool never automatically commits, pushes, tags, merges, publishes, or rewrites accepted Contract/Plan artifacts. A normal authority revision is recorded outside the target repository and passes machine Contract/Plan propagation and review before a single scoped promotion decision may update accepted project authorities.
 
 Human gates are group approval, plan freeze, final acceptance, and scoped machine-readable Decision Requests for unresolved architecture or Contract questions. Hard stops include `PLAN_EXPANSION_REQUIRED`, security-sensitive or destructive actions, unauthorized external side effects, frozen-source mismatch, merge conflict, unrelated Git contamination that cannot be isolated, workflow digest changes, invalid outcomes after retry exhaustion, and recovery uncertainty. A scoped decision is not a global hard stop.
 

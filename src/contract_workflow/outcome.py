@@ -60,6 +60,14 @@ OUTCOME_SCHEMA = {
         "blocking_scope": {"type": "object"},
         "decision_requests": {"type": "array", "items": {"type": "object"}},
         "authority_change": {"type": "object"},
+        "propagation_plan": {"type": "object"},
+        "candidate_artifacts": {"type": "array", "items": {"type": "object"}},
+        "contract_revision_report": {"type": "object"},
+        "contract_review": {"type": "object"},
+        "plan_revision_report": {"type": "object"},
+        "plan_review": {"type": "object"},
+        "plan_graph": {"type": "object"},
+        "task_rebase": {"type": "object"},
     },
 }
 

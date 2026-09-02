@@ -25,6 +25,13 @@ AGENT_STAGE_NAMES = frozenset({
     Stage.PLAN_REVISION_REVIEW.value,
     Stage.FINAL_VERIFICATION.value,
     Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+    Stage.CHANGE_PROPAGATION_PLANNING.value,
+    Stage.CONTRACT_REVISION.value,
+    Stage.CONTRACT_REVISION_REVIEW.value,
+    Stage.PLAN_REVISION.value,
+    Stage.PLAN_REVISION_REVIEW.value,
+    Stage.PLAN_GRAPH_BUILD.value,
+    Stage.TASK_REBASE_ANALYSIS.value,
 })
 HUMAN_GATE_NAMES = frozenset({
     Stage.HUMAN_PLAN_FREEZE.value,
@@ -33,12 +40,26 @@ HUMAN_GATE_NAMES = frozenset({
 })
 
 
-def _task_map(config: WorkflowConfig) -> dict[str, tuple[str, TaskSpec]]:
+def _task_map(config: WorkflowConfig, state: WorkflowState | None = None) -> dict[str, tuple[str, TaskSpec]]:
+    if state and state.plan_graph and isinstance(state.plan_graph.get("tasks"), list):
+        result: dict[str, tuple[str, TaskSpec]] = {}
+        for raw in state.plan_graph["tasks"]:
+            if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
+                continue
+            task = TaskSpec(
+                id=raw["id"], expected_outputs=tuple(raw.get("expected_outputs", ()) or ()),
+                allowed_paths=tuple(raw.get("allowed_paths", ()) or ()), dependencies=tuple(raw.get("dependencies", ()) or ()),
+                requirement_ids=tuple(raw.get("requirement_ids", ()) or ()), contract_anchors=tuple(raw.get("contract_anchors", ()) or ()),
+                skill_role=raw.get("skill_role"),
+            )
+            result[task.id] = (str(raw.get("group", "default")), task)
+        if result:
+            return result
     return {task.id: (group_id, task) for group_id, task in config.tasks}
 
 
-def _descendants(config: WorkflowConfig, roots: Iterable[str]) -> set[str]:
-    task_map = _task_map(config)
+def _descendants(config: WorkflowConfig, roots: Iterable[str], state: WorkflowState | None = None) -> set[str]:
+    task_map = _task_map(config, state)
     result: set[str] = set()
     frontier = set(roots)
     while frontier:
@@ -50,13 +71,13 @@ def _descendants(config: WorkflowConfig, roots: Iterable[str]) -> set[str]:
     return result
 
 
-def dependency_closure(config: WorkflowConfig, roots: Iterable[str]) -> set[str]:
+def dependency_closure(config: WorkflowConfig, roots: Iterable[str], state: WorkflowState | None = None) -> set[str]:
     """Return the deterministic downstream task closure for authority/decision blockers."""
-    return _descendants(config, roots)
+    return _descendants(config, roots, state)
 
 
 def _fresh_work_items(config: WorkflowConfig, state: WorkflowState) -> dict[str, WorkItemState]:
-    task_map = _task_map(config)
+    task_map = _task_map(config, state)
     order = list(task_map)
     current_index = order.index(state.current_task) if state.current_task in order else None
     result: dict[str, WorkItemState] = {}
@@ -83,7 +104,7 @@ def ensure_work_items(config: WorkflowConfig, state: WorkflowState) -> WorkflowS
 
 def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
     state = ensure_work_items(config, state)
-    task_map = _task_map(config)
+    task_map = _task_map(config, state)
     pending = [decision for decision in state.decisions.values() if decision.status == DecisionStatus.PENDING.value]
     all_ids = set(task_map)
     decisions: dict[str, HumanDecision] = {}
@@ -94,7 +115,7 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
 
     for decision in pending:
         direct = set(decision.directly_blocked_items) & all_ids
-        dependent = _descendants(config, direct)
+        dependent = _descendants(config, direct, state)
         for task_id in direct:
             direct_by_task[task_id].append(decision.decision_id)
         for task_id in dependent - direct:
@@ -110,14 +131,20 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
         if change.get("status") not in {"CHANGE_PENDING", "PROPAGATING"}:
             continue
         direct = set(change.get("directly_affected_tasks", ())) & all_ids
-        dependent = _descendants(config, direct)
+        dependent = _descendants(config, direct, state)
         for task_id in direct:
             authority_direct_by_task[task_id].append(change_id)
         for task_id in dependent - direct:
             authority_dependency_by_task[task_id].append(change_id)
 
     items: dict[str, WorkItemState] = {}
+    source_items = dict(state.work_items)
+    for task_id, (group_id, task) in task_map.items():
+        source_items.setdefault(task_id, WorkItemState(task_id, group_id, WorkItemStatus.NEW.value, tuple(task.dependencies)))
     for task_id, item in state.work_items.items():
+        if task_id not in task_map:
+            items[task_id] = replace(item, status=WorkItemStatus.SUPERSEDED.value)
+    for task_id, item in source_items.items():
         if task_id not in task_map:
             continue
         _, task = task_map[task_id]
@@ -127,7 +154,11 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
         authority_dependency_ids = sorted(authority_dependency_by_task[task_id])
         status = item.status
         if authority_direct_ids:
-            status = WorkItemStatus.BLOCKED_BY_AUTHORITY_CHANGE.value
+            requires_rebase = any(
+                task_id in change.get("directly_affected_tasks", []) and change.get("propagation_ready")
+                for change in state.authority_changes.values()
+            )
+            status = WorkItemStatus.TASK_REBASE_REQUIRED.value if requires_rebase else WorkItemStatus.BLOCKED_BY_AUTHORITY_CHANGE.value
         elif status == WorkItemStatus.COMPLETED.value:
             direct_ids = []
             dependency_ids = []
@@ -140,8 +171,10 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
         elif status in {
             WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value,
             WorkItemStatus.BLOCKED_BY_AUTHORITY_CHANGE.value,
+            WorkItemStatus.TASK_REBASE_REQUIRED.value,
             WorkItemStatus.WAITING_DEPENDENCY.value,
             WorkItemStatus.READY.value,
+            WorkItemStatus.NEW.value,
         }:
             status = WorkItemStatus.READY.value
         items[task_id] = replace(item, status=status, dependencies=tuple(task.dependencies), blocking_decision_ids=direct_ids, dependency_blocked_by_decision_ids=dependency_ids, blocking_authority_change_ids=authority_direct_ids, dependency_blocked_by_authority_change_ids=authority_dependency_ids)
@@ -151,7 +184,7 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
 def ready_work(config: WorkflowConfig, state: WorkflowState) -> list[WorkItemState]:
     state = recompute(config, state)
     result = []
-    for _, task in config.tasks:
+    for _, task in _task_map(config, state).values():
         item = state.work_items.get(task.id)
         if item and item.status == WorkItemStatus.READY.value and all(
             state.work_items.get(dep, WorkItemState(dep, "")).status == WorkItemStatus.COMPLETED.value
@@ -197,6 +230,13 @@ def schedule(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
             pending_human_gate=None,
             status=WorkflowStatus.WAITING_HUMAN.value,
         )
+    propagation = next((item for item in state.propagation.values() if item.get("status") == "RUNNING" and item.get("next_stage")), None)
+    if propagation:
+        return replace(
+            state,
+            current_stage=str(propagation["next_stage"]), current_group=None, current_task=None, run_id=None,
+            attempt=0, pending_human_gate=None, status=WorkflowStatus.RUNNING.value,
+        )
     if any(change.get("status") in {"CHANGE_PENDING", "PROPAGATING"} for change in state.authority_changes.values()):
         return replace(
             state,
@@ -208,7 +248,8 @@ def schedule(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
             pending_human_gate=None,
             status=WorkflowStatus.WAITING_AUTHORITY_CHANGE.value,
         )
-    if state.work_items and all(item.status == WorkItemStatus.COMPLETED.value for item in state.work_items.values()):
+    terminal = {WorkItemStatus.COMPLETED.value, WorkItemStatus.SUPERSEDED.value}
+    if state.work_items and all(item.status in terminal for item in state.work_items.values()):
         return replace(state, current_stage=Stage.FINAL_VERIFICATION.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
     return replace(
         state,

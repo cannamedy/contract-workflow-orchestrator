@@ -15,6 +15,13 @@ DEFAULT_TEMPLATES = {
     "PLAN_REVISION_REVIEW": "plan-revision-review.md",
     "FINAL_VERIFICATION": "task-review.md",
     "AUTHORITY_CHANGE_ANALYSIS": "authority-change-analysis.md",
+    "CHANGE_PROPAGATION_PLANNING": "authority-change-analysis.md",
+    "CONTRACT_REVISION": "authority-change-analysis.md",
+    "CONTRACT_REVISION_REVIEW": "task-review.md",
+    "PLAN_REVISION": "authority-change-analysis.md",
+    "PLAN_REVISION_REVIEW": "task-review.md",
+    "PLAN_GRAPH_BUILD": "authority-change-analysis.md",
+    "TASK_REBASE_ANALYSIS": "authority-change-analysis.md",
 }
 DEFAULT_TEXTS = {
     "TASK_EXECUTION": "# Task Execution\n\nWork only on the current task using the configured Skill.",
@@ -24,6 +31,13 @@ DEFAULT_TEXTS = {
     "PLAN_REVISION_REVIEW": "# Plan Revision Review\n\nReview the revised plan against authoritative artifacts.",
     "FINAL_VERIFICATION": "# Final Verification\n\nVerify the completed workflow against its authoritative artifacts.",
     "AUTHORITY_CHANGE_ANALYSIS": "# Authority Change Analysis\n\nCompare the accepted authority revision with the registered candidate and produce only the structured impact analysis. Do not edit authority, Contract, Plan, or task artifacts.",
+    "CHANGE_PROPAGATION_PLANNING": "# Change Propagation Planning\n\nTurn the accepted Change Record into an ordered machine propagation plan. Do not modify project authority files.",
+    "CONTRACT_REVISION": "# Contract Revision\n\nProduce an incremental candidate Engineering Contract in the external propagation store. Do not modify the accepted project Contract.",
+    "CONTRACT_REVISION_REVIEW": "# Contract Revision Review\n\nIndependently review the candidate Contract against the candidate Human Guide, requirements, anchors, and unaffected Contract sections.",
+    "PLAN_REVISION": "# Plan Revision\n\nProduce an incremental candidate Implementation Plan and structured task graph in the external propagation store. Do not modify the accepted project Plan.",
+    "PLAN_REVISION_REVIEW": "# Plan Revision Review\n\nIndependently verify the candidate Plan and its Requirement-to-Contract-to-Task closure.",
+    "PLAN_GRAPH_BUILD": "# Plan Graph Build\n\nEmit a complete machine-readable Plan Graph projection. Do not infer it from unvalidated prose in later stages.",
+    "TASK_REBASE_ANALYSIS": "# Task Rebase Analysis\n\nCompare affected task definitions and existing implementation/review evidence, preserving the smallest required rebase work.",
 }
 STAGE_VERDICT_GUIDANCE = {
     "TASK_EXECUTION": "Use APPROVED when the requested implementation and tests are complete; COMPLETED is not valid for this stage.",
@@ -33,6 +47,13 @@ STAGE_VERDICT_GUIDANCE = {
     "PLAN_REVISION_REVIEW": "Use APPROVED when the revised plan is correct, or REQUIRES_PATCH when it still has a defect.",
     "FINAL_VERIFICATION": "Use APPROVED or COMPLETED only when final verification succeeds.",
     "AUTHORITY_CHANGE_ANALYSIS": "Use APPROVED for a valid machine-resolvable analysis, or ARCHITECTURE_DECISION_REQUIRED only when the authority semantics have no unique safe interpretation.",
+    "CHANGE_PROPAGATION_PLANNING": "Use APPROVED when the ordered propagation plan is complete; use a scoped decision verdict only for genuine authority ambiguity.",
+    "CONTRACT_REVISION": "Use APPROVED when the candidate Contract and revision report are complete; do not write the accepted Contract.",
+    "CONTRACT_REVISION_REVIEW": "Use APPROVED when the candidate Contract is aligned and traceable, or REQUIRES_PATCH for a repairable defect.",
+    "PLAN_REVISION": "Use APPROVED when the candidate Plan is complete and incremental; do not write the accepted Plan.",
+    "PLAN_REVISION_REVIEW": "Use APPROVED when the candidate Plan is complete and graph-valid, or REQUIRES_PATCH for a repairable defect.",
+    "PLAN_GRAPH_BUILD": "Use APPROVED only with a complete valid plan_graph object.",
+    "TASK_REBASE_ANALYSIS": "Use APPROVED when affected task rebase evidence is complete; do not modify implementation files in this stage.",
 }
 
 
@@ -48,7 +69,7 @@ class PromptBuilder:
             path = self.template_dir / template_name
             if path.is_file():
                 template = path.read_text(encoding="utf-8")
-        skill = config.skills.get("planner" if "PLAN" in stage else "coding")
+        skill = _skill_for_stage(config, stage, state)
         frozen = "\n".join(f"- {item.path} sha256={item.sha256} commit={item.git_commit or '-'} tag={item.git_tag or '-'}" for item in config.authoritative_sources) or "- none declared"
         task = config.task_at(state.current_group, state.current_task)
         task_paths = []
@@ -73,6 +94,9 @@ class PromptBuilder:
             authority_context = str(state.authority_changes.get(state.current_authority_change_id, "registered change unavailable"))
         elif pending and state.current_task and any(state.current_task in change.get("unaffected_tasks", []) for change in pending):
             authority_context = "There is a registered pending authority change " + ", ".join(str(change.get("change_id")) for change in pending) + ". This task has been deterministically classified as unaffected. Do not modify affected authority artifacts. Operate only within this task's allowed scope."
+        if stage in {Stage.CHANGE_PROPAGATION_PLANNING.value, Stage.CONTRACT_REVISION.value, Stage.CONTRACT_REVISION_REVIEW.value, Stage.PLAN_REVISION.value, Stage.PLAN_REVISION_REVIEW.value, Stage.PLAN_GRAPH_BUILD.value, Stage.TASK_REBASE_ANALYSIS.value}:
+            active = state.propagation.get(state.current_authority_change_id or "", {})
+            authority_context = "Registered propagation context: " + str(active or "unavailable") + ". Candidate artifacts are external runtime evidence and must not be written over accepted project authorities."
         values = {
             "project_path": config.project_path, "project": config.project_name, "stage": stage,
             "group": state.current_group or "", "task": state.current_task or "",
@@ -116,8 +140,43 @@ For `ARCHITECTURE_DECISION_REQUIRED` or an unresolved `OPEN_CONTRACT_ISSUE`, inc
 
 For `AUTHORITY_CHANGE_ANALYSIS`, include an `authority_change` object with change_id, base_sha256, candidate_sha256, classification (C0-C4), semantic_change, affected_requirements, affected_contract_anchors, directly_affected_tasks, dependency_affected_tasks, unaffected_tasks, machine_resolvable, human_decision_required, human_decision_requests, required_propagation, and a concise analysis_summary. Do not include chain-of-thought.
 
+For propagation stages, emit only structured fields appropriate to the stage: `propagation_plan`, `candidate_artifacts`, `contract_revision_report`, `plan_revision_report`, `plan_graph`, or `task_rebase` as requested by the prompt. Candidate artifact content is evidence in CWO external state and must never be written to accepted project authority files by the Agent.
+
 {render_outcome_contract(values['run_id'], values['stage'], values['project'], values['group'], values['task'])}
 Do not include private chain-of-thought.'''
+
+
+def _skill_for_stage(config: WorkflowConfig, stage: str, state: WorkflowState):
+    if stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value:
+        for key, spec in config.skills.items():
+            if "technical-specification-guide" in spec.path or "engineering-contract-spec" in spec.path:
+                return spec
+        for spec in config.skills.values():
+            sibling = Path(spec.path).expanduser().resolve().parent / "engineering-contract-spec" / "SKILL.md"
+            if sibling.is_file():
+                from .models import SkillSpec
+                return SkillSpec(str(sibling))
+    if stage in {Stage.CONTRACT_REVISION.value, Stage.CONTRACT_REVISION_REVIEW.value}:
+        for key, spec in config.skills.items():
+            if "contract" in key.lower() and "implementation" not in key.lower():
+                return spec
+            if "engineering-contract-spec" in spec.path:
+                return spec
+        for spec in config.skills.values():
+            sibling = Path(spec.path).expanduser().resolve().parent / "engineering-contract-spec" / "SKILL.md"
+            if sibling.is_file():
+                from .models import SkillSpec
+                return SkillSpec(str(sibling))
+        return None
+    if stage in {Stage.PLAN_REVISION.value, Stage.PLAN_REVISION_REVIEW.value, Stage.PLAN_GRAPH_BUILD.value, Stage.CHANGE_PROPAGATION_PLANNING.value}:
+        for key, spec in config.skills.items():
+            if "planner" in key.lower() or "implementation-planner" in spec.path:
+                return spec
+        return None
+    task = config.task_at(state.current_group, state.current_task)
+    if task and task.skill_role and task.skill_role in config.skills:
+        return config.skills[task.skill_role]
+    return config.skills.get("coding")
 
 
 def _previous_issues(state: WorkflowState) -> str:

@@ -23,12 +23,14 @@ class StateStore:
         self.authority_path = root / "authority"
         self.authority_ledger_path = self.authority_path / "ledger.json"
         self.authority_changes_path = self.authority_path / "changes"
+        self.propagation_path = root / "propagation"
 
     def ensure(self) -> None:
         self.runs_path.mkdir(parents=True, exist_ok=True)
         self.decisions_path.mkdir(parents=True, exist_ok=True)
         self.adrs_path.mkdir(parents=True, exist_ok=True)
         self.authority_changes_path.mkdir(parents=True, exist_ok=True)
+        self.propagation_path.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> WorkflowState | None:
         if not self.state_path.exists():
@@ -108,6 +110,31 @@ class StateStore:
         if not change_id or Path(change_id).name != change_id:
             raise StateStoreError("authority change requires a safe change_id")
         self._atomic_write(self.authority_changes_path / f"{change_id}.json", json.dumps(change, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+    def propagation_dir(self, change_id: str) -> Path:
+        if not change_id or Path(change_id).name != change_id:
+            raise StateStoreError("change_id must be a safe path component")
+        path = self.propagation_path / change_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_propagation_json(self, change_id: str, relative_name: str, value: object) -> Path:
+        base = self.propagation_dir(change_id).resolve()
+        path = (base / relative_name).resolve()
+        if not path.is_relative_to(base) or Path(relative_name).is_absolute():
+            raise StateStoreError("propagation artifact path escapes runtime state")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(path, json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        return path
+
+    def save_candidate_artifact(self, change_id: str, relative_name: str, content: str) -> Path:
+        base = (self.propagation_dir(change_id) / "candidates").resolve()
+        path = (base / relative_name).resolve()
+        if not path.is_relative_to(base) or Path(relative_name).is_absolute():
+            raise StateStoreError("candidate artifact path escapes runtime state")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(path, content)
+        return path
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:

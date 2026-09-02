@@ -187,6 +187,12 @@ def scan_authority_changes(config: WorkflowConfig, store: Any, state: WorkflowSt
             continue
         accepted = str(entry.get("accepted_sha256", source.sha256))
         if digest.lower() == accepted.lower():
+            # The runtime ledger may accept a revision without changing the
+            # immutable workflow YAML.  Tell integrity auditing to use that
+            # accepted snapshot; this also prevents stale bootstrap commit/tag
+            # metadata from reviving the old frozen mismatch after promotion.
+            if accepted.lower() != source.sha256.lower() or entry.get("status") == "ACCEPTED" and entry.get("path") != source.path:
+                overrides[str(configured.resolve())] = (str(candidate), digest)
             continue
         registered.update({str(configured.resolve()), str(candidate.resolve())})
         if active:
@@ -230,8 +236,8 @@ def authority_snapshot(config: WorkflowConfig, store: Any) -> dict[str, str]:
     return snapshot
 
 
-def dependency_tasks(config: WorkflowConfig, direct: list[str]) -> list[str]:
-    return sorted(dependency_closure(config, direct))
+def dependency_tasks(config: WorkflowConfig, direct: list[str], state: WorkflowState | None = None) -> list[str]:
+    return sorted(dependency_closure(config, direct, state))
 
 
 def _known_authority_text(config: WorkflowConfig) -> str:
@@ -284,14 +290,14 @@ def validate_analysis(config: WorkflowConfig, store: Any, state: WorkflowState, 
     if isinstance(anchors, list):
         text = _known_authority_text(config)
         errors.extend(f"untraceable contract anchor: {item}" for item in anchors if item not in text)
-    known = {task.id for _, task in config.tasks}
+    known = {str(item.get("id")) for item in (state.plan_graph or {}).get("tasks", []) if isinstance(item, dict) and isinstance(item.get("id"), str)} or {task.id for _, task in config.tasks}
     direct = raw.get("directly_affected_tasks", [])
     reported_dependencies = raw.get("dependency_affected_tasks", [])
     unaffected = raw.get("unaffected_tasks", [])
     for key, values in (("directly_affected_tasks", direct), ("dependency_affected_tasks", reported_dependencies), ("unaffected_tasks", unaffected)):
         if isinstance(values, list):
             errors.extend(f"unknown task id in {key}: {item}" for item in values if item not in known)
-    computed = dependency_tasks(config, direct) if isinstance(direct, list) else []
+    computed = dependency_tasks(config, direct, state) if isinstance(direct, list) else []
     if isinstance(reported_dependencies, list) and sorted(reported_dependencies) != computed:
         errors.append(f"dependency closure mismatch: expected {computed}")
     if isinstance(direct, list) and isinstance(reported_dependencies, list) and set(direct) & set(reported_dependencies):

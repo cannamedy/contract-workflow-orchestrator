@@ -67,7 +67,7 @@ def _decode_git_path(value: str) -> str:
     return value
 
 
-def audit_git(project: Path, config: WorkflowConfig, registered_authority_paths: tuple[str, ...] = ()) -> GitAudit:
+def audit_git(project: Path, config: WorkflowConfig, registered_authority_paths: tuple[str, ...] = (), additional_expected_paths: tuple[str, ...] = ()) -> GitAudit:
     root = _git(project, "rev-parse", "--show-toplevel")
     if root.returncode != 0:
         return GitAudit(False, (), (GitClassification.UNKNOWN,), True, root.stderr.strip() or "not a git repository")
@@ -80,6 +80,7 @@ def audit_git(project: Path, config: WorkflowConfig, registered_authority_paths:
     for _, task in config.tasks:
         expected.extend(task.expected_outputs)
         expected.extend(task.allowed_paths)
+    expected.extend(additional_expected_paths)
     changes: list[GitChange] = []
     for line in result.stdout.splitlines():
         if len(line) < 3:
@@ -124,7 +125,10 @@ def source_integrity(project: Path, sources: tuple[AuthoritativeSource, ...], ov
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if not source.mutable_after_start and digest.lower() != expected_sha.lower():
             errors.append(f"FROZEN_SOURCE_MISMATCH: {path}")
-        if source.git_commit:
+        # A ledger override represents a runtime-accepted authority revision;
+        # workflow.yaml's bootstrap commit/tag metadata belongs to the old
+        # baseline and must not invalidate the promoted revision.
+        if source.git_commit and not override:
             check = _git(project, "rev-parse", source.git_commit)
             if check.returncode != 0:
                 errors.append(f"git commit not found: {source.git_commit}")
@@ -132,7 +136,7 @@ def source_integrity(project: Path, sources: tuple[AuthoritativeSource, ...], ov
                 head = _git(project, "rev-parse", "HEAD")
                 if head.returncode == 0 and head.stdout.strip() != check.stdout.strip():
                     errors.append(f"FROZEN_SOURCE_MISMATCH: HEAD is not configured commit {source.git_commit}")
-        if source.git_tag:
+        if source.git_tag and not override:
             check = _git(project, "rev-parse", "refs/tags/" + source.git_tag)
             if check.returncode != 0:
                 errors.append(f"git tag not found: {source.git_tag}")

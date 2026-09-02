@@ -17,11 +17,17 @@ class Stage(str, Enum):
     TASK_INDEPENDENT_REVIEW = "TASK_INDEPENDENT_REVIEW"
     TASK_PATCH = "TASK_PATCH"
     PLAN_DEFECT_RESOLUTION = "PLAN_DEFECT_RESOLUTION"
-    PLAN_REVISION_REVIEW = "PLAN_REVISION_REVIEW"
     HUMAN_PLAN_FREEZE = "HUMAN_PLAN_FREEZE"
     HUMAN_GROUP_APPROVAL = "HUMAN_GROUP_APPROVAL"
     FINAL_VERIFICATION = "FINAL_VERIFICATION"
     AUTHORITY_CHANGE_ANALYSIS = "AUTHORITY_CHANGE_ANALYSIS"
+    CHANGE_PROPAGATION_PLANNING = "CHANGE_PROPAGATION_PLANNING"
+    CONTRACT_REVISION = "CONTRACT_REVISION"
+    CONTRACT_REVISION_REVIEW = "CONTRACT_REVISION_REVIEW"
+    PLAN_REVISION = "PLAN_REVISION"
+    PLAN_REVISION_REVIEW = "PLAN_REVISION_REVIEW"
+    PLAN_GRAPH_BUILD = "PLAN_GRAPH_BUILD"
+    TASK_REBASE_ANALYSIS = "TASK_REBASE_ANALYSIS"
     HUMAN_FINAL_ACCEPTANCE = "HUMAN_FINAL_ACCEPTANCE"
     WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
     WAITING_FOR_AUTHORITY_CHANGE = "WAITING_FOR_AUTHORITY_CHANGE"
@@ -72,6 +78,9 @@ class WorkItemStatus(str, Enum):
     REQUIRES_PATCH = "REQUIRES_PATCH"
     BLOCKED_BY_HUMAN_DECISION = "BLOCKED_BY_HUMAN_DECISION"
     BLOCKED_BY_AUTHORITY_CHANGE = "BLOCKED_BY_AUTHORITY_CHANGE"
+    TASK_REBASE_REQUIRED = "TASK_REBASE_REQUIRED"
+    SUPERSEDED = "SUPERSEDED"
+    NEW = "NEW"
     WAITING_DEPENDENCY = "WAITING_DEPENDENCY"
     FAILED = "FAILED"
     RECOVERY_UNCERTAIN = "RECOVERY_UNCERTAIN"
@@ -219,6 +228,9 @@ class WorkflowState:
     adrs: dict[str, dict[str, Any]] = field(default_factory=dict)
     current_authority_change_id: str | None = None
     authority_changes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    propagation: dict[str, dict[str, Any]] = field(default_factory=dict)
+    plan_graph: dict[str, Any] | None = None
+    plan_graph_reconciliation: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         value = self.__dict__.copy()

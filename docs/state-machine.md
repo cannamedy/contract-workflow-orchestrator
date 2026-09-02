@@ -8,6 +8,13 @@
 | AUTHORITY_CHANGE_ANALYSIS | C0/C1, no semantic/task impact | accepted revision, then normal scheduling |
 | AUTHORITY_CHANGE_ANALYSIS | C2-C4 machine-resolvable | scoped authority blockers and unaffected continuation |
 | AUTHORITY_CHANGE_ANALYSIS | unresolved authority ambiguity | existing scoped Decision Request / `WAITING_FOR_HUMAN` when no READY work |
+| CHANGE_PROPAGATION_PLANNING | APPROVED | `CONTRACT_REVISION` / `PLAN_REVISION` / `PLAN_GRAPH_BUILD` according to deterministic propagation plan |
+| CONTRACT_REVISION | APPROVED | independent `CONTRACT_REVISION_REVIEW` |
+| CONTRACT_REVISION_REVIEW | REQUIRES_PATCH | automatic Contract revision and re-review |
+| PLAN_REVISION | APPROVED | independent `PLAN_REVISION_REVIEW` |
+| PLAN_REVISION_REVIEW | REQUIRES_PATCH | automatic Plan revision and re-review |
+| PLAN_GRAPH_BUILD | APPROVED | deterministic graph reconciliation, then `TASK_REBASE_ANALYSIS` or promotion request |
+| TASK_REBASE_ANALYSIS | APPROVED | existing scoped promotion Decision Request |
 | TASK_EXECUTION | APPROVED | TASK_INDEPENDENT_REVIEW |
 | TASK_INDEPENDENT_REVIEW | REQUIRES_PATCH | TASK_PATCH |
 | TASK_PATCH | APPROVED | TASK_INDEPENDENT_REVIEW |
@@ -26,7 +33,7 @@
 
 `HUMAN_PLAN_FREEZE`, `HUMAN_GROUP_APPROVAL`, and `HUMAN_FINAL_ACCEPTANCE` cannot be bypassed by a model outcome. `approve` only releases the exact pending gate.
 
-An authority candidate is not accepted as the new baseline merely because its hash changed. `AUTHORITY_CHANGE_ANALYSIS` persists the candidate and its propagation requirements. Only a C0/C1 analysis with `semantic_change=false` and no affected task auto-accepts. An active Agent's unauthorized authority mutation remains `UNAUTHORIZED_AUTHORITY_MUTATION` and enters `HARD_STOP`.
+An authority candidate is not accepted as the new baseline merely because its hash changed. `AUTHORITY_CHANGE_ANALYSIS` persists the candidate and its propagation requirements. Only a C0/C1 analysis with `semantic_change=false` and no affected task auto-accepts. Machine-resolvable semantic changes create external candidate Contract/Plan artifacts and a re-buildable `plan_graph`; accepted artifacts are promoted together only after independent reviews and the existing scoped HumanDecision. An active Agent's unauthorized authority mutation remains `UNAUTHORIZED_AUTHORITY_MUTATION` and enters `HARD_STOP`.
 
 ## Scoped Human Gates
 

@@ -10,7 +10,9 @@ from typing import Any
 
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity
-from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger
+from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
+from .plan_graph import reconcile_plan_graph, validate_plan_graph
+from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
 from .logging import EventLogger
 from .models import (
     DecisionStatus,
@@ -30,7 +32,7 @@ from .prompt_builder import PromptBuilder
 from .runners import AgentRunner, CodexCliRunner, MockRunner, RunnerResult
 from .state_machine import AGENT_STAGES, HUMAN_GATES, approve, initial_state, stop, transition_after_outcome, transition_ready
 from .state_store import StateStore, StateStoreError
-from .scheduler import AGENT_STAGE_NAMES, HUMAN_GATE_NAMES, pending_decisions, recompute, ready_work, schedule
+from .scheduler import AGENT_STAGE_NAMES, HUMAN_GATE_NAMES, dependency_closure, pending_decisions, recompute, ready_work, schedule
 
 
 class OrchestratorError(RuntimeError):
@@ -98,7 +100,8 @@ class Orchestrator:
         scan = scan or scan_authority_changes(self.config, self.store, self._load_or_initialize_state_only())
         integrity = source_integrity(Path(self.config.project_path), self.config.authoritative_sources, scan.integrity_overrides or {})
         configured_authority_paths = tuple(str((Path(source.path) if Path(source.path).is_absolute() else Path(self.config.project_path) / source.path).resolve()) for source in self.config.authoritative_sources if not source.mutable_after_start)
-        audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))))
+        plan_expected = tuple(path for raw in (self._load_or_initialize_state_only().plan_graph or {}).get("tasks", []) if isinstance(raw, dict) for path in tuple(raw.get("expected_outputs", ()) or ()) + tuple(raw.get("allowed_paths", ()) or ()))
+        audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected)
         self.logger.emit("doctor_check", git_blocking=audit.blocking, integrity_errors=len(integrity), classifications=[item.value for item in audit.classifications])
         return audit, integrity, scan
 
@@ -221,6 +224,16 @@ class Orchestrator:
         stage = state.current_stage
         if stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value:
             return self._apply_authority_analysis(state, outcome)
+        # PLAN_REVISION_REVIEW is also an existing ordinary plan-defect stage.
+        # Route it to propagation only when an active propagation record owns
+        # the current stage; otherwise preserve the v0.3-A transition table.
+        active_propagation = (
+            state.current_authority_change_id
+            and state.current_authority_change_id in state.propagation
+            and state.propagation[state.current_authority_change_id].get("next_stage") == stage
+        )
+        if stage in PROPAGATION_STAGES and (stage != Stage.PLAN_REVISION_REVIEW.value or active_propagation):
+            return self._apply_propagation_outcome(state, outcome)
         verdict = Verdict(outcome["verdict"])
         if verdict in SCOPED_DECISION_VERDICTS:
             state, unresolved = self._record_decisions(state, outcome)
@@ -250,8 +263,8 @@ class Orchestrator:
         change_id = str(analysis["change_id"])
         change = dict(state.authority_changes.get(change_id, {}))
         direct = list(analysis["directly_affected_tasks"])
-        computed = sorted(dependency_tasks(self.config, direct))
-        all_tasks = {task.id for _, task in self.config.tasks}
+        computed = sorted(dependency_tasks(self.config, direct, state))
+        all_tasks = {str(item.get("id")) for item in (state.plan_graph or {}).get("tasks", []) if isinstance(item, dict) and isinstance(item.get("id"), str)} or {task.id for _, task in self.config.tasks}
         record = {**change, **analysis, "dependency_affected_tasks": computed, "unaffected_tasks": sorted(all_tasks - set(direct) - set(computed)), "status": "CHANGE_PENDING" if analysis["human_decision_required"] else "PROPAGATING", "analyzed_at": now_iso()}
         self.store.save_authority_change(record)
         ledger = bootstrap_ledger(self.config, self.store)
@@ -263,12 +276,172 @@ class Orchestrator:
         else:
             entry.update({"candidate_sha256": record["candidate_sha256"], "status": record["status"], "change_id": change_id})
             self.logger.emit("authority_change_analyzed", change_id=change_id, classification=analysis["classification"], human_decision_required=analysis["human_decision_required"], required_propagation=analysis["required_propagation"])
+        self.store.save_authority_change(record)
         self.store.save_authority_ledger(ledger)
-        updated = replace(state, authority_changes={**state.authority_changes, change_id: record}, current_authority_change_id=None, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False)
+        if record["status"] != "ACCEPTED":
+            propagation = None if analysis["human_decision_required"] else self._new_propagation(record)
+        else:
+            propagation = None
+        updated = replace(state, authority_changes={**state.authority_changes, change_id: record}, current_authority_change_id=change_id if propagation else None, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False)
+        if propagation:
+            updated = replace(updated, propagation={**updated.propagation, change_id: propagation})
         if analysis["human_decision_required"]:
-            updated, _ = self._record_decisions(updated, {**outcome, "directly_affected_work": direct, "blocking_scope": {"directly_blocked_items": direct}})
+            requests = outcome.get("decision_requests") or analysis.get("human_decision_requests", [])
+            normalized_requests = [{**request, "source_change": change_id, "source_stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value, "directly_blocked_items": request.get("directly_blocked_items", direct)} for request in requests if isinstance(request, dict)]
+            updated, _ = self._record_decisions(updated, {**outcome, "decision_requests": normalized_requests, "directly_affected_work": direct, "blocking_scope": {"directly_blocked_items": direct}})
         updated = schedule(self.config, recompute(self.config, updated))
         return StepResult(self._save(updated), "authority_change_analyzed")
+
+    def _new_propagation(self, change: dict[str, Any]) -> dict[str, Any]:
+        steps = propagation_steps(change)
+        value = {
+            "schema_version": "1.0", "change_id": change["change_id"], "status": "RUNNING", "stages": steps,
+            "stage_index": 0, "next_stage": steps[0] if steps else None, "candidate_artifacts": [],
+            "reviews": {}, "created_at": now_iso(),
+        }
+        self.store.save_propagation_json(str(change["change_id"]), "propagation-plan.json", value)
+        return value
+
+    def _apply_propagation_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
+        change_id = state.current_authority_change_id
+        propagation = dict(state.propagation.get(change_id or "", {}))
+        if not change_id or not propagation or propagation.get("status") != "RUNNING":
+            return self._invalid_or_failed(state, ["active propagation record is missing"])
+        stage = state.current_stage
+        if Verdict(outcome["verdict"]) in SCOPED_DECISION_VERDICTS:
+            requests = {**outcome, "directly_affected_work": state.authority_changes.get(change_id, {}).get("directly_affected_tasks", [])}
+            propagation.update({"status": "WAITING_DECISION", "next_stage": stage})
+            updated, unresolved = self._record_decisions(state, requests)
+            updated = replace(updated, propagation={**updated.propagation, change_id: propagation}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, status=WorkflowStatus.RUNNING.value, last_outcome=outcome)
+            self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
+            updated = schedule(self.config, updated)
+            return StepResult(self._save(updated), "scoped_human_decision")
+        if Verdict(outcome["verdict"]) == Verdict.REQUIRES_PATCH:
+            if stage == Stage.CONTRACT_REVISION_REVIEW.value:
+                target = Stage.CONTRACT_REVISION.value
+                review = outcome.get("contract_review", outcome.get("review", {"verdict": outcome["verdict"], "summary": outcome.get("summary", "")}))
+                if isinstance(review, dict):
+                    propagation.setdefault("review_history", []).append({"kind": "contract", **review, "verdict": outcome["verdict"]})
+            elif stage == Stage.PLAN_REVISION_REVIEW.value:
+                target = Stage.PLAN_REVISION.value
+                review = outcome.get("plan_review", outcome.get("review", {"verdict": outcome["verdict"], "summary": outcome.get("summary", "")}))
+                if isinstance(review, dict):
+                    propagation.setdefault("review_history", []).append({"kind": "plan", **review, "verdict": outcome["verdict"]})
+            else:
+                return self._invalid_or_failed(state, ["REQUIRES_PATCH is not supported for this propagation stage"])
+            propagation.update({"next_stage": target, "stage_index": propagation["stages"].index(target)})
+            updated = replace(state, propagation={**state.propagation, change_id: propagation}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome)
+            self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
+            return StepResult(self._save(schedule(self.config, updated)), "propagation_patch")
+        if Verdict(outcome["verdict"]) != Verdict.APPROVED:
+            return self._invalid_or_failed(state, [f"unsupported propagation verdict {outcome['verdict']}"])
+
+        change = dict(state.authority_changes[change_id])
+        if stage == Stage.CHANGE_PROPAGATION_PLANNING.value:
+            plan, errors = validate_propagation_plan(outcome.get("propagation_plan"), propagation["stages"])
+            if errors:
+                return self._invalid_or_failed(state, errors)
+            propagation["plan"] = plan
+        elif stage == Stage.CONTRACT_REVISION.value:
+            required = source_path_for_role(self.config, "ENGINEERING_CONTRACT")
+            artifacts, errors = validate_candidate_artifacts(self.config, outcome.get("candidate_artifacts"), required_path=required)
+            if errors:
+                return self._invalid_or_failed(state, errors)
+            stored = self._persist_candidate_artifacts(change_id, artifacts or [])
+            propagation["candidate_artifacts"] = self._merge_artifacts(propagation.get("candidate_artifacts", []), stored)
+            propagation["contract_revision_report"] = outcome.get("contract_revision_report", {})
+        elif stage == Stage.CONTRACT_REVISION_REVIEW.value:
+            review = outcome.get("contract_review", outcome.get("review", {"verdict": outcome["verdict"], "summary": outcome.get("summary", "")}))
+            if not isinstance(review, dict):
+                return self._invalid_or_failed(state, ["contract_review must be an object"])
+            propagation.setdefault("reviews", {})["contract"] = {**review, "verdict": outcome["verdict"]}
+        elif stage == Stage.PLAN_REVISION.value:
+            required = source_path_for_role(self.config, "IMPLEMENTATION_PLAN")
+            artifacts, errors = validate_candidate_artifacts(self.config, outcome.get("candidate_artifacts"), required_path=required)
+            if errors:
+                return self._invalid_or_failed(state, errors)
+            stored = self._persist_candidate_artifacts(change_id, artifacts or [])
+            propagation["candidate_artifacts"] = self._merge_artifacts(propagation.get("candidate_artifacts", []), stored)
+            propagation["plan_revision_report"] = outcome.get("plan_revision_report", {})
+        elif stage == Stage.PLAN_REVISION_REVIEW.value:
+            review = outcome.get("plan_review", outcome.get("review", {"verdict": outcome["verdict"], "summary": outcome.get("summary", "")}))
+            if not isinstance(review, dict):
+                return self._invalid_or_failed(state, ["plan_review must be an object"])
+            propagation.setdefault("reviews", {})["plan"] = {**review, "verdict": outcome["verdict"]}
+        elif stage == Stage.PLAN_GRAPH_BUILD.value:
+            graph, errors = validate_plan_graph(self.config, outcome.get("plan_graph"), contract_text=contract_text(self.config, state))
+            if errors:
+                return self._invalid_or_failed(state, errors)
+            expected_plan_sha = self._candidate_artifact_sha(propagation, source_path_for_role(self.config, "IMPLEMENTATION_PLAN")) or next((source.sha256 for source in self.config.authoritative_sources if (source.role or "").upper() == "IMPLEMENTATION_PLAN" or "plan" in source.path.lower() or "计划" in source.path), None)
+            if expected_plan_sha and graph["plan_sha256"].lower() != expected_plan_sha.lower():
+                return self._invalid_or_failed(state, ["plan_graph.plan_sha256 does not match the candidate Plan"])
+            graph_affected = set(change.get("directly_affected_tasks", ())) | set(dependency_closure(self.config, change.get("directly_affected_tasks", ()), replace(state, plan_graph=graph)))
+            reconciliation = reconcile_plan_graph(self.config, state, graph, graph_affected)
+            propagation["plan_graph"] = graph
+            propagation["graph_reconciliation"] = reconciliation
+            change["propagation_ready"] = True
+            state = replace(state, plan_graph=graph, plan_graph_reconciliation=reconciliation)
+        elif stage == Stage.TASK_REBASE_ANALYSIS.value:
+            affected = set(change.get("directly_affected_tasks", ()))
+            rebase, errors = validate_rebase(outcome.get("task_rebase"), affected)
+            if errors:
+                return self._invalid_or_failed(state, errors)
+            propagation["task_rebase"] = rebase
+            propagation["rebase_ready"] = True
+        else:
+            return self._invalid_or_failed(state, [f"unsupported propagation stage {stage}"])
+
+        self.store.save_authority_change(change)
+
+        index = propagation["stages"].index(stage) + 1
+        if index < len(propagation["stages"]):
+            propagation.update({"stage_index": index, "next_stage": propagation["stages"][index]})
+            self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
+            updated = replace(state, authority_changes={**state.authority_changes, change_id: change}, propagation={**state.propagation, change_id: propagation}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome)
+            return StepResult(self._save(schedule(self.config, updated)), "propagation_stage_complete")
+
+        request = {
+            "decision_id": f"ADR-AUTHORITY-PROMOTION-{change_id}", "category": "AUTHORITY_PROMOTION",
+            "question": f"Promote authority change {change_id} to the accepted Architecture/Contract/Plan baseline?",
+            "context": f"Candidate Human Guide, Contract, Plan and Plan Graph are prepared. Change summary: {change.get('analysis_summary', '')}",
+            "why_human_required": "The authoritative rule requires Human Review and immutable Revision 2 freeze before promotion.",
+            "options": ["promote", "defer"], "recommended_option": "promote", "allow_freeform": False,
+            "source_change": change_id, "source_stage": Stage.TASK_REBASE_ANALYSIS.value,
+            "affected_requirements": change.get("affected_requirements", []), "affected_contract_anchors": change.get("affected_contract_anchors", []),
+            "affected_tasks": change.get("directly_affected_tasks", []), "affected_work_items": change.get("directly_affected_tasks", []),
+            "directly_blocked_items": change.get("directly_affected_tasks", []),
+        }
+        propagation.update({"status": "WAITING_PROMOTION", "next_stage": None, "promotion_decision_id": request["decision_id"], "machine_complete": True})
+        change["propagation_ready"] = True
+        self.store.save_authority_change(change)
+        self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
+        updated, _ = self._record_decisions(replace(state, authority_changes={**state.authority_changes, change_id: change}, propagation={**state.propagation, change_id: propagation}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, status=WorkflowStatus.RUNNING.value, last_outcome=outcome), {"decision_requests": [request], "directly_affected_work": change.get("directly_affected_tasks", [])})
+        updated = replace(updated, authority_changes={**updated.authority_changes, change_id: change}, propagation={**updated.propagation, change_id: propagation})
+        updated = schedule(self.config, updated)
+        self.logger.emit("authority_promotion_request_created", change_id=change_id, decision_id=request["decision_id"])
+        return StepResult(self._save(updated), "authority_promotion_request")
+
+    def _persist_candidate_artifacts(self, change_id: str, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        stored: list[dict[str, Any]] = []
+        for artifact in artifacts:
+            path = self.store.save_candidate_artifact(change_id, artifact["path"], artifact["content"])
+            stored.append({"path": artifact["path"], "sha256": artifact["sha256"], "stored_path": str(path), "content": artifact["content"]})
+        return stored
+
+    @staticmethod
+    def _merge_artifacts(existing: list[dict[str, Any]], additions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result = {str(item.get("path")): item for item in existing if isinstance(item, dict) and item.get("path")}
+        result.update({str(item["path"]): item for item in additions})
+        return list(result.values())
+
+    @staticmethod
+    def _candidate_artifact_sha(propagation: dict[str, Any], path: str | None) -> str | None:
+        if not path:
+            return None
+        for item in propagation.get("candidate_artifacts", []):
+            if item.get("path") == path:
+                return item.get("sha256")
+        return None
 
     def _invalid_or_failed(self, state: WorkflowState, errors: list[str]) -> StepResult:
         self.logger.emit("outcome_invalid", run_id=state.run_id, stage=state.current_stage, errors=errors)
@@ -319,7 +492,7 @@ class Orchestrator:
             raw_requests = [raw_requests]
         if not isinstance(raw_requests, list) or not raw_requests:
             raw_requests = [outcome]
-        known_tasks = {task.id for _, task in self.config.tasks}
+        known_tasks = {str(item.get("id")) for item in (state.plan_graph or {}).get("tasks", []) if isinstance(item, dict) and isinstance(item.get("id"), str)} or {task.id for _, task in self.config.tasks}
         decisions = dict(state.decisions)
         unresolved: list[str] = []
         for raw in raw_requests:
@@ -427,12 +600,104 @@ class Orchestrator:
             },
             "created_at": resolved_at,
         }
+        next_state = replace(state, decisions=decisions, adrs={**state.adrs, str(resolved.adr_id): adr}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
+        promoted = resolved.category == "AUTHORITY_PROMOTION" and value == "promote"
+        if promoted:
+            next_state = self._promote_authority_change(next_state, resolved)
+        elif resolved.source_stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value:
+            change = next((item for item in next_state.authority_changes.values() if item.get("change_id") == resolved.source_change or item.get("change_id") == resolved.source_change), None)
+            if change and resolved.source_change not in next_state.propagation:
+                propagation = self._new_propagation(change)
+                next_state = replace(next_state, propagation={**next_state.propagation, resolved.source_change: propagation}, current_authority_change_id=resolved.source_change)
+            elif change and resolved.source_change in next_state.propagation:
+                propagation = dict(next_state.propagation[resolved.source_change])
+                propagation.update({"status": "RUNNING", "next_stage": propagation.get("next_stage") or propagation.get("stages", [None])[0]})
+                next_state = replace(next_state, propagation={**next_state.propagation, resolved.source_change: propagation}, current_authority_change_id=resolved.source_change)
+        # Promotion performs external project writes only after all checks pass.
+        # Persist the decision/ADR after that preflight so a rejected promotion
+        # does not leave a false RESOLVED record behind.
         self.store.save_decision(resolved)
         self.store.save_adr(adr)
-        next_state = replace(state, decisions=decisions, adrs={**state.adrs, str(resolved.adr_id): adr}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
-        next_state = schedule(self.config, next_state)
+        # Promotion deliberately hands the first affected implementation back
+        # at TASK_PATCH.  Generic scheduling would classify that active item as
+        # non-ready and turn the valid rebase handoff into DEPENDENCY_BLOCKED.
+        if not (promoted and next_state.current_stage in AGENT_STAGE_NAMES and next_state.current_task):
+            next_state = schedule(self.config, next_state)
         self.logger.emit("decision_resolved", decision_id=decision_id, adr_id=resolved.adr_id, next_stage=next_state.current_stage)
         return self._save(next_state)
+
+    def _promote_authority_change(self, state: WorkflowState, decision: HumanDecision) -> WorkflowState:
+        change_id = decision.source_change
+        change = state.authority_changes.get(change_id)
+        propagation = state.propagation.get(change_id)
+        if not change or not propagation or propagation.get("status") != "WAITING_PROMOTION":
+            raise OrchestratorError("authority promotion record is incomplete")
+        current_scan = scan_authority_changes(self.config, self.store, state)
+        current = next((item for item in current_scan.changes if item.get("change_id") == change_id), None)
+        if not current or current.get("candidate_sha256") != change.get("candidate_sha256"):
+            raise OrchestratorError("authority candidate changed since propagation analysis")
+        if any(review.get("verdict") != Verdict.APPROVED.value for review in propagation.get("reviews", {}).values() if isinstance(review, dict)):
+            raise OrchestratorError("all propagation reviews must be approved before promotion")
+        project = Path(self.config.project_path)
+        before_after: list[dict[str, Any]] = []
+        for artifact in propagation.get("candidate_artifacts", []):
+            destination = safe_project_path(project, str(artifact.get("path", "")))
+            stored = Path(str(artifact.get("stored_path", "")))
+            if destination is None or not stored.is_file():
+                raise OrchestratorError("candidate artifact is missing or unsafe")
+            content = stored.read_text(encoding="utf-8")
+            import hashlib
+            if hashlib.sha256(content.encode()).hexdigest() != artifact.get("sha256"):
+                raise OrchestratorError("candidate artifact hash mismatch")
+            old_digest = hashlib.sha256(destination.read_bytes()).hexdigest() if destination.is_file() else None
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+            before_after.append({"path": artifact["path"], "before_sha256": old_digest, "after_sha256": artifact["sha256"]})
+        candidate_source = safe_project_path(project, str(change.get("source_path", "")))
+        configured_source = safe_project_path(project, str(change.get("configured_source_path", "")))
+        if candidate_source is None or configured_source is None or not candidate_source.is_file():
+            raise OrchestratorError("Human Guide candidate is missing or unsafe")
+        import hashlib
+        if hashlib.sha256(candidate_source.read_bytes()).hexdigest() != change.get("candidate_sha256"):
+            raise OrchestratorError("Human Guide candidate hash mismatch")
+        if candidate_source.resolve() != configured_source.resolve():
+            old_digest = hashlib.sha256(configured_source.read_bytes()).hexdigest() if configured_source.is_file() else None
+            configured_source.parent.mkdir(parents=True, exist_ok=True)
+            configured_source.write_bytes(candidate_source.read_bytes())
+            before_after.append({"path": str(change.get("configured_source_path")), "before_sha256": old_digest, "after_sha256": change.get("candidate_sha256")})
+        ledger = bootstrap_ledger(self.config, self.store)
+        # Downstream candidate authorities promoted with this change become
+        # accepted revisions together with the Human Guide.  Otherwise the
+        # next bounded run would rediscover the just-promoted Contract/Plan as
+        # unrelated frozen mismatches.
+        artifact_by_path = {str(item.get("path")): item for item in propagation.get("candidate_artifacts", []) if isinstance(item, dict)}
+        for source in self.config.authoritative_sources:
+            configured_path = str(source.path)
+            artifact = artifact_by_path.get(configured_path)
+            if not artifact:
+                continue
+            entry = ledger.setdefault("sources", {}).setdefault(source_id(source), {})
+            entry.update({
+                "accepted_sha256": artifact.get("sha256"),
+                "candidate_sha256": artifact.get("sha256"),
+                "status": "ACCEPTED",
+                "change_id": change_id,
+                "path": configured_path,
+            })
+        entry = ledger.setdefault("sources", {}).setdefault(str(change.get("source_id")), {})
+        entry.update({"accepted_sha256": change.get("candidate_sha256"), "candidate_sha256": change.get("candidate_sha256"), "status": "ACCEPTED", "change_id": change_id, "path": change.get("configured_source_path")})
+        self.store.save_authority_ledger(ledger)
+        change = {**change, "status": "PROMOTED", "promoted_at": now_iso(), "promotion": {"decision_id": decision.decision_id, "before_after": before_after}}
+        propagation = {**propagation, "status": "PROMOTED", "promoted_at": now_iso(), "promotion": {"decision_id": decision.decision_id, "before_after": before_after}}
+        self.store.save_authority_change(change)
+        self.store.save_propagation_json(change_id, "promotion.json", propagation["promotion"])
+        direct = list(change.get("directly_affected_tasks", ()))
+        graph = state.plan_graph
+        current_task = direct[0] if direct and graph else None
+        group = None
+        if current_task and graph:
+            group = next((item.get("group") for item in graph.get("tasks", []) if item.get("id") == current_task), None)
+        return replace(state, authority_changes={**state.authority_changes, change_id: change}, propagation={**state.propagation, change_id: propagation}, current_authority_change_id=None, current_stage=Stage.TASK_PATCH.value if current_task else Stage.READY.value, current_group=group, current_task=current_task, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
 
     def status_report(self) -> dict[str, Any]:
         state = recompute(self.config, self._load_or_initialize())
@@ -446,6 +711,9 @@ class Orchestrator:
             "work": counts,
             "pending_decisions": [decision.to_dict() for decision in pending],
             "authority_changes": list(state.authority_changes.values()),
+            "propagation": state.propagation,
+            "plan_graph": state.plan_graph,
+            "plan_graph_reconciliation": state.plan_graph_reconciliation,
             "unaffected_work_continues": state.status == WorkflowStatus.RUNNING.value and bool(ready_work(self.config, state)),
             "state": state.to_dict(),
         }
