@@ -21,8 +21,10 @@ class Stage(str, Enum):
     HUMAN_PLAN_FREEZE = "HUMAN_PLAN_FREEZE"
     HUMAN_GROUP_APPROVAL = "HUMAN_GROUP_APPROVAL"
     FINAL_VERIFICATION = "FINAL_VERIFICATION"
+    AUTHORITY_CHANGE_ANALYSIS = "AUTHORITY_CHANGE_ANALYSIS"
     HUMAN_FINAL_ACCEPTANCE = "HUMAN_FINAL_ACCEPTANCE"
     WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+    WAITING_FOR_AUTHORITY_CHANGE = "WAITING_FOR_AUTHORITY_CHANGE"
     HARD_STOP = "HARD_STOP"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -56,6 +58,7 @@ SCOPED_DECISION_VERDICTS = {Verdict.OPEN_CONTRACT_ISSUE, Verdict.ARCHITECTURE_DE
 class WorkflowStatus(str, Enum):
     RUNNING = "RUNNING"
     WAITING_HUMAN = "WAITING_HUMAN"
+    WAITING_AUTHORITY_CHANGE = "WAITING_AUTHORITY_CHANGE"
     HARD_STOPPED = "HARD_STOPPED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -68,6 +71,7 @@ class WorkItemStatus(str, Enum):
     COMPLETED = "COMPLETED"
     REQUIRES_PATCH = "REQUIRES_PATCH"
     BLOCKED_BY_HUMAN_DECISION = "BLOCKED_BY_HUMAN_DECISION"
+    BLOCKED_BY_AUTHORITY_CHANGE = "BLOCKED_BY_AUTHORITY_CHANGE"
     WAITING_DEPENDENCY = "WAITING_DEPENDENCY"
     FAILED = "FAILED"
     RECOVERY_UNCERTAIN = "RECOVERY_UNCERTAIN"
@@ -86,6 +90,36 @@ class AuthoritativeSource:
     git_commit: str | None = None
     git_tag: str | None = None
     mutable_after_start: bool = False
+    source_id: str | None = None
+    role: str | None = None
+
+
+@dataclass
+class AuthorityChange:
+    """Durable, machine-readable change record; analysis never stores chain-of-thought."""
+
+    change_id: str
+    source_path: str
+    source_role: str
+    base_sha256: str
+    candidate_sha256: str
+    detected_at: str = field(default_factory=now_iso)
+    classification: str | None = None
+    semantic_change: bool | None = None
+    affected_requirements: list[str] = field(default_factory=list)
+    affected_contract_anchors: list[str] = field(default_factory=list)
+    directly_affected_tasks: list[str] = field(default_factory=list)
+    dependency_affected_tasks: list[str] = field(default_factory=list)
+    unaffected_tasks: list[str] = field(default_factory=list)
+    machine_resolvable: bool | None = None
+    human_decision_required: bool | None = None
+    human_decision_requests: list[dict[str, Any]] = field(default_factory=list)
+    required_propagation: list[str] = field(default_factory=list)
+    analysis_summary: str = ""
+    status: str = "CHANGE_PENDING"
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
 
 
 @dataclass(frozen=True)
@@ -183,6 +217,8 @@ class WorkflowState:
     work_items: dict[str, "WorkItemState"] = field(default_factory=dict)
     decisions: dict[str, "HumanDecision"] = field(default_factory=dict)
     adrs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    current_authority_change_id: str | None = None
+    authority_changes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         value = self.__dict__.copy()
@@ -220,6 +256,8 @@ class WorkItemState:
     dependencies: tuple[str, ...] = ()
     blocking_decision_ids: list[str] = field(default_factory=list)
     dependency_blocked_by_decision_ids: list[str] = field(default_factory=list)
+    blocking_authority_change_ids: list[str] = field(default_factory=list)
+    dependency_blocked_by_authority_change_ids: list[str] = field(default_factory=list)
     last_outcome: dict[str, Any] | None = None
     attempt: int = 0
 
@@ -237,6 +275,8 @@ class WorkItemState:
             dependencies=tuple(value.get("dependencies", ()) or ()),
             blocking_decision_ids=list(value.get("blocking_decision_ids", ()) or ()),
             dependency_blocked_by_decision_ids=list(value.get("dependency_blocked_by_decision_ids", ()) or ()),
+            blocking_authority_change_ids=list(value.get("blocking_authority_change_ids", ()) or ()),
+            dependency_blocked_by_authority_change_ids=list(value.get("dependency_blocked_by_authority_change_ids", ()) or ()),
             last_outcome=value.get("last_outcome"),
             attempt=int(value.get("attempt", 0)),
         )

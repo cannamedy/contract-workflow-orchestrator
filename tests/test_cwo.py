@@ -447,7 +447,7 @@ groups:
         self.assertEqual(result.state.current_stage, Stage.TASK_INDEPENDENT_REVIEW.value)
         self.assertEqual(runner.calls, [])
 
-    def test_frozen_source_integrity_blocks(self):
+    def test_external_authority_change_enters_analysis_instead_of_global_stop(self):
         source = self.project / "contract.md"
         source.write_text("original", encoding="utf-8")
         config = self.workflow()
@@ -456,8 +456,9 @@ groups:
         path = self.project / ".contract-workflow" / "workflow.yaml"
         path.write_text(path.read_text().replace("authoritative_sources: []", f"authoritative_sources:\n  - path: contract.md\n    sha256: {digest}"), encoding="utf-8")
         config = load_workflow(path, self.project)
-        state = Orchestrator(config).run()
-        self.assertEqual(state.current_stage, Stage.HARD_STOP.value)
+        state = Orchestrator(config).step().state
+        self.assertEqual(state.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
+        self.assertEqual(state.status, "RUNNING")
 
     def scoped_fixture(self):
         source = Path(__file__).parent / "fixtures" / "scoped-human-gate" / ".contract-workflow"

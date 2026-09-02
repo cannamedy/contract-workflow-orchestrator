@@ -4,6 +4,10 @@
 |---|---|---|
 | INITIALIZING | setup | READY |
 | READY | setup | TASK_EXECUTION |
+| any bounded-run boundary | registered external authority candidate | AUTHORITY_CHANGE_ANALYSIS |
+| AUTHORITY_CHANGE_ANALYSIS | C0/C1, no semantic/task impact | accepted revision, then normal scheduling |
+| AUTHORITY_CHANGE_ANALYSIS | C2-C4 machine-resolvable | scoped authority blockers and unaffected continuation |
+| AUTHORITY_CHANGE_ANALYSIS | unresolved authority ambiguity | existing scoped Decision Request / `WAITING_FOR_HUMAN` when no READY work |
 | TASK_EXECUTION | APPROVED | TASK_INDEPENDENT_REVIEW |
 | TASK_INDEPENDENT_REVIEW | REQUIRES_PATCH | TASK_PATCH |
 | TASK_PATCH | APPROVED | TASK_INDEPENDENT_REVIEW |
@@ -21,6 +25,8 @@
 | `WAITING_FOR_HUMAN` | pending decisions and no READY work | `cwo decide` then `cwo resume` |
 
 `HUMAN_PLAN_FREEZE`, `HUMAN_GROUP_APPROVAL`, and `HUMAN_FINAL_ACCEPTANCE` cannot be bypassed by a model outcome. `approve` only releases the exact pending gate.
+
+An authority candidate is not accepted as the new baseline merely because its hash changed. `AUTHORITY_CHANGE_ANALYSIS` persists the candidate and its propagation requirements. Only a C0/C1 analysis with `semantic_change=false` and no affected task auto-accepts. An active Agent's unauthorized authority mutation remains `UNAUTHORIZED_AUTHORITY_MUTATION` and enters `HARD_STOP`.
 
 ## Scoped Human Gates
 

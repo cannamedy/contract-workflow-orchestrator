@@ -30,6 +30,10 @@ The default policy is conservative: gated mode, no automatic commit, push, tag, 
 
 Projects declare `.contract-workflow/workflow.yaml`. See `examples/workflow.yaml` for a generic configuration. Runtime state defaults to `~/.local/share/contract-workflow/<project-key>` and can be redirected with `CWO_STATE_DIR`; it is kept outside the target Git repository.
 
+## Authority Change Intake
+
+When a declared authority file changes between bounded Agent runs, CWO records a runtime-only Change Record under `authority/changes/` and runs `AUTHORITY_CHANGE_ANALYSIS`. The ledger separates the workflow digest from accepted authority revisions, so normal Human Guide evolution does not require editing `workflow.yaml`. The Agent classifies C0-C4 and declares direct impact; CWO validates the declaration and computes downstream dependency closure. Directly affected work is `BLOCKED_BY_AUTHORITY_CHANGE`, its descendants wait for dependencies, and independent READY work continues. C0/C1 changes with no semantic or task impact are auto-accepted. C2-C4 do not trigger automatic Contract/Plan rewriting in v0.3.0.
+
 Every Agent run writes `runs/<run-id>/outcome.json`, `prompt.md`, separated stdout/stderr, and metadata. Only a schema-validated outcome plus deterministic checks can select the next transition. Missing, malformed, mismatched, or unknown outcomes are retryable up to the configured bound; unresolved uncertainty becomes a hard stop.
 
 ## Scoped Human Gates

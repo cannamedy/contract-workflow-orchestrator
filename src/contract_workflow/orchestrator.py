@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity
+from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger
 from .logging import EventLogger
 from .models import (
     DecisionStatus,
@@ -79,6 +80,7 @@ class Orchestrator:
         if state is None:
             state = initial_state(self.config)
             state = recompute(self.config, state)
+            bootstrap_ledger(self.config, self.store)
             self.store.save(state)
             self.logger.emit("workflow_loaded", project=self.config.project_name, workflow_digest=self.config.digest)
         else:
@@ -92,11 +94,44 @@ class Orchestrator:
                 self.store.save(state)
         return state
 
-    def _audit_gate(self) -> tuple[GitAudit, list[str]]:
-        integrity = source_integrity(Path(self.config.project_path), self.config.authoritative_sources)
-        audit = audit_git(Path(self.config.project_path), self.config)
+    def _audit_gate(self, scan: AuthorityScan | None = None) -> tuple[GitAudit, list[str], AuthorityScan]:
+        scan = scan or scan_authority_changes(self.config, self.store, self._load_or_initialize_state_only())
+        integrity = source_integrity(Path(self.config.project_path), self.config.authoritative_sources, scan.integrity_overrides or {})
+        configured_authority_paths = tuple(str((Path(source.path) if Path(source.path).is_absolute() else Path(self.config.project_path) / source.path).resolve()) for source in self.config.authoritative_sources if not source.mutable_after_start)
+        audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))))
         self.logger.emit("doctor_check", git_blocking=audit.blocking, integrity_errors=len(integrity), classifications=[item.value for item in audit.classifications])
-        return audit, integrity
+        return audit, integrity, scan
+
+    def _load_or_initialize_state_only(self) -> WorkflowState:
+        return self.store.load() or initial_state(self.config)
+
+    def _authority_gate(self, state: WorkflowState) -> StepResult | None:
+        scan = scan_authority_changes(self.config, self.store, state)
+        if scan.unauthorized:
+            reason = "; ".join(scan.unauthorized)
+            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code="UNAUTHORIZED_AUTHORITY_MUTATION", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
+            self.logger.emit("hard_stop_entered", reason=reason, stop_code="UNAUTHORIZED_AUTHORITY_MUTATION")
+            return StepResult(self._save(new_state), "hard_stop")
+        if scan.errors:
+            reason = "; ".join(scan.errors)
+            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code="FROZEN_SOURCE_MISMATCH", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
+            self.logger.emit("hard_stop_entered", reason=reason, stop_code="FROZEN_SOURCE_MISMATCH")
+            return StepResult(self._save(new_state), "hard_stop")
+        unanalyzed = [item for item in scan.changes if str(item.get("change_id")) not in state.authority_changes or state.authority_changes.get(str(item.get("change_id")), {}).get("classification") is None]
+        if unanalyzed and state.current_stage != Stage.AUTHORITY_CHANGE_ANALYSIS.value:
+            change = sorted(unanalyzed, key=lambda item: str(item.get("change_id", "")))[0]
+            reset_items = {
+                item_id: replace(item, status=WorkItemStatus.READY.value) if item.status in {WorkItemStatus.RUNNING.value, WorkItemStatus.REQUIRES_PATCH.value} else item
+                for item_id, item in state.work_items.items()
+            }
+            new_state = replace(state, current_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, pending_human_gate=None, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False, current_authority_change_id=str(change["change_id"]), authority_changes={**state.authority_changes, **{str(item["change_id"]): item for item in scan.changes}}, work_items=reset_items, updated_at=now_iso())
+            self.logger.emit("authority_change_detected", change_id=change["change_id"], source_path=change.get("source_path"), base_sha256=change.get("base_sha256"), candidate_sha256=change.get("candidate_sha256"))
+            return StepResult(self._save(new_state), "authority_change_analysis")
+        if unanalyzed and state.current_stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value:
+            merged = {**state.authority_changes, **{str(item["change_id"]): item for item in scan.changes}}
+            if merged != state.authority_changes:
+                return StepResult(self._save(replace(state, authority_changes=merged, updated_at=now_iso())), "authority_change_registered")
+        return None
 
     def _save(self, state: WorkflowState) -> WorkflowState:
         self.store.save(state)
@@ -107,14 +142,17 @@ class Orchestrator:
         if state.total_steps >= self.config.policy.max_total_steps and state.status == WorkflowStatus.RUNNING.value:
             state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, stop_reason="max_total_steps exceeded", stop_code="MAX_TOTAL_STEPS", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
             return StepResult(self._save(state), "hard_stop")
-        if state.status in {WorkflowStatus.COMPLETED.value, WorkflowStatus.HARD_STOPPED.value, WorkflowStatus.FAILED.value, WorkflowStatus.STOPPED.value} or state.current_stage in HUMAN_GATES:
+        authority_result = self._authority_gate(state)
+        if authority_result:
+            return authority_result
+        if state.status in {WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value, WorkflowStatus.STOPPED.value} or state.current_stage in HUMAN_GATES:
             return StepResult(state, "waiting")
 
         if state.current_stage == Stage.WAITING_FOR_HUMAN.value:
             scheduled = schedule(self.config, state)
             return StepResult(self._save(scheduled), "rescheduled" if scheduled.current_stage != state.current_stage else "waiting")
 
-        audit, integrity = self._audit_gate()
+        audit, integrity, scan = self._audit_gate()
         if integrity or audit.blocking:
             reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
             stop_code = "FROZEN_SOURCE_MISMATCH" if integrity else ("UNEXPECTED_UNRELATED_CHANGE" if any(item.classification.value == "UNEXPECTED_UNRELATED_CHANGE" for item in audit.changes) else ("MERGE_CONFLICT" if any(item.classification.value == "MERGE_CONFLICT" for item in audit.changes) else "GIT_AUDIT_BLOCKED"))
@@ -122,6 +160,9 @@ class Orchestrator:
             self.logger.emit("hard_stop_entered", reason=new_state.stop_reason)
             return StepResult(self._save(new_state), "hard_stop")
 
+        if state.current_stage == Stage.WAITING_FOR_AUTHORITY_CHANGE.value:
+            scheduled = schedule(self.config, state)
+            return StepResult(self._save(scheduled), "rescheduled" if scheduled.current_stage != state.current_stage else "waiting")
         if state.current_stage in {Stage.INITIALIZING.value, Stage.READY.value}:
             scheduled = schedule(self.config, state)
             self.logger.emit("transition", from_stage=state.current_stage, to_stage=scheduled.current_stage)
@@ -156,12 +197,17 @@ class Orchestrator:
         outcome_path = run_dir / "outcome.json"
         prompt = self.prompt_builder.build(self.config, state, outcome_path)
         (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "running", "started_at": now_iso()})
+        authority_before = authority_snapshot(self.config, self.store)
+        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "running", "started_at": now_iso(), "authority_snapshot": authority_before})
         self.logger.emit("stage_entered", stage=stage, group=state.current_group, task=state.current_task)
         self.logger.emit("agent_run_started", run_id=run_id, stage=stage, attempt=state.attempt)
         result = self.runner.run(Path(self.config.project_path), prompt, run_dir, self.config.runner.timeout_seconds, env={"CWO_RUN_ID": run_id, "CWO_OUTCOME_PATH": str(outcome_path)})
         _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "completed", "started_at": result.started_at, "finished_at": result.finished_at, "exit_code": result.exit_code, "timed_out": result.timed_out, "runner_metadata": result.runner_metadata})
         self.logger.emit("agent_run_finished", run_id=run_id, stage=stage, exit_code=result.exit_code, timed_out=result.timed_out)
+        if authority_before != authority_snapshot(self.config, self.store):
+            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="UNAUTHORIZED_AUTHORITY_MUTATION: authority changed during Agent invocation", stop_code="UNAUTHORIZED_AUTHORITY_MUTATION", blocked_stage=stage, recoverable=False, updated_at=now_iso())
+            self.logger.emit("hard_stop_entered", reason=new_state.stop_reason, stop_code=new_state.stop_code)
+            return StepResult(self._save(new_state), "hard_stop")
         valid, outcome, errors = validate_outcome(outcome_path, run_id, stage)
         if result.exit_code != 0 or result.timed_out:
             errors = ["runner timed out" if result.timed_out else f"runner process failed with exit code {result.exit_code}"]
@@ -173,6 +219,8 @@ class Orchestrator:
 
     def _apply_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         stage = state.current_stage
+        if stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value:
+            return self._apply_authority_analysis(state, outcome)
         verdict = Verdict(outcome["verdict"])
         if verdict in SCOPED_DECISION_VERDICTS:
             state, unresolved = self._record_decisions(state, outcome)
@@ -194,6 +242,33 @@ class Orchestrator:
         new_state = recompute(self.config, new_state)
         self.logger.emit("transition", from_stage=state.current_stage, to_stage=new_state.current_stage, verdict=outcome["verdict"])
         return StepResult(self._save(new_state), result.action, result.retry_delay)
+
+    def _apply_authority_analysis(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
+        analysis, errors = validate_analysis(self.config, self.store, state, outcome)
+        if errors or analysis is None:
+            return self._invalid_or_failed(state, errors or ["invalid authority change analysis"])
+        change_id = str(analysis["change_id"])
+        change = dict(state.authority_changes.get(change_id, {}))
+        direct = list(analysis["directly_affected_tasks"])
+        computed = sorted(dependency_tasks(self.config, direct))
+        all_tasks = {task.id for _, task in self.config.tasks}
+        record = {**change, **analysis, "dependency_affected_tasks": computed, "unaffected_tasks": sorted(all_tasks - set(direct) - set(computed)), "status": "CHANGE_PENDING" if analysis["human_decision_required"] else "PROPAGATING", "analyzed_at": now_iso()}
+        self.store.save_authority_change(record)
+        ledger = bootstrap_ledger(self.config, self.store)
+        entry = ledger.setdefault("sources", {}).setdefault(record["source_id"], {})
+        if analysis["classification"] in {"C0", "C1"} and not analysis["semantic_change"] and not direct:
+            entry.update({"accepted_sha256": record["candidate_sha256"], "candidate_sha256": record["candidate_sha256"], "path": record["source_path"], "candidate_path": record["source_path"], "status": "ACCEPTED", "change_id": change_id})
+            record["status"] = "ACCEPTED"
+            self.logger.emit("authority_change_auto_accepted", change_id=change_id, classification=analysis["classification"])
+        else:
+            entry.update({"candidate_sha256": record["candidate_sha256"], "status": record["status"], "change_id": change_id})
+            self.logger.emit("authority_change_analyzed", change_id=change_id, classification=analysis["classification"], human_decision_required=analysis["human_decision_required"], required_propagation=analysis["required_propagation"])
+        self.store.save_authority_ledger(ledger)
+        updated = replace(state, authority_changes={**state.authority_changes, change_id: record}, current_authority_change_id=None, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False)
+        if analysis["human_decision_required"]:
+            updated, _ = self._record_decisions(updated, {**outcome, "directly_affected_work": direct, "blocking_scope": {"directly_blocked_items": direct}})
+        updated = schedule(self.config, recompute(self.config, updated))
+        return StepResult(self._save(updated), "authority_change_analyzed")
 
     def _invalid_or_failed(self, state: WorkflowState, errors: list[str]) -> StepResult:
         self.logger.emit("outcome_invalid", run_id=state.run_id, stage=state.current_stage, errors=errors)
@@ -370,6 +445,7 @@ class Orchestrator:
             "stage": state.current_stage,
             "work": counts,
             "pending_decisions": [decision.to_dict() for decision in pending],
+            "authority_changes": list(state.authority_changes.values()),
             "unaffected_work_continues": state.status == WorkflowStatus.RUNNING.value and bool(ready_work(self.config, state)),
             "state": state.to_dict(),
         }
@@ -401,7 +477,7 @@ class Orchestrator:
                     self.logger.emit("late_outcome_validated", run_id=state.run_id, blocked_stage=state.blocked_stage, verdict=late_outcome.get("verdict") if late_outcome else None, resulting_stage=None, valid=False, reason=reason)
                     self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                     raise OrchestratorError(reason)
-                audit, integrity = self._audit_gate()
+                audit, integrity, _ = self._audit_gate()
                 if integrity or audit.blocking or not audit.is_repository or audit.error:
                     reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
                     reason = reason or audit.error or "Git audit blocked"
@@ -436,7 +512,7 @@ class Orchestrator:
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
 
-        audit, integrity = self._audit_gate()
+        audit, integrity, _ = self._audit_gate()
         if integrity or audit.blocking or not audit.is_repository or audit.error:
             reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
             reason = reason or audit.error or "Git audit blocked"
@@ -572,11 +648,13 @@ class Orchestrator:
 
     def dry_run(self) -> dict[str, Any]:
         state = self.store.load() or initial_state(self.config)
-        audit, integrity = self._audit_gate()
+        audit, integrity, scan = self._audit_gate()
         run_id = state.run_id or "dry-run"
-        dry_state = replace(state, run_id=run_id)
+        dry_changes = {str(change["change_id"]): change for change in scan.changes}
+        dry_state = replace(state, run_id=run_id, current_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value if scan.changes else state.current_stage, current_authority_change_id=str(scan.changes[0]["change_id"]) if scan.changes else state.current_authority_change_id, authority_changes={**state.authority_changes, **dry_changes})
         prompt = self.prompt_builder.build(self.config, dry_state, self.store.root / "runs" / run_id / "outcome.json")
-        return {"project": self.config.project_name, "workflow_digest": self.config.digest, "stage": state.current_stage, "possible_action": "blocked" if integrity or audit.blocking else ("agent_run" if state.current_stage in AGENT_STAGES else "transition"), "git_classifications": [item.value for item in audit.classifications], "integrity_errors": integrity, "prompt": prompt}
+        authority_action = "authority_change_analysis" if scan.new_changes or any(str(item.get("change_id")) not in state.authority_changes or state.authority_changes.get(str(item.get("change_id")), {}).get("classification") is None for item in scan.changes) else None
+        return {"project": self.config.project_name, "workflow_digest": self.config.digest, "stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value if authority_action else state.current_stage, "possible_action": authority_action or ("blocked" if integrity or audit.blocking else ("agent_run" if state.current_stage in AGENT_STAGES else "transition")), "authority_changes": list(scan.changes), "authority_change_errors": list(scan.errors) + list(scan.unauthorized), "git_classifications": [item.value for item in audit.classifications], "integrity_errors": integrity, "prompt": prompt}
 
 
 def doctor(project: str | Path, workflow_file: str | Path | None = None) -> dict[str, Any]:

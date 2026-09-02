@@ -24,6 +24,7 @@ AGENT_STAGE_NAMES = frozenset({
     Stage.PLAN_DEFECT_RESOLUTION.value,
     Stage.PLAN_REVISION_REVIEW.value,
     Stage.FINAL_VERIFICATION.value,
+    Stage.AUTHORITY_CHANGE_ANALYSIS.value,
 })
 HUMAN_GATE_NAMES = frozenset({
     Stage.HUMAN_PLAN_FREEZE.value,
@@ -47,6 +48,11 @@ def _descendants(config: WorkflowConfig, roots: Iterable[str]) -> set[str]:
                 result.add(task_id)
                 frontier.add(task_id)
     return result
+
+
+def dependency_closure(config: WorkflowConfig, roots: Iterable[str]) -> set[str]:
+    """Return the deterministic downstream task closure for authority/decision blockers."""
+    return _descendants(config, roots)
 
 
 def _fresh_work_items(config: WorkflowConfig, state: WorkflowState) -> dict[str, WorkItemState]:
@@ -83,6 +89,8 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
     decisions: dict[str, HumanDecision] = {}
     direct_by_task: dict[str, list[str]] = {task_id: [] for task_id in all_ids}
     dependency_by_task: dict[str, list[str]] = {task_id: [] for task_id in all_ids}
+    authority_direct_by_task: dict[str, list[str]] = {task_id: [] for task_id in all_ids}
+    authority_dependency_by_task: dict[str, list[str]] = {task_id: [] for task_id in all_ids}
 
     for decision in pending:
         direct = set(decision.directly_blocked_items) & all_ids
@@ -98,6 +106,16 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
         )
     decisions.update({decision.decision_id: decision for decision in state.decisions.values() if decision.status != DecisionStatus.PENDING.value})
 
+    for change_id, change in state.authority_changes.items():
+        if change.get("status") not in {"CHANGE_PENDING", "PROPAGATING"}:
+            continue
+        direct = set(change.get("directly_affected_tasks", ())) & all_ids
+        dependent = _descendants(config, direct)
+        for task_id in direct:
+            authority_direct_by_task[task_id].append(change_id)
+        for task_id in dependent - direct:
+            authority_dependency_by_task[task_id].append(change_id)
+
     items: dict[str, WorkItemState] = {}
     for task_id, item in state.work_items.items():
         if task_id not in task_map:
@@ -105,23 +123,28 @@ def recompute(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
         _, task = task_map[task_id]
         direct_ids = sorted(direct_by_task[task_id])
         dependency_ids = sorted(dependency_by_task[task_id])
+        authority_direct_ids = sorted(authority_direct_by_task[task_id])
+        authority_dependency_ids = sorted(authority_dependency_by_task[task_id])
         status = item.status
-        if status == WorkItemStatus.COMPLETED.value:
+        if authority_direct_ids:
+            status = WorkItemStatus.BLOCKED_BY_AUTHORITY_CHANGE.value
+        elif status == WorkItemStatus.COMPLETED.value:
             direct_ids = []
             dependency_ids = []
         elif task_id == state.current_task and state.current_stage in AGENT_STAGE_NAMES:
             status = WorkItemStatus.REQUIRES_PATCH.value if state.current_stage == Stage.TASK_PATCH.value else WorkItemStatus.RUNNING.value
         elif direct_ids:
             status = WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value
-        elif any(state.work_items.get(dep, WorkItemState(dep, "")).status != WorkItemStatus.COMPLETED.value for dep in task.dependencies):
+        elif authority_dependency_ids or dependency_ids or any(state.work_items.get(dep, WorkItemState(dep, "")).status != WorkItemStatus.COMPLETED.value for dep in task.dependencies):
             status = WorkItemStatus.WAITING_DEPENDENCY.value
         elif status in {
             WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value,
+            WorkItemStatus.BLOCKED_BY_AUTHORITY_CHANGE.value,
             WorkItemStatus.WAITING_DEPENDENCY.value,
             WorkItemStatus.READY.value,
         }:
             status = WorkItemStatus.READY.value
-        items[task_id] = replace(item, status=status, dependencies=tuple(task.dependencies), blocking_decision_ids=direct_ids, dependency_blocked_by_decision_ids=dependency_ids)
+        items[task_id] = replace(item, status=status, dependencies=tuple(task.dependencies), blocking_decision_ids=direct_ids, dependency_blocked_by_decision_ids=dependency_ids, blocking_authority_change_ids=authority_direct_ids, dependency_blocked_by_authority_change_ids=authority_dependency_ids)
     return replace(state, work_items=items, decisions=decisions)
 
 
@@ -173,6 +196,17 @@ def schedule(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
             attempt=0,
             pending_human_gate=None,
             status=WorkflowStatus.WAITING_HUMAN.value,
+        )
+    if any(change.get("status") in {"CHANGE_PENDING", "PROPAGATING"} for change in state.authority_changes.values()):
+        return replace(
+            state,
+            current_stage=Stage.WAITING_FOR_AUTHORITY_CHANGE.value,
+            current_group=None,
+            current_task=None,
+            run_id=None,
+            attempt=0,
+            pending_human_gate=None,
+            status=WorkflowStatus.WAITING_AUTHORITY_CHANGE.value,
         )
     if state.work_items and all(item.status == WorkItemStatus.COMPLETED.value for item in state.work_items.values()):
         return replace(state, current_stage=Stage.FINAL_VERIFICATION.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)

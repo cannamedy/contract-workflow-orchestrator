@@ -10,7 +10,7 @@ from .orchestrator import Orchestrator, OrchestratorError, doctor
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.2.0")
+    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.3.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)

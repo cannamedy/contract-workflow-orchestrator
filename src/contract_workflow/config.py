@@ -77,7 +77,7 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
         source = _mapping(item, f"authoritative_sources[{index}]")
         if not isinstance(source.get("path"), str) or not isinstance(source.get("sha256"), str):
             raise WorkflowConfigError("authoritative source requires path and sha256")
-        sources.append(AuthoritativeSource(path=source["path"], sha256=source["sha256"], git_commit=source.get("git_commit"), git_tag=source.get("git_tag"), mutable_after_start=bool(source.get("mutable_after_start", False))))
+        sources.append(AuthoritativeSource(path=source["path"], sha256=source["sha256"], git_commit=source.get("git_commit"), git_tag=source.get("git_tag"), mutable_after_start=bool(source.get("mutable_after_start", False)), source_id=source.get("source_id"), role=source.get("role")))
     skill_raw = _mapping(raw.get("skills"), "skills")
     skills: dict[str, SkillSpec] = {}
     for role, item in skill_raw.items():

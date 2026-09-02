@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import ast
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -14,6 +15,7 @@ class GitClassification(str, Enum):
     EXPECTED_TARGET_ARTIFACT = "EXPECTED_TARGET_ARTIFACT"
     AUTHORIZED_MUTABLE_TRACKER = "AUTHORIZED_MUTABLE_TRACKER"
     FROZEN_AUTHORITY_CHANGE = "FROZEN_AUTHORITY_CHANGE"
+    REGISTERED_AUTHORITY_CHANGE = "REGISTERED_AUTHORITY_CHANGE"
     UNEXPECTED_RELATED_CHANGE = "UNEXPECTED_RELATED_CHANGE"
     UNEXPECTED_UNRELATED_CHANGE = "UNEXPECTED_UNRELATED_CHANGE"
     MERGE_CONFLICT = "MERGE_CONFLICT"
@@ -37,7 +39,7 @@ class GitAudit:
 
 
 def _git(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(project), *args], text=True, capture_output=True, check=False)
+    return subprocess.run(["git", "-C", str(project), "-c", "core.quotePath=false", *args], text=True, capture_output=True, check=False)
 
 
 def _source_paths(project: Path, sources: tuple[AuthoritativeSource, ...]) -> set[str]:
@@ -53,7 +55,19 @@ def _matches(path: str, patterns: tuple[str, ...], project: Path) -> bool:
     return any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(path, pattern) for pattern in patterns)
 
 
-def audit_git(project: Path, config: WorkflowConfig) -> GitAudit:
+def _decode_git_path(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        try:
+            decoded = ast.literal_eval(value)
+            if isinstance(decoded, str):
+                return decoded
+        except (SyntaxError, ValueError):
+            pass
+    return value
+
+
+def audit_git(project: Path, config: WorkflowConfig, registered_authority_paths: tuple[str, ...] = ()) -> GitAudit:
     root = _git(project, "rev-parse", "--show-toplevel")
     if root.returncode != 0:
         return GitAudit(False, (), (GitClassification.UNKNOWN,), True, root.stderr.strip() or "not a git repository")
@@ -61,6 +75,7 @@ def audit_git(project: Path, config: WorkflowConfig) -> GitAudit:
     if result.returncode != 0:
         return GitAudit(True, (), (GitClassification.UNKNOWN,), True, result.stderr.strip())
     frozen = _source_paths(project, tuple(source for source in config.authoritative_sources if not source.mutable_after_start))
+    registered = {str(Path(path).resolve()) for path in registered_authority_paths}
     expected: list[str] = []
     for _, task in config.tasks:
         expected.extend(task.expected_outputs)
@@ -70,10 +85,12 @@ def audit_git(project: Path, config: WorkflowConfig) -> GitAudit:
         if len(line) < 3:
             continue
         status, raw_path = line[:2], line[3:]
-        path = raw_path.split(" -> ")[-1]
+        path = _decode_git_path(raw_path.split(" -> ")[-1])
         absolute = str((project / path).resolve())
         if "U" in status or status in {"AA", "DD"}:
             kind = GitClassification.MERGE_CONFLICT
+        elif absolute in registered:
+            kind = GitClassification.REGISTERED_AUTHORITY_CHANGE
         elif absolute in frozen:
             kind = GitClassification.FROZEN_AUTHORITY_CHANGE
         elif path == ".contract-workflow/workflow.yaml" or path.startswith(".contract-workflow/"):
@@ -90,16 +107,22 @@ def audit_git(project: Path, config: WorkflowConfig) -> GitAudit:
     return GitAudit(True, tuple(changes), classes, blocking)
 
 
-def source_integrity(project: Path, sources: tuple[AuthoritativeSource, ...]) -> list[str]:
+def source_integrity(project: Path, sources: tuple[AuthoritativeSource, ...], overrides: dict[str, tuple[str, str]] | None = None) -> list[str]:
     errors: list[str] = []
     for source in sources:
-        path = Path(source.path)
-        path = path if path.is_absolute() else project / path
+        configured = Path(source.path)
+        configured = configured if configured.is_absolute() else project / configured
+        path = configured
+        override = (overrides or {}).get(str(configured.resolve()))
+        expected_sha = source.sha256
+        if override:
+            path = Path(override[0])
+            expected_sha = override[1]
         if not path.is_file():
             errors.append(f"authoritative source missing: {path}")
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if not source.mutable_after_start and digest.lower() != source.sha256.lower():
+        if not source.mutable_after_start and digest.lower() != expected_sha.lower():
             errors.append(f"FROZEN_SOURCE_MISMATCH: {path}")
         if source.git_commit:
             check = _git(project, "rev-parse", source.git_commit)

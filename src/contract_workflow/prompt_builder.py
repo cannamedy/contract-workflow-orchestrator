@@ -14,6 +14,7 @@ DEFAULT_TEMPLATES = {
     "PLAN_DEFECT_RESOLUTION": "plan-defect-resolution.md",
     "PLAN_REVISION_REVIEW": "plan-revision-review.md",
     "FINAL_VERIFICATION": "task-review.md",
+    "AUTHORITY_CHANGE_ANALYSIS": "authority-change-analysis.md",
 }
 DEFAULT_TEXTS = {
     "TASK_EXECUTION": "# Task Execution\n\nWork only on the current task using the configured Skill.",
@@ -22,6 +23,7 @@ DEFAULT_TEXTS = {
     "PLAN_DEFECT_RESOLUTION": "# Plan Defect Resolution\n\nResolve only the reported planning defect.",
     "PLAN_REVISION_REVIEW": "# Plan Revision Review\n\nReview the revised plan against authoritative artifacts.",
     "FINAL_VERIFICATION": "# Final Verification\n\nVerify the completed workflow against its authoritative artifacts.",
+    "AUTHORITY_CHANGE_ANALYSIS": "# Authority Change Analysis\n\nCompare the accepted authority revision with the registered candidate and produce only the structured impact analysis. Do not edit authority, Contract, Plan, or task artifacts.",
 }
 STAGE_VERDICT_GUIDANCE = {
     "TASK_EXECUTION": "Use APPROVED when the requested implementation and tests are complete; COMPLETED is not valid for this stage.",
@@ -30,6 +32,7 @@ STAGE_VERDICT_GUIDANCE = {
     "PLAN_DEFECT_RESOLUTION": "Use APPROVED when the planning defect is resolved; report a structured blocking verdict when it cannot safely proceed.",
     "PLAN_REVISION_REVIEW": "Use APPROVED when the revised plan is correct, or REQUIRES_PATCH when it still has a defect.",
     "FINAL_VERIFICATION": "Use APPROVED or COMPLETED only when final verification succeeds.",
+    "AUTHORITY_CHANGE_ANALYSIS": "Use APPROVED for a valid machine-resolvable analysis, or ARCHITECTURE_DECISION_REQUIRED only when the authority semantics have no unique safe interpretation.",
 }
 
 
@@ -64,6 +67,12 @@ class PromptBuilder:
         previous_issues = _previous_issues(state)
         if stage == "TASK_INDEPENDENT_REVIEW":
             previous_issues = "not provided to preserve review independence; inspect the current repository and frozen authority directly"
+        pending = [change for change in state.authority_changes.values() if change.get("status") in {"CHANGE_PENDING", "PROPAGATING"}]
+        authority_context = "none"
+        if stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value and state.current_authority_change_id:
+            authority_context = str(state.authority_changes.get(state.current_authority_change_id, "registered change unavailable"))
+        elif pending and state.current_task and any(state.current_task in change.get("unaffected_tasks", []) for change in pending):
+            authority_context = "There is a registered pending authority change " + ", ".join(str(change.get("change_id")) for change in pending) + ". This task has been deterministically classified as unaffected. Do not modify affected authority artifacts. Operate only within this task's allowed scope."
         values = {
             "project_path": config.project_path, "project": config.project_name, "stage": stage,
             "group": state.current_group or "", "task": state.current_task or "",
@@ -74,6 +83,7 @@ class PromptBuilder:
             "task_requirements": task_requirements, "task_anchors": task_anchors,
             "attempt": str(state.attempt), "previous_issue_summary": previous_issues,
             "verdict_guidance": STAGE_VERDICT_GUIDANCE.get(stage, "Use only a verdict valid for the current stage."),
+            "authority_context": authority_context,
         }
         try:
             body = template.format(**values)
@@ -98,10 +108,13 @@ Allowed scope:
 Hard stops: {values['hard_stops']}
 Task Requirement IDs: {values['task_requirements']}
 Task Contract anchors: {values['task_anchors']}
+Authority change context: {values['authority_context']}
 Stage verdict guidance: {values['verdict_guidance']}
 Previous issue summary: {values['previous_issue_summary']}
 
 For `ARCHITECTURE_DECISION_REQUIRED` or an unresolved `OPEN_CONTRACT_ISSUE`, include `decision_id` or `decision_requests`, `directly_affected_work`, and `blocking_scope` in the machine-readable outcome.
+
+For `AUTHORITY_CHANGE_ANALYSIS`, include an `authority_change` object with change_id, base_sha256, candidate_sha256, classification (C0-C4), semantic_change, affected_requirements, affected_contract_anchors, directly_affected_tasks, dependency_affected_tasks, unaffected_tasks, machine_resolvable, human_decision_required, human_decision_requests, required_propagation, and a concise analysis_summary. Do not include chain-of-thought.
 
 {render_outcome_contract(values['run_id'], values['stage'], values['project'], values['group'], values['task'])}
 Do not include private chain-of-thought.'''

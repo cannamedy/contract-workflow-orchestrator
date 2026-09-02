@@ -10,6 +10,7 @@ AGENT_STAGES = {
     Stage.TASK_EXECUTION.value, Stage.TASK_INDEPENDENT_REVIEW.value,
     Stage.TASK_PATCH.value, Stage.PLAN_DEFECT_RESOLUTION.value,
     Stage.PLAN_REVISION_REVIEW.value, Stage.FINAL_VERIFICATION.value,
+    Stage.AUTHORITY_CHANGE_ANALYSIS.value,
 }
 HUMAN_GATES = {Stage.HUMAN_GROUP_APPROVAL.value, Stage.HUMAN_PLAN_FREEZE.value, Stage.HUMAN_FINAL_ACCEPTANCE.value}
 
@@ -44,6 +45,9 @@ def transition_after_outcome(config: WorkflowConfig, state: WorkflowState, outco
     """Pure deterministic transition; prose is never consulted."""
     verdict = Verdict(outcome["verdict"])
     stage = Stage(state.current_stage)
+    if stage == Stage.AUTHORITY_CHANGE_ANALYSIS:
+        if verdict == Verdict.APPROVED:
+            return StepResult(_update(state, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome=outcome), "authority_change_analyzed")
     if verdict in SCOPED_DECISION_VERDICTS:
         return StepResult(_update(state, current_stage=Stage.WAITING_FOR_HUMAN.value, status=WorkflowStatus.WAITING_HUMAN.value, pending_human_gate=None, run_id=None), "scoped_human_decision")
     if verdict in BLOCKING_VERDICTS:

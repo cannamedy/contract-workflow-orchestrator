@@ -20,11 +20,15 @@ class StateStore:
         self.runs_path = root / "runs"
         self.decisions_path = root / "decisions"
         self.adrs_path = root / "adrs"
+        self.authority_path = root / "authority"
+        self.authority_ledger_path = self.authority_path / "ledger.json"
+        self.authority_changes_path = self.authority_path / "changes"
 
     def ensure(self) -> None:
         self.runs_path.mkdir(parents=True, exist_ok=True)
         self.decisions_path.mkdir(parents=True, exist_ok=True)
         self.adrs_path.mkdir(parents=True, exist_ok=True)
+        self.authority_changes_path.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> WorkflowState | None:
         if not self.state_path.exists():
@@ -82,6 +86,28 @@ class StateStore:
             raise StateStoreError("ADR requires adr_id")
         path = self.adrs_path / f"{adr_id}.json"
         self._atomic_write(path, json.dumps(adr, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+    def load_authority_ledger(self) -> dict[str, object] | None:
+        if not self.authority_ledger_path.exists():
+            return None
+        try:
+            value = json.loads(self.authority_ledger_path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("ledger root is not an object")
+            return value
+        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+            raise StateStoreError(f"corrupt authority ledger: {self.authority_ledger_path}: {exc}") from exc
+
+    def save_authority_ledger(self, ledger: dict[str, object]) -> None:
+        self.ensure()
+        self._atomic_write(self.authority_ledger_path, json.dumps(ledger, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+    def save_authority_change(self, change: dict[str, object]) -> None:
+        self.ensure()
+        change_id = str(change.get("change_id", ""))
+        if not change_id or Path(change_id).name != change_id:
+            raise StateStoreError("authority change requires a safe change_id")
+        self._atomic_write(self.authority_changes_path / f"{change_id}.json", json.dumps(change, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:

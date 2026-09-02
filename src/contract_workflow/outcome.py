@@ -59,6 +59,7 @@ OUTCOME_SCHEMA = {
         "directly_affected_work": {"type": "array", "items": {"type": "string"}},
         "blocking_scope": {"type": "object"},
         "decision_requests": {"type": "array", "items": {"type": "object"}},
+        "authority_change": {"type": "object"},
     },
 }
 
