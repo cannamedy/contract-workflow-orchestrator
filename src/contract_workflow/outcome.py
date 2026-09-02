@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .models import Verdict
+from .models import SCOPED_DECISION_VERDICTS, Verdict
 
 
 OUTCOME_SCHEMA_VERSION = "1.0"
@@ -12,6 +12,12 @@ OUTCOME_REQUIRED_FIELDS = (
     "schema_version", "run_id", "stage", "verdict", "blocking", "project", "group", "task",
     "issues", "changed_files", "tests", "next_action", "summary",
 )
+OUTCOME_DECISION_FIELDS = {
+    "decision_id": str,
+    "directly_affected_work": list,
+    "blocking_scope": dict,
+    "decision_requests": list,
+}
 ISSUE_REQUIRED_FIELDS = (
     "type", "severity", "requirement_ids", "message", "blocking", "recommended_stage",
 )
@@ -49,6 +55,10 @@ OUTCOME_SCHEMA = {
         "tests": {"type": "array"},
         "next_action": {"type": "string"},
         "summary": {"type": "string"},
+        "decision_id": {"type": "string"},
+        "directly_affected_work": {"type": "array", "items": {"type": "string"}},
+        "blocking_scope": {"type": "object"},
+        "decision_requests": {"type": "array", "items": {"type": "object"}},
     },
 }
 
@@ -80,6 +90,28 @@ def validate_outcome(path: Path, run_id: str, stage: str) -> tuple[bool, dict[st
             errors.append(f"{field_name} must be an array")
     if not isinstance(value.get("project"), str) or not isinstance(value.get("summary"), str):
         errors.append("project and summary must be strings")
+    for field_name, expected in OUTCOME_DECISION_FIELDS.items():
+        if field_name in value and not isinstance(value[field_name], expected):
+            errors.append(f"{field_name} must be a {expected.__name__}")
+    if isinstance(value.get("directly_affected_work"), list) and not all(isinstance(item, str) for item in value["directly_affected_work"]):
+        errors.append("directly_affected_work must contain strings")
+    if isinstance(value.get("decision_requests"), list):
+        for index, request in enumerate(value["decision_requests"]):
+            if not isinstance(request, dict):
+                errors.append(f"decision_requests[{index}] must be an object")
+            elif "decision_id" in request and not isinstance(request["decision_id"], str):
+                errors.append(f"decision_requests[{index}].decision_id must be a string")
+    if value.get("verdict") in {item.value for item in SCOPED_DECISION_VERDICTS}:
+        if not value.get("decision_id") and not value.get("decision_requests"):
+            errors.append("scoped decision outcome requires decision_id or decision_requests")
+        request_scope = any(
+            isinstance(request, dict) and (
+                request.get("directly_blocked_items") or request.get("affected_work_items") or request.get("affected_tasks")
+            )
+            for request in value.get("decision_requests", []) if isinstance(value.get("decision_requests"), list)
+        )
+        if not value.get("directly_affected_work") and not value.get("blocking_scope") and not request_scope:
+            errors.append("scoped decision outcome requires directly_affected_work or blocking_scope")
     for index, issue in enumerate(value.get("issues", []) if isinstance(value.get("issues"), list) else []):
         if not isinstance(issue, dict):
             errors.append(f"issues[{index}] must be an object")

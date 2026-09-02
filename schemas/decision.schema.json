@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CWO Human Decision Request",
+  "type": "object",
+  "required": ["decision_id", "status", "created_at", "category", "question", "why_human_required", "directly_blocked_items", "dependency_blocked_items", "unaffected_items"],
+  "properties": {
+    "decision_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["PENDING", "RESOLVED", "SUPERSEDED"]},
+    "created_at": {"type": "string"},
+    "resolved_at": {"type": ["string", "null"]},
+    "category": {"type": "string"},
+    "question": {"type": "string"},
+    "context": {"type": "string"},
+    "why_human_required": {"type": "string"},
+    "options": {"type": "array", "items": {"type": "string"}},
+    "recommended_option": {"type": ["string", "null"]},
+    "allow_freeform": {"type": "boolean"},
+    "source_change": {"type": "string"},
+    "source_stage": {"type": "string"},
+    "affected_requirements": {"type": "array", "items": {"type": "string"}},
+    "affected_contract_anchors": {"type": "array", "items": {"type": "string"}},
+    "affected_tasks": {"type": "array", "items": {"type": "string"}},
+    "affected_work_items": {"type": "array", "items": {"type": "string"}},
+    "directly_blocked_items": {"type": "array", "items": {"type": "string"}},
+    "dependency_blocked_items": {"type": "array", "items": {"type": "string"}},
+    "unaffected_items": {"type": "array", "items": {"type": "string"}},
+    "decision": {},
+    "decision_rationale": {"type": ["string", "null"]},
+    "adr_id": {"type": ["string", "null"]}
+  },
+  "additionalProperties": true
+}

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from .models import BLOCKING_VERDICTS, Stage, StepResult, Verdict, WorkflowConfig, WorkflowState, WorkflowStatus, now_iso
+from .models import BLOCKING_VERDICTS, SCOPED_DECISION_VERDICTS, Stage, StepResult, Verdict, WorkflowConfig, WorkflowState, WorkflowStatus, now_iso
 
 
 AGENT_STAGES = {
@@ -44,6 +44,8 @@ def transition_after_outcome(config: WorkflowConfig, state: WorkflowState, outco
     """Pure deterministic transition; prose is never consulted."""
     verdict = Verdict(outcome["verdict"])
     stage = Stage(state.current_stage)
+    if verdict in SCOPED_DECISION_VERDICTS:
+        return StepResult(_update(state, current_stage=Stage.WAITING_FOR_HUMAN.value, status=WorkflowStatus.WAITING_HUMAN.value, pending_human_gate=None, run_id=None), "scoped_human_decision")
     if verdict in BLOCKING_VERDICTS:
         return _enter_hard_stop(state, f"{verdict.value}: {outcome.get('summary', '')}".strip(), stop_code=verdict.value)
     if stage == Stage.TASK_EXECUTION:

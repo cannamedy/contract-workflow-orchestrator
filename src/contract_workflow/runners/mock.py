@@ -14,13 +14,16 @@ class MockRunner:
     def __init__(self, fixtures: Mapping[str, Any] | None = None):
         self.fixtures = dict(fixtures or {})
         self.calls: list[str] = []
+        self.task_calls: list[str] = []
 
     def run(self, cwd: Path, prompt: str, run_dir: Path, timeout: int, env: Mapping[str, str] | None = None) -> RunnerResult:
         stage = _prompt_value(prompt, "CURRENT STAGE") or _prompt_value(prompt, "current stage") or ""
+        task = _prompt_value(prompt, "CURRENT TASK") or _prompt_value(prompt, "current task") or ""
         run_id = _prompt_value(prompt, "RUN ID") or run_dir.name
         project = _prompt_value(prompt, "PROJECT") or cwd.name
         self.calls.append(stage)
-        spec = self.fixtures.get(stage)
+        self.task_calls.append(task)
+        spec = self.fixtures.get(f"{stage}:{task}", self.fixtures.get(stage))
         if isinstance(spec, list):
             spec = spec[min(self.calls.count(stage) - 1, len(spec) - 1)]
         if isinstance(spec, dict) and "runner_failure" in spec:

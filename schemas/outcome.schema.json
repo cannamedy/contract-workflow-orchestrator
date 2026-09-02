@@ -11,7 +11,11 @@
     "blocking": {"type": "boolean"},
     "project": {"type": "string"}, "group": {"type": ["string", "null"]}, "task": {"type": ["string", "null"]},
     "issues": {"type": "array", "items": {"type": "object", "required": ["type", "severity", "requirement_ids", "message", "blocking", "recommended_stage"]}},
-    "changed_files": {"type": "array"}, "tests": {"type": "array"}, "next_action": {"type": "string"}, "summary": {"type": "string"}
+    "changed_files": {"type": "array"}, "tests": {"type": "array"}, "next_action": {"type": "string"}, "summary": {"type": "string"},
+    "decision_id": {"type": "string"},
+    "directly_affected_work": {"type": "array", "items": {"type": "string"}},
+    "blocking_scope": {"type": "object"},
+    "decision_requests": {"type": "array", "items": {"type": "object"}}
   },
   "additionalProperties": true
 }

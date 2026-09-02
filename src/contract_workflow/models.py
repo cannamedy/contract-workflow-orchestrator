@@ -22,6 +22,7 @@ class Stage(str, Enum):
     HUMAN_GROUP_APPROVAL = "HUMAN_GROUP_APPROVAL"
     FINAL_VERIFICATION = "FINAL_VERIFICATION"
     HUMAN_FINAL_ACCEPTANCE = "HUMAN_FINAL_ACCEPTANCE"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
     HARD_STOP = "HARD_STOP"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -44,11 +45,12 @@ class Verdict(str, Enum):
 
 
 BLOCKING_VERDICTS = {
-    Verdict.OPEN_CONTRACT_ISSUE, Verdict.ARCHITECTURE_DECISION_REQUIRED,
     Verdict.SECURITY_SENSITIVE_ACTION, Verdict.DESTRUCTIVE_ACTION_REQUIRED,
     Verdict.UNAUTHORIZED_EXTERNAL_SIDE_EFFECT, Verdict.FROZEN_SOURCE_MISMATCH,
     Verdict.PLAN_EXPANSION_REQUIRED,
 }
+
+SCOPED_DECISION_VERDICTS = {Verdict.OPEN_CONTRACT_ISSUE, Verdict.ARCHITECTURE_DECISION_REQUIRED}
 
 
 class WorkflowStatus(str, Enum):
@@ -58,6 +60,23 @@ class WorkflowStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     STOPPED = "STOPPED"
+
+
+class WorkItemStatus(str, Enum):
+    READY = "READY"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    REQUIRES_PATCH = "REQUIRES_PATCH"
+    BLOCKED_BY_HUMAN_DECISION = "BLOCKED_BY_HUMAN_DECISION"
+    WAITING_DEPENDENCY = "WAITING_DEPENDENCY"
+    FAILED = "FAILED"
+    RECOVERY_UNCERTAIN = "RECOVERY_UNCERTAIN"
+
+
+class DecisionStatus(str, Enum):
+    PENDING = "PENDING"
+    RESOLVED = "RESOLVED"
+    SUPERSEDED = "SUPERSEDED"
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,10 @@ class TaskSpec:
     id: str
     expected_outputs: tuple[str, ...] = ()
     allowed_paths: tuple[str, ...] = ()
+    dependencies: tuple[str, ...] = ()
+    requirement_ids: tuple[str, ...] = ()
+    contract_anchors: tuple[str, ...] = ()
+    skill_role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,14 +180,29 @@ class WorkflowState:
     stop_code: str | None = None
     blocked_stage: str | None = None
     recoverable: bool = False
+    work_items: dict[str, "WorkItemState"] = field(default_factory=dict)
+    decisions: dict[str, "HumanDecision"] = field(default_factory=dict)
+    adrs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return self.__dict__.copy()
+        value = self.__dict__.copy()
+        value["work_items"] = {key: item.to_dict() for key, item in self.work_items.items()}
+        value["decisions"] = {key: item.to_dict() for key, item in self.decisions.items()}
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "WorkflowState":
         allowed = set(cls.__dataclass_fields__)
-        return cls(**{key: item for key, item in value.items() if key in allowed})
+        payload = {key: item for key, item in value.items() if key in allowed}
+        payload["work_items"] = {
+            key: WorkItemState.from_dict(item) if isinstance(item, dict) else item
+            for key, item in (payload.get("work_items") or {}).items()
+        }
+        payload["decisions"] = {
+            key: HumanDecision.from_dict(item) if isinstance(item, dict) else item
+            for key, item in (payload.get("decisions") or {}).items()
+        }
+        return cls(**payload)
 
 
 @dataclass(frozen=True)
@@ -172,3 +210,80 @@ class StepResult:
     state: WorkflowState
     action: str
     retry_delay: float = 0.0
+
+
+@dataclass
+class WorkItemState:
+    id: str
+    group: str
+    status: str = WorkItemStatus.WAITING_DEPENDENCY.value
+    dependencies: tuple[str, ...] = ()
+    blocking_decision_ids: list[str] = field(default_factory=list)
+    dependency_blocked_by_decision_ids: list[str] = field(default_factory=list)
+    last_outcome: dict[str, Any] | None = None
+    attempt: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        value = self.__dict__.copy()
+        value["dependencies"] = list(self.dependencies)
+        return value
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "WorkItemState":
+        return cls(
+            id=str(value.get("id", "")),
+            group=str(value.get("group", "")),
+            status=str(value.get("status", WorkItemStatus.WAITING_DEPENDENCY.value)),
+            dependencies=tuple(value.get("dependencies", ()) or ()),
+            blocking_decision_ids=list(value.get("blocking_decision_ids", ()) or ()),
+            dependency_blocked_by_decision_ids=list(value.get("dependency_blocked_by_decision_ids", ()) or ()),
+            last_outcome=value.get("last_outcome"),
+            attempt=int(value.get("attempt", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class HumanDecision:
+    decision_id: str
+    status: str = DecisionStatus.PENDING.value
+    created_at: str = field(default_factory=now_iso)
+    resolved_at: str | None = None
+    category: str = "ARCHITECTURE"
+    question: str = ""
+    context: str = ""
+    why_human_required: str = ""
+    options: tuple[str, ...] = ()
+    recommended_option: str | None = None
+    allow_freeform: bool = True
+    source_change: str = ""
+    source_stage: str = ""
+    affected_requirements: tuple[str, ...] = ()
+    affected_contract_anchors: tuple[str, ...] = ()
+    affected_tasks: tuple[str, ...] = ()
+    affected_work_items: tuple[str, ...] = ()
+    directly_blocked_items: tuple[str, ...] = ()
+    dependency_blocked_items: tuple[str, ...] = ()
+    unaffected_items: tuple[str, ...] = ()
+    decision: Any = None
+    decision_rationale: str | None = None
+    adr_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        value = self.__dict__.copy()
+        for key in (
+            "options", "affected_requirements", "affected_contract_anchors", "affected_tasks",
+            "affected_work_items", "directly_blocked_items", "dependency_blocked_items", "unaffected_items",
+        ):
+            value[key] = list(value[key])
+        return value
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "HumanDecision":
+        sequence_fields = {
+            "options", "affected_requirements", "affected_contract_anchors", "affected_tasks",
+            "affected_work_items", "directly_blocked_items", "dependency_blocked_items", "unaffected_items",
+        }
+        payload = {key: item for key, item in value.items() if key in cls.__dataclass_fields__}
+        for key in sequence_fields:
+            payload[key] = tuple(payload.get(key, ()) or ())
+        return cls(**payload)

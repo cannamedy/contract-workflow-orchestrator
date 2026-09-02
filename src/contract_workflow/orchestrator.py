@@ -11,12 +11,25 @@ from typing import Any
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity
 from .logging import EventLogger
-from .models import Stage, StepResult, Verdict, WorkflowConfig, WorkflowState, WorkflowStatus, now_iso
+from .models import (
+    DecisionStatus,
+    HumanDecision,
+    SCOPED_DECISION_VERDICTS,
+    Stage,
+    StepResult,
+    Verdict,
+    WorkItemStatus,
+    WorkflowConfig,
+    WorkflowState,
+    WorkflowStatus,
+    now_iso,
+)
 from .outcome import make_outcome, validate_outcome
 from .prompt_builder import PromptBuilder
 from .runners import AgentRunner, CodexCliRunner, MockRunner, RunnerResult
 from .state_machine import AGENT_STAGES, HUMAN_GATES, approve, initial_state, stop, transition_after_outcome, transition_ready
 from .state_store import StateStore, StateStoreError
+from .scheduler import AGENT_STAGE_NAMES, HUMAN_GATE_NAMES, pending_decisions, recompute, ready_work, schedule
 
 
 class OrchestratorError(RuntimeError):
@@ -65,6 +78,7 @@ class Orchestrator:
             raise
         if state is None:
             state = initial_state(self.config)
+            state = recompute(self.config, state)
             self.store.save(state)
             self.logger.emit("workflow_loaded", project=self.config.project_name, workflow_digest=self.config.digest)
         else:
@@ -73,6 +87,9 @@ class Orchestrator:
                 state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="workflow digest changed; hot reload is not supported", stop_code="WORKFLOW_DIGEST_CHANGED", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
                 self.store.save(state)
                 self.logger.emit("hard_stop_entered", reason=state.stop_reason)
+            else:
+                state = recompute(self.config, state)
+                self.store.save(state)
         return state
 
     def _audit_gate(self) -> tuple[GitAudit, list[str]]:
@@ -93,6 +110,10 @@ class Orchestrator:
         if state.status in {WorkflowStatus.COMPLETED.value, WorkflowStatus.HARD_STOPPED.value, WorkflowStatus.FAILED.value, WorkflowStatus.STOPPED.value} or state.current_stage in HUMAN_GATES:
             return StepResult(state, "waiting")
 
+        if state.current_stage == Stage.WAITING_FOR_HUMAN.value:
+            scheduled = schedule(self.config, state)
+            return StepResult(self._save(scheduled), "rescheduled" if scheduled.current_stage != state.current_stage else "waiting")
+
         audit, integrity = self._audit_gate()
         if integrity or audit.blocking:
             reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
@@ -102,9 +123,9 @@ class Orchestrator:
             return StepResult(self._save(new_state), "hard_stop")
 
         if state.current_stage in {Stage.INITIALIZING.value, Stage.READY.value}:
-            result = transition_ready(self.config, state)
-            self.logger.emit("transition", from_stage=state.current_stage, to_stage=result.state.current_stage)
-            return StepResult(self._save(result.state), result.action)
+            scheduled = schedule(self.config, state)
+            self.logger.emit("transition", from_stage=state.current_stage, to_stage=scheduled.current_stage)
+            return StepResult(self._save(scheduled), "schedule")
         if state.current_stage in AGENT_STAGES:
             return self._agent_step(state)
         return StepResult(state, "waiting")
@@ -128,6 +149,9 @@ class Orchestrator:
         run_id = uuid.uuid4().hex
         run_dir = self.store.run_dir(run_id)
         state = replace(state, run_id=run_id, attempt=state.attempt + 1, total_steps=state.total_steps + 1, updated_at=now_iso())
+        if state.current_task in state.work_items:
+            item = state.work_items[state.current_task]
+            state = replace(state, work_items={**state.work_items, state.current_task: replace(item, status=WorkItemStatus.REQUIRES_PATCH.value if stage == Stage.TASK_PATCH.value else WorkItemStatus.RUNNING.value, attempt=state.attempt)})
         self._save(state)
         outcome_path = run_dir / "outcome.json"
         prompt = self.prompt_builder.build(self.config, state, outcome_path)
@@ -148,9 +172,28 @@ class Orchestrator:
         return self._apply_outcome(state, outcome)
 
     def _apply_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
+        stage = state.current_stage
+        verdict = Verdict(outcome["verdict"])
+        if verdict in SCOPED_DECISION_VERDICTS:
+            state, unresolved = self._record_decisions(state, outcome)
+            if unresolved:
+                blocked = replace(state, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome)
+                blocked = schedule(self.config, blocked)
+                self.logger.emit("scoped_human_decision", decision_ids=unresolved, ready_work=[item.id for item in ready_work(self.config, blocked)])
+                return StepResult(self._save(blocked), "scoped_human_decision")
+            outcome = {**outcome, "verdict": Verdict.APPROVED.value, "summary": "resolved by an exact existing ADR"}
         result = transition_after_outcome(self.config, state, outcome)
-        self.logger.emit("transition", from_stage=state.current_stage, to_stage=result.state.current_stage, verdict=outcome["verdict"])
-        return StepResult(self._save(result.state), result.action, result.retry_delay)
+        new_state = result.state
+        if stage == Stage.TASK_INDEPENDENT_REVIEW.value and verdict == Verdict.APPROVED and state.current_task:
+            item = new_state.work_items.get(state.current_task)
+            if item:
+                new_items = {**new_state.work_items, state.current_task: replace(item, status=WorkItemStatus.COMPLETED.value, last_outcome=outcome, blocking_decision_ids=[], dependency_blocked_by_decision_ids=[])}
+                new_state = replace(new_state, work_items=new_items)
+            if self.config.mode == "autonomous":
+                new_state = schedule(self.config, replace(new_state, current_stage=Stage.READY.value, current_group=None, current_task=None, pending_human_gate=None, status=WorkflowStatus.RUNNING.value))
+        new_state = recompute(self.config, new_state)
+        self.logger.emit("transition", from_stage=state.current_stage, to_stage=new_state.current_stage, verdict=outcome["verdict"])
+        return StepResult(self._save(new_state), result.action, result.retry_delay)
 
     def _invalid_or_failed(self, state: WorkflowState, errors: list[str]) -> StepResult:
         self.logger.emit("outcome_invalid", run_id=state.run_id, stage=state.current_stage, errors=errors)
@@ -184,11 +227,152 @@ class Orchestrator:
             raise OrchestratorError("hard stops cannot be approved")
         result = approve(self.config, state, gate)
         self.logger.emit("transition", from_stage=state.current_stage, to_stage=result.state.current_stage, action="human_approved")
-        return self._save(result.state)
+        next_state = result.state
+        if state.current_stage == Stage.HUMAN_GROUP_APPROVAL.value:
+            next_state = schedule(self.config, replace(next_state, current_stage=Stage.READY.value, current_group=None, current_task=None, pending_human_gate=None, status=WorkflowStatus.RUNNING.value))
+        else:
+            next_state = recompute(self.config, next_state)
+        return self._save(next_state)
 
     def stop(self, reason: str = "stopped by operator") -> WorkflowState:
         state = self._load_or_initialize()
         return self._save(stop(state, reason))
+
+    def _record_decisions(self, state: WorkflowState, outcome: dict[str, Any]) -> tuple[WorkflowState, list[str]]:
+        raw_requests = outcome.get("decision_requests")
+        if isinstance(raw_requests, dict):
+            raw_requests = [raw_requests]
+        if not isinstance(raw_requests, list) or not raw_requests:
+            raw_requests = [outcome]
+        known_tasks = {task.id for _, task in self.config.tasks}
+        decisions = dict(state.decisions)
+        unresolved: list[str] = []
+        for raw in raw_requests:
+            if not isinstance(raw, dict):
+                continue
+            decision_id = raw.get("decision_id") or outcome.get("decision_id") or f"ADR-PENDING-{uuid.uuid4().hex[:12]}"
+            if not isinstance(decision_id, str) or not decision_id:
+                continue
+            scope = raw.get("blocking_scope") or outcome.get("blocking_scope") or {}
+            if not isinstance(scope, dict):
+                scope = {}
+            direct = raw.get("directly_blocked_items") or raw.get("affected_work_items") or raw.get("affected_tasks") or scope.get("directly_blocked_items")
+            direct = direct or outcome.get("directly_affected_work") or [state.current_task]
+            direct = tuple(item for item in direct if isinstance(item, str) and item in known_tasks)
+            if not direct:
+                direct = tuple(task.id for _, task in self.config.tasks if state.work_items.get(task.id, None) and state.work_items[task.id].status != WorkItemStatus.COMPLETED.value)
+            payload = {
+                "category": raw.get("category", outcome.get("category", "ARCHITECTURE")),
+                "question": raw.get("question", outcome.get("question", outcome.get("summary", "Human authority decision required"))),
+                "context": raw.get("context", outcome.get("context", "")),
+                "why_human_required": raw.get("why_human_required", outcome.get("why_human_required", "The authority chain has no unique machine-resolvable answer.")),
+                "options": tuple(item for item in (raw.get("options", outcome.get("options", ())) or ()) if isinstance(item, str)),
+                "recommended_option": raw.get("recommended_option", outcome.get("recommended_option")),
+                "allow_freeform": bool(raw.get("allow_freeform", outcome.get("allow_freeform", True))),
+                "source_change": raw.get("source_change", outcome.get("source_change", "")),
+                "source_stage": raw.get("source_stage", outcome.get("source_stage", state.current_stage)),
+                "affected_requirements": tuple(raw.get("affected_requirements", outcome.get("affected_requirements", ())) or ()),
+                "affected_contract_anchors": tuple(raw.get("affected_contract_anchors", outcome.get("affected_contract_anchors", ())) or ()),
+                "affected_tasks": tuple(raw.get("affected_tasks", outcome.get("affected_tasks", direct)) or ()),
+                "affected_work_items": tuple(raw.get("affected_work_items", direct) or direct),
+                "directly_blocked_items": direct,
+            }
+            candidate = HumanDecision(decision_id=decision_id, **payload)
+            match = self._matching_resolved_adr(candidate, decisions)
+            if match:
+                self.logger.emit("architecture_decision_reused", decision_id=decision_id, adr_id=match.get("adr_id"))
+                continue
+            existing = decisions.get(decision_id)
+            if existing and existing.status == DecisionStatus.PENDING.value:
+                unresolved.append(decision_id)
+                continue
+            decisions[decision_id] = candidate
+            self.store.save_decision(candidate)
+            unresolved.append(decision_id)
+            self.logger.emit("decision_request_created", decision_id=decision_id, directly_blocked_items=list(direct))
+        return replace(state, decisions=decisions), unresolved
+
+    @staticmethod
+    def _matching_resolved_adr(candidate: HumanDecision, decisions: dict[str, HumanDecision]) -> dict[str, Any] | None:
+        signature = (
+            candidate.category, candidate.question, candidate.source_change, candidate.source_stage,
+            candidate.affected_requirements, candidate.affected_contract_anchors,
+            candidate.affected_tasks, candidate.directly_blocked_items,
+        )
+        for decision in decisions.values():
+            if decision.status != DecisionStatus.RESOLVED.value:
+                continue
+            other = (
+                decision.category, decision.question, decision.source_change, decision.source_stage,
+                decision.affected_requirements, decision.affected_contract_anchors,
+                decision.affected_tasks, decision.directly_blocked_items,
+            )
+            if signature == other:
+                return {"adr_id": decision.adr_id or f"ADR-{decision.decision_id}"}
+        return None
+
+    def list_decisions(self, pending_only: bool = True) -> list[HumanDecision]:
+        state = self._load_or_initialize()
+        values = list(state.decisions.values())
+        return [item for item in values if item.status == DecisionStatus.PENDING.value] if pending_only else values
+
+    def show_decision(self, decision_id: str) -> HumanDecision:
+        state = self._load_or_initialize()
+        try:
+            return state.decisions[decision_id]
+        except KeyError as exc:
+            raise OrchestratorError(f"decision not found: {decision_id}") from exc
+
+    def decide(self, decision_id: str, *, option: str | None = None, answer: str | None = None, rationale: str | None = None) -> WorkflowState:
+        state = self._load_or_initialize()
+        decision = self.show_decision(decision_id)
+        if decision.status != DecisionStatus.PENDING.value:
+            raise OrchestratorError(f"decision is not pending: {decision_id}")
+        if option is None and answer is None:
+            raise OrchestratorError("provide --option or --answer")
+        if option is not None and decision.options and option not in decision.options:
+            raise OrchestratorError(f"option is not declared by decision: {option}")
+        if option is None and not decision.allow_freeform:
+            raise OrchestratorError("this decision requires a declared --option")
+        value = option if option is not None else answer
+        resolved_at = now_iso()
+        resolved = replace(decision, status=DecisionStatus.RESOLVED.value, resolved_at=resolved_at, decision=value, decision_rationale=rationale, adr_id=f"ADR-{decision_id}")
+        decisions = {**state.decisions, decision_id: resolved}
+        adr = {
+            "adr_id": resolved.adr_id,
+            "decision_id": decision_id,
+            "question": resolved.question,
+            "decision": value,
+            "rationale": rationale or "",
+            "scope": {
+                "affected_requirements": list(resolved.affected_requirements),
+                "affected_contract_anchors": list(resolved.affected_contract_anchors),
+                "affected_tasks": list(resolved.affected_tasks),
+                "directly_blocked_items": list(resolved.directly_blocked_items),
+            },
+            "created_at": resolved_at,
+        }
+        self.store.save_decision(resolved)
+        self.store.save_adr(adr)
+        next_state = replace(state, decisions=decisions, adrs={**state.adrs, str(resolved.adr_id): adr}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
+        next_state = schedule(self.config, next_state)
+        self.logger.emit("decision_resolved", decision_id=decision_id, adr_id=resolved.adr_id, next_stage=next_state.current_stage)
+        return self._save(next_state)
+
+    def status_report(self) -> dict[str, Any]:
+        state = recompute(self.config, self._load_or_initialize())
+        counts = {status.value: 0 for status in WorkItemStatus}
+        for item in state.work_items.values():
+            counts[item.status] = counts.get(item.status, 0) + 1
+        pending = pending_decisions(state)
+        return {
+            "workflow": state.status,
+            "stage": state.current_stage,
+            "work": counts,
+            "pending_decisions": [decision.to_dict() for decision in pending],
+            "unaffected_work_continues": state.status == WorkflowStatus.RUNNING.value and bool(ready_work(self.config, state)),
+            "state": state.to_dict(),
+        }
 
     def recover(self) -> WorkflowState:
         state = self._load_or_initialize()
@@ -234,10 +418,13 @@ class Orchestrator:
                     blocked_stage=None,
                     recoverable=False,
                 )
-                result = transition_after_outcome(self.config, reconciled, late_outcome)
-                self.logger.emit("late_outcome_validated", run_id=state.run_id, blocked_stage=reconciled.current_stage, verdict=late_outcome["verdict"], resulting_stage=result.state.current_stage, valid=True)
-                self.logger.emit("transition", from_stage=reconciled.current_stage, to_stage=result.state.current_stage, verdict=late_outcome["verdict"])
-                saved = self._save(result.state)
+                if Verdict(late_outcome["verdict"]) in SCOPED_DECISION_VERDICTS:
+                    result = self._apply_outcome(reconciled, late_outcome)
+                    saved = result.state
+                else:
+                    result = transition_after_outcome(self.config, reconciled, late_outcome)
+                    saved = self._save(result.state)
+                self.logger.emit("late_outcome_validated", run_id=state.run_id, blocked_stage=reconciled.current_stage, verdict=late_outcome["verdict"], resulting_stage=saved.current_stage, valid=True)
                 self.logger.emit("late_outcome_reconciled", run_id=state.run_id, blocked_stage=reconciled.current_stage, verdict=late_outcome["verdict"], resulting_stage=saved.current_stage)
                 return saved
             safety_errors = self._schema_recovery_errors(state)

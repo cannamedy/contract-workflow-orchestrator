@@ -10,11 +10,11 @@ from .orchestrator import Orchestrator, OrchestratorError, doctor
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.1.0")
+    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.2.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)
-    for name in ("doctor", "status", "step", "run", "resume", "recover", "approve", "stop"):
+    for name in ("doctor", "status", "step", "run", "resume", "recover", "decisions", "approve", "stop"):
         command = sub.add_parser(name)
         command.add_argument("project", type=Path)
         if name == "run":
@@ -23,6 +23,17 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--gate", choices=["HUMAN_GROUP_APPROVAL", "HUMAN_PLAN_FREEZE", "HUMAN_FINAL_ACCEPTANCE"])
         if name == "stop":
             command.add_argument("--reason", default="stopped by operator")
+    decision = sub.add_parser("decision", help="inspect a persisted human decision")
+    decision_sub = decision.add_subparsers(dest="decision_command", required=True)
+    decision_show = decision_sub.add_parser("show")
+    decision_show.add_argument("project", type=Path)
+    decision_show.add_argument("decision_id")
+    decide = sub.add_parser("decide", help="resolve a pending human decision")
+    decide.add_argument("project", type=Path)
+    decide.add_argument("decision_id")
+    decide.add_argument("--option")
+    decide.add_argument("--answer")
+    decide.add_argument("--rationale")
     return parser
 
 
@@ -52,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         orchestrator = Orchestrator.for_project(args.project)
         if args.command == "status":
-            _dump(orchestrator.status())
+            _dump(orchestrator.status_report())
         elif args.command == "resume":
             _dump(orchestrator.run())
         elif args.command == "recover":
@@ -65,6 +76,12 @@ def main(argv: list[str] | None = None) -> int:
             _dump(orchestrator.approve(args.gate))
         elif args.command == "stop":
             _dump(orchestrator.stop(args.reason))
+        elif args.command == "decisions":
+            _dump([item.to_dict() for item in orchestrator.list_decisions()])
+        elif args.command == "decision" and args.decision_command == "show":
+            _dump(orchestrator.show_decision(args.decision_id))
+        elif args.command == "decide":
+            _dump(orchestrator.decide(args.decision_id, option=args.option, answer=args.answer, rationale=args.rationale))
         return 0
     except (OrchestratorError, ValueError, OSError) as exc:
         print(f"cwo: {exc}", file=sys.stderr)

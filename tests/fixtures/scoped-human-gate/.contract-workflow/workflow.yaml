@@ -1,0 +1,77 @@
+version: "1"
+project:
+  name: scoped-human-gate-fixture
+  path: .
+mode: autonomous
+authoritative_sources: []
+skills: {}
+runner:
+  type: mock
+  mock_outcomes:
+    TASK_EXECUTION:TASK-002:
+      verdict: ARCHITECTURE_DECISION_REQUIRED
+      decision_requests:
+        - decision_id: ADR-PENDING-001
+          category: ARCHITECTURE
+          question: "What are the manifest revision semantics?"
+          context: "The guide change affects manifest identity and discovery compatibility."
+          why_human_required: "The authority chain does not select a unique compatibility policy."
+          options: [defer, adopt-new]
+          recommended_option: defer
+          allow_freeform: true
+          source_change: "Human Guide C4 architecture change"
+          affected_requirements: [REQ-MANIFEST-001]
+          affected_contract_anchors: ["§4"]
+          affected_tasks: [TASK-002, TASK-009, TASK-012]
+          directly_blocked_items: [TASK-002, TASK-009, TASK-012]
+        - decision_id: ADR-PENDING-002
+          category: SECURITY
+          question: "Should Security Identity be in the v0.1 core scope?"
+          context: "The guide change crosses the identity and safety boundaries."
+          why_human_required: "Security scope cannot be inferred without an authority decision."
+          options: [defer, include]
+          recommended_option: defer
+          allow_freeform: true
+          source_change: "Human Guide C4 architecture change"
+          affected_requirements: [REQ-IDENTITY-001]
+          affected_contract_anchors: ["§3", "§15"]
+          affected_tasks: [TASK-002, TASK-006, TASK-012]
+          directly_blocked_items: [TASK-002, TASK-006, TASK-012]
+    TASK_EXECUTION: {verdict: APPROVED}
+    TASK_INDEPENDENT_REVIEW: {verdict: APPROVED}
+    FINAL_VERIFICATION: {verdict: COMPLETED}
+policy:
+  auto_patch: true
+  auto_rereview: true
+  auto_plan_defect_resolution: true
+  auto_plan_revision_review: true
+  auto_commit_checkpoint: false
+  auto_push: false
+  auto_tag: false
+  max_attempts_per_stage: 2
+  max_total_steps: 100
+  retry_backoff_seconds: 0
+groups:
+  - id: pais-derived-graph
+    tasks:
+      - id: TASK-002
+        requirement_ids: [REQ-MANIFEST-001, REQ-IDENTITY-001]
+        contract_anchors: ["§3", "§4"]
+      - id: TASK-009
+        dependencies: [TASK-002]
+        requirement_ids: [REQ-DISC-001]
+        contract_anchors: ["§13"]
+      - id: TASK-006
+        requirement_ids: [REQ-SAFE-001]
+        contract_anchors: ["§15"]
+      - id: TASK-012
+        dependencies: [TASK-002, TASK-006, TASK-009]
+        requirement_ids: [REQ-CONF-001]
+        contract_anchors: ["§21"]
+      - id: TASK-X
+        requirement_ids: [REQ-ERR-001]
+        contract_anchors: ["§18"]
+      - id: TASK-Y
+        dependencies: [TASK-002]
+        requirement_ids: [REQ-RUNTIME-001]
+        contract_anchors: ["§19"]

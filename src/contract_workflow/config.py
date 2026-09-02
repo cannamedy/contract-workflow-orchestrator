@@ -26,12 +26,30 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
+def _strings(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+        raise WorkflowConfigError("task list fields must contain strings")
+    return tuple(value)
+
+
 def _task(value: Any, group: str, index: int) -> TaskSpec:
     if isinstance(value, str):
         return TaskSpec(id=value)
     if not isinstance(value, dict) or not isinstance(value.get("id"), str):
         raise WorkflowConfigError(f"groups[{group}].tasks[{index}] requires an id")
-    return TaskSpec(id=value["id"], expected_outputs=tuple(value.get("expected_outputs", ()) or ()), allowed_paths=tuple(value.get("allowed_paths", ()) or ()))
+    return TaskSpec(
+        id=value["id"],
+        expected_outputs=_strings(value.get("expected_outputs")),
+        allowed_paths=_strings(value.get("allowed_paths")),
+        dependencies=_strings(value.get("dependencies", value.get("depends_on"))),
+        requirement_ids=_strings(value.get("requirement_ids")),
+        contract_anchors=_strings(value.get("contract_anchors")),
+        skill_role=value.get("skill_role"),
+    )
 
 
 def load_workflow(path: str | Path, project_override: str | Path | None = None) -> WorkflowConfig:
@@ -85,6 +103,15 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
         groups.append(GroupSpec(group["id"], tasks))
     if not groups or not any(group.tasks for group in groups):
         raise WorkflowConfigError("at least one task is required")
+    task_ids = [task.id for _, task in ((group.id, task) for group in groups for task in group.tasks)]
+    if len(task_ids) != len(set(task_ids)):
+        raise WorkflowConfigError("task ids must be globally unique")
+    known_tasks = set(task_ids)
+    for group in groups:
+        for task in group.tasks:
+            unknown = set(task.dependencies) - known_tasks
+            if unknown:
+                raise WorkflowConfigError(f"task {task.id} depends on unknown task(s): {', '.join(sorted(unknown))}")
     return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), workflow_file=str(workflow_path), digest=digest_file(workflow_path))
 
 

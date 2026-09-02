@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from contract_workflow.config import load_workflow
 from contract_workflow.git_audit import GitClassification, audit_git
-from contract_workflow.models import Stage, Verdict, WorkflowState
+from contract_workflow.models import DecisionStatus, Stage, Verdict, WorkItemStatus, WorkflowState
 from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
@@ -72,7 +73,7 @@ groups:
         self.assertEqual(transition_after_outcome(config, state, make_outcome("r", state.current_stage, "p", "APPROVED")).state.current_stage, Stage.HUMAN_GROUP_APPROVAL.value)
         self.assertEqual(transition_after_outcome(config, state, make_outcome("r", state.current_stage, "p", "REQUIRES_PATCH")).state.current_stage, Stage.TASK_PATCH.value)
         self.assertEqual(transition_after_outcome(config, state, make_outcome("r", state.current_stage, "p", "PLAN_TASK_DEFECT")).state.current_stage, Stage.PLAN_DEFECT_RESOLUTION.value)
-        self.assertEqual(transition_after_outcome(config, state, make_outcome("r", state.current_stage, "p", "OPEN_CONTRACT_ISSUE")).state.current_stage, Stage.HARD_STOP.value)
+        self.assertEqual(transition_after_outcome(config, state, make_outcome("r", state.current_stage, "p", "OPEN_CONTRACT_ISSUE")).state.current_stage, Stage.WAITING_FOR_HUMAN.value)
         autonomous = self.workflow("autonomous")
         result = transition_after_outcome(autonomous, state, make_outcome("r", state.current_stage, "p", "APPROVED"))
         self.assertEqual(result.state.current_stage, Stage.FINAL_VERIFICATION.value)
@@ -80,6 +81,20 @@ groups:
     def test_outcome_validation_rejects_missing_malformed_unknown_and_mismatch(self):
         path = self.root / "outcome.json"
         self.assertFalse(validate_outcome(path, "r", "S")[0])
+
+    def test_scoped_decision_outcome_requires_machine_scope(self):
+        path = self.root / "decision-outcome.json"
+        value = make_outcome("r", Stage.TASK_EXECUTION.value, "p", Verdict.ARCHITECTURE_DECISION_REQUIRED.value)
+        path.write_text(json.dumps(value), encoding="utf-8")
+        valid, _, errors = validate_outcome(path, "r", Stage.TASK_EXECUTION.value)
+        self.assertFalse(valid)
+        self.assertIn("scoped decision outcome requires decision_id or decision_requests", errors)
+        value = make_outcome(
+            "r", Stage.TASK_EXECUTION.value, "p", Verdict.ARCHITECTURE_DECISION_REQUIRED.value,
+            decision_id="D1", directly_affected_work=["t"], blocking_scope={"type": "architecture"},
+        )
+        path.write_text(json.dumps(value), encoding="utf-8")
+        self.assertTrue(validate_outcome(path, "r", Stage.TASK_EXECUTION.value)[0])
         path.write_text("{", encoding="utf-8")
         self.assertFalse(validate_outcome(path, "r", "S")[0])
         path.write_text(json.dumps({"verdict": "NOPE"}), encoding="utf-8")
@@ -395,6 +410,21 @@ groups:
             Orchestrator(config, store=store).recover()
         self.assertEqual(store.load().current_stage, Stage.HARD_STOP.value)
 
+    def test_late_scoped_decision_outcome_is_persisted_during_recovery(self):
+        config = self.workflow()
+        run_id = "late-architecture-review"
+        outcome = make_outcome(
+            run_id, Stage.TASK_INDEPENDENT_REVIEW.value, config.project_name,
+            Verdict.ARCHITECTURE_DECISION_REQUIRED.value,
+            decision_id="ADR-LATE-001", directly_affected_work=["t"],
+            question="Which architecture boundary applies?", options=["defer", "adopt"],
+        )
+        store = self._late_recovery_fixture(config, Stage.TASK_INDEPENDENT_REVIEW.value, outcome, run_id=run_id, store_name="late-architecture")
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+        self.assertEqual(recovered.current_stage, Stage.WAITING_FOR_HUMAN.value)
+        self.assertEqual(recovered.decisions["ADR-LATE-001"].status, DecisionStatus.PENDING.value)
+        self.assertTrue((store.decisions_path / "ADR-LATE-001.json").is_file())
+
     def test_recovery_rejects_nonrecoverable_stops(self):
         config = self.workflow()
         store = StateStore(self.state)
@@ -428,6 +458,129 @@ groups:
         config = load_workflow(path, self.project)
         state = Orchestrator(config).run()
         self.assertEqual(state.current_stage, Stage.HARD_STOP.value)
+
+    def scoped_fixture(self):
+        source = Path(__file__).parent / "fixtures" / "scoped-human-gate" / ".contract-workflow"
+        destination = self.project / ".contract-workflow"
+        shutil.copytree(source, destination)
+        return load_workflow(destination / "workflow.yaml", self.project)
+
+    def test_scoped_decisions_persist_and_unaffected_work_completes(self):
+        config = self.scoped_fixture()
+        runner = MockRunner(config.runner.mock_outcomes)
+        orchestrator = Orchestrator(config, runner=runner)
+        state = orchestrator.run()
+        self.assertEqual(state.current_stage, Stage.WAITING_FOR_HUMAN.value)
+        self.assertEqual(state.status, "WAITING_HUMAN")
+        self.assertEqual(set(state.decisions), {"ADR-PENDING-001", "ADR-PENDING-002"})
+        self.assertEqual(state.work_items["TASK-002"].status, WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value)
+        self.assertEqual(state.work_items["TASK-006"].status, WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value)
+        self.assertEqual(state.work_items["TASK-009"].status, WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value)
+        self.assertEqual(state.work_items["TASK-012"].status, WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value)
+        self.assertEqual(state.work_items["TASK-Y"].status, WorkItemStatus.WAITING_DEPENDENCY.value)
+        self.assertEqual(state.work_items["TASK-X"].status, WorkItemStatus.COMPLETED.value)
+        self.assertEqual(runner.task_calls.count("TASK-X"), 2)
+        self.assertTrue((self.state / "decisions" / "ADR-PENDING-001.json").is_file())
+        reloaded = Orchestrator(config, store=StateStore(self.state), runner=MockRunner()).list_decisions()
+        self.assertEqual({item.decision_id for item in reloaded}, {"ADR-PENDING-001", "ADR-PENDING-002"})
+
+    def test_resolving_one_decision_preserves_other_blocker_and_resumes_ready_work(self):
+        config = self.scoped_fixture()
+        runner = MockRunner(config.runner.mock_outcomes)
+        orchestrator = Orchestrator(config, runner=runner)
+        orchestrator.run()
+        after_d1 = orchestrator.decide("ADR-PENDING-001", option="defer", rationale="keep the revision outside this slice")
+        self.assertEqual(after_d1.current_stage, Stage.WAITING_FOR_HUMAN.value)
+        self.assertEqual(after_d1.work_items["TASK-002"].blocking_decision_ids, ["ADR-PENDING-002"])
+        self.assertEqual(after_d1.work_items["TASK-006"].blocking_decision_ids, ["ADR-PENDING-002"])
+        self.assertEqual(after_d1.work_items["TASK-009"].status, WorkItemStatus.WAITING_DEPENDENCY.value)
+        self.assertEqual(after_d1.decisions["ADR-PENDING-001"].status, DecisionStatus.RESOLVED.value)
+        self.assertTrue((self.state / "adrs" / "ADR-ADR-PENDING-001.json").is_file())
+        after_d2 = orchestrator.decide("ADR-PENDING-002", answer="SecurityIdentity remains outside v0.1 Core", rationale="defer until a separate Contract revision")
+        self.assertEqual(after_d2.status, "RUNNING")
+        self.assertEqual(after_d2.current_task, "TASK-002")
+        self.assertEqual(after_d2.work_items["TASK-002"].status, WorkItemStatus.RUNNING.value)
+
+    def test_resume_after_decisions_does_not_rerun_completed_unrelated_work(self):
+        config = self.scoped_fixture()
+        runner = MockRunner(config.runner.mock_outcomes)
+        orchestrator = Orchestrator(config, runner=runner)
+        orchestrator.run()
+        completed_calls = runner.task_calls.count("TASK-X")
+        orchestrator.decide("ADR-PENDING-001", option="defer")
+        orchestrator.decide("ADR-PENDING-002", option="defer")
+        final = orchestrator.run()
+        self.assertEqual(final.status, "COMPLETED")
+        self.assertEqual(runner.task_calls.count("TASK-X"), completed_calls)
+        self.assertEqual(final.work_items["TASK-X"].status, WorkItemStatus.COMPLETED.value)
+
+    def test_exact_resolved_adr_is_reused_but_new_question_creates_decision(self):
+        config = self.scoped_fixture()
+        orchestrator = Orchestrator(config, runner=MockRunner(config.runner.mock_outcomes))
+        state = orchestrator.run()
+        original = state.decisions["ADR-PENDING-001"]
+        state = orchestrator.decide("ADR-PENDING-001", option="defer")
+        state, unresolved = orchestrator._record_decisions(state, {
+            "verdict": Verdict.ARCHITECTURE_DECISION_REQUIRED.value,
+            "decision_requests": [original.to_dict()],
+        })
+        self.assertEqual(unresolved, [])
+        state, unresolved = orchestrator._record_decisions(state, {
+            "verdict": Verdict.ARCHITECTURE_DECISION_REQUIRED.value,
+            "decision_requests": [{
+                "decision_id": "ADR-PENDING-NEW",
+                "question": "A new architecture question",
+                "directly_blocked_items": ["TASK-006"],
+            }],
+        })
+        self.assertEqual(unresolved, ["ADR-PENDING-NEW"])
+        self.assertEqual(state.decisions["ADR-PENDING-NEW"].status, DecisionStatus.PENDING.value)
+
+    def test_status_report_exposes_work_counts_and_pending_decisions(self):
+        config = self.scoped_fixture()
+        orchestrator = Orchestrator(config, runner=MockRunner(config.runner.mock_outcomes))
+        orchestrator.run()
+        report = orchestrator.status_report()
+        self.assertEqual(report["workflow"], "WAITING_HUMAN")
+        self.assertEqual(report["work"][WorkItemStatus.BLOCKED_BY_HUMAN_DECISION.value], 4)
+        self.assertEqual(report["work"][WorkItemStatus.WAITING_DEPENDENCY.value], 1)
+        self.assertEqual(len(report["pending_decisions"]), 2)
+        self.assertFalse(report["unaffected_work_continues"])
+
+    def test_pending_decision_keeps_workflow_running_while_ready_branch_exists(self):
+        config = self.scoped_fixture()
+        runner = MockRunner(config.runner.mock_outcomes)
+        orchestrator = Orchestrator(config, runner=runner)
+        self.assertEqual(orchestrator.step().state.current_task, "TASK-002")
+        continued = orchestrator.step().state
+        self.assertEqual(continued.status, "RUNNING")
+        self.assertEqual(continued.current_task, "TASK-X")
+        self.assertEqual(len([item for item in continued.decisions.values() if item.status == DecisionStatus.PENDING.value]), 2)
+
+    def test_decide_rejects_unknown_option_and_missing_answer(self):
+        config = self.scoped_fixture()
+        orchestrator = Orchestrator(config, runner=MockRunner(config.runner.mock_outcomes))
+        orchestrator.run()
+        with self.assertRaises(OrchestratorError):
+            orchestrator.decide("ADR-PENDING-001")
+        with self.assertRaises(OrchestratorError):
+            orchestrator.decide("ADR-PENDING-001", option="not-declared")
+
+    def test_security_and_destructive_verdicts_remain_global_hard_stops(self):
+        config = self.workflow("autonomous")
+        state = WorkflowState(project="test-project", current_stage=Stage.TASK_EXECUTION.value, current_group="g", current_task="t")
+        for verdict in (Verdict.SECURITY_SENSITIVE_ACTION.value, Verdict.DESTRUCTIVE_ACTION_REQUIRED.value, Verdict.FROZEN_SOURCE_MISMATCH.value):
+            with self.subTest(verdict=verdict):
+                result = transition_after_outcome(config, state, make_outcome("r", state.current_stage, "p", verdict))
+                self.assertEqual(result.state.current_stage, Stage.HARD_STOP.value)
+
+    def test_prompt_includes_task_requirements_and_decision_contract(self):
+        config = self.scoped_fixture()
+        state = WorkflowState(project=config.project_name, current_stage=Stage.TASK_EXECUTION.value, current_group="pais-derived-graph", current_task="TASK-002")
+        prompt = PromptBuilder().build(config, state, self.root / "run" / "outcome.json")
+        self.assertIn("REQ-MANIFEST-001", prompt)
+        self.assertIn("§4", prompt)
+        self.assertIn("decision_requests", prompt)
 
 
 if __name__ == "__main__":

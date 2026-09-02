@@ -49,9 +49,13 @@ class PromptBuilder:
         frozen = "\n".join(f"- {item.path} sha256={item.sha256} commit={item.git_commit or '-'} tag={item.git_tag or '-'}" for item in config.authoritative_sources) or "- none declared"
         task = config.task_at(state.current_group, state.current_task)
         task_paths = []
+        task_requirements = "none declared"
+        task_anchors = "none declared"
         if task:
             task_paths.extend(task.expected_outputs)
             task_paths.extend(path for path in task.allowed_paths if path not in task_paths)
+            task_requirements = ", ".join(task.requirement_ids) or task_requirements
+            task_anchors = ", ".join(task.contract_anchors) or task_anchors
         allowed = "- .contract-workflow runtime tracker (orchestrator-owned)"
         if task_paths:
             allowed += "\n" + "\n".join(f"- {path}" for path in task_paths)
@@ -67,6 +71,7 @@ class PromptBuilder:
             "skill_path": skill.path if skill else "(no Skill configured)", "frozen_authority": frozen,
             "outcome_path": str(outcome_path), "allowed_scope": allowed,
             "hard_stops": ", ".join(config.hard_stops) or "OPEN_CONTRACT_ISSUE, ARCHITECTURE_DECISION_REQUIRED, SECURITY_SENSITIVE_ACTION, DESTRUCTIVE_ACTION_REQUIRED, FROZEN_SOURCE_MISMATCH",
+            "task_requirements": task_requirements, "task_anchors": task_anchors,
             "attempt": str(state.attempt), "previous_issue_summary": previous_issues,
             "verdict_guidance": STAGE_VERDICT_GUIDANCE.get(stage, "Use only a verdict valid for the current stage."),
         }
@@ -91,8 +96,12 @@ Allowed scope:
 {values['allowed_scope']}
 
 Hard stops: {values['hard_stops']}
+Task Requirement IDs: {values['task_requirements']}
+Task Contract anchors: {values['task_anchors']}
 Stage verdict guidance: {values['verdict_guidance']}
 Previous issue summary: {values['previous_issue_summary']}
+
+For `ARCHITECTURE_DECISION_REQUIRED` or an unresolved `OPEN_CONTRACT_ISSUE`, include `decision_id` or `decision_requests`, `directly_affected_work`, and `blocking_scope` in the machine-readable outcome.
 
 {render_outcome_contract(values['run_id'], values['stage'], values['project'], values['group'], values['task'])}
 Do not include private chain-of-thought.'''

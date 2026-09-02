@@ -25,3 +25,5 @@ groups:
   - id: example
     tasks:
       - id: example-task
+        requirement_ids: [REQ-EXAMPLE-001]
+        contract_anchors: ["§example"]
