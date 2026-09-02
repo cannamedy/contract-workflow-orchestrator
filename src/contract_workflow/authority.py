@@ -261,6 +261,49 @@ def _known_authority_text(config: WorkflowConfig) -> str:
     return "\n".join(chunks)
 
 
+def _known_task_ids(config: WorkflowConfig, state: WorkflowState) -> set[str]:
+    """Return task IDs available before the structured Plan Graph exists.
+
+    The workflow declaration is intentionally allowed to be a legacy partial
+    projection during authority-change intake.  Existing task files provide a
+    deterministic repository-side ID inventory; the structured Plan Graph
+    remains the authority for dependencies and execution after propagation.
+    """
+    known = {
+        str(item.get("id"))
+        for item in (state.plan_graph or {}).get("tasks", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    known.update(task.id for _, task in config.tasks)
+    task_dir = Path(config.project_path) / "implementation" / "tasks"
+    if task_dir.is_dir():
+        known.update(
+            match.group(1)
+            for path in task_dir.glob("TASK-*.md")
+            if (match := re.match(r"^(TASK-\d+)(?:-|\.md$)", path.name))
+        )
+    return known
+
+
+def _anchor_is_traceable(anchor: str, authority_text: str) -> bool:
+    if anchor in authority_text:
+        return True
+    # Agents may report a stable section anchor with a descriptive suffix.
+    # Validate every section number against an actual Markdown heading instead
+    # of accepting arbitrary prose as a Contract anchor.
+    refs: list[str] = []
+    for start, end in re.findall(r"§\s*(\d+(?:\.\d+)?)(?:\s*-\s*(\d+))?", anchor):
+        refs.append(start)
+        if end:
+            refs.append(end)
+    if not refs:
+        return False
+    return all(
+        re.search(rf"(?m)^#{{1,6}}\s+(?:§\s*)?{re.escape(ref)}(?:\s|[.:]|$)", authority_text)
+        for ref in refs
+    )
+
+
 def validate_analysis(config: WorkflowConfig, store: Any, state: WorkflowState, outcome: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
     raw = outcome.get("authority_change")
     if not isinstance(raw, dict):
@@ -289,8 +332,8 @@ def validate_analysis(config: WorkflowConfig, store: Any, state: WorkflowState, 
     anchors = raw.get("affected_contract_anchors", [])
     if isinstance(anchors, list):
         text = _known_authority_text(config)
-        errors.extend(f"untraceable contract anchor: {item}" for item in anchors if item not in text)
-    known = {str(item.get("id")) for item in (state.plan_graph or {}).get("tasks", []) if isinstance(item, dict) and isinstance(item.get("id"), str)} or {task.id for _, task in config.tasks}
+        errors.extend(f"untraceable contract anchor: {item}" for item in anchors if not _anchor_is_traceable(item, text))
+    known = _known_task_ids(config, state)
     direct = raw.get("directly_affected_tasks", [])
     reported_dependencies = raw.get("dependency_affected_tasks", [])
     unaffected = raw.get("unaffected_tasks", [])

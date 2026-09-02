@@ -9,7 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from contract_workflow.authority import scan_authority_changes, validate_analysis
+from contract_workflow.authority import _anchor_is_traceable, scan_authority_changes, validate_analysis
 from contract_workflow.config import load_workflow
 from contract_workflow.models import Stage, Verdict, WorkItemStatus, WorkflowState
 from contract_workflow.orchestrator import Orchestrator
@@ -158,6 +158,62 @@ class AuthorityChangeTests(unittest.TestCase):
         valid, errors = validate_analysis(config, store, state, make_outcome("r", Stage.AUTHORITY_CHANGE_ANALYSIS.value, config.project_name, Verdict.APPROVED.value, authority_change=bad))
         self.assertFalse(valid)
         self.assertTrue(any("unknown task" in error or "candidate_sha256" in error for error in errors))
+
+    def test_analysis_accepts_full_plan_task_ids_before_graph_projection(self):
+        config, store = self.detect()
+        task_dir = self.project / "implementation" / "tasks"
+        task_dir.mkdir(parents=True)
+        for task_id in range(1, 13):
+            (task_dir / f"TASK-{task_id:03d}-fixture.md").write_text("fixture\n", encoding="utf-8")
+        state = store.load()
+        change = state.authority_changes[state.current_authority_change_id]
+        task_ids = [f"TASK-{task_id:03d}" for task_id in range(1, 13)]
+        spec = {
+            **self.c2_spec(),
+            "change_id": change["change_id"],
+            "base_sha256": change["base_sha256"],
+            "candidate_sha256": change["candidate_sha256"],
+            "directly_affected_tasks": task_ids,
+            "dependency_affected_tasks": [],
+            "unaffected_tasks": ["A", "B", "X"],
+        }
+        valid, errors = validate_analysis(
+            config,
+            store,
+            state,
+            make_outcome("r", Stage.AUTHORITY_CHANGE_ANALYSIS.value, config.project_name, Verdict.APPROVED.value, authority_change=spec),
+        )
+        self.assertTrue(valid, errors)
+
+    def test_analysis_accepts_descriptive_section_anchor(self):
+        self.assertTrue(_anchor_is_traceable(
+            "Contract §0.2 Scope and §0.3 frozen architecture invariants",
+            "## 0.2 Scope\n### 0.3 Frozen invariants\n",
+        ))
+        self.source.write_text("accepted\n## 0.2 Scope\n### 0.3 Frozen invariants\n", encoding="utf-8")
+        self.old_sha = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        config = self.config()
+        store = StateStore(self.state_root)
+        orchestrator = Orchestrator(config, store=store)
+        self.assertEqual(orchestrator.step().state.current_stage, Stage.TASK_EXECUTION.value)
+        self.source.write_text("candidate\n## 0.2 Scope\n### 0.3 Frozen invariants\n", encoding="utf-8")
+        self.assertEqual(orchestrator.step().action, "authority_change_analysis")
+        state = store.load()
+        change = state.authority_changes[state.current_authority_change_id]
+        spec = {
+            **self.c2_spec(),
+            "change_id": change["change_id"],
+            "base_sha256": change["base_sha256"],
+            "candidate_sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            "affected_contract_anchors": [],
+        }
+        valid, errors = validate_analysis(
+            config,
+            store,
+            state,
+            make_outcome("r", Stage.AUTHORITY_CHANGE_ANALYSIS.value, config.project_name, Verdict.APPROVED.value, authority_change=spec),
+        )
+        self.assertTrue(valid, errors)
 
     def test_c3_human_decision_reuses_existing_scoped_decision_system(self):
         config, store = self.detect()
