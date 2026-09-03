@@ -33,6 +33,7 @@ from .models import (
 )
 from .outcome import make_outcome, validate_outcome
 from .prompt_builder import PromptBuilder
+from .project_validator import ProjectValidatorResult, execute_project_validator, requires_project_validation
 from .runners import AgentRunner, CodexCliRunner, MockRunner, RunnerResult
 from .state_machine import AGENT_STAGES, HUMAN_GATES, approve, initial_state, stop, transition_after_outcome, transition_ready
 from .state_store import StateStore, StateStoreError
@@ -201,6 +202,8 @@ class Orchestrator:
         if state.current_stage == Stage.WAITING_FOR_AUTHORITY_CHANGE.value:
             scheduled = schedule(self.config, state)
             return StepResult(self._save(scheduled), "rescheduled" if scheduled.current_stage != state.current_stage else "waiting")
+        if state.current_stage == Stage.ARTIFACT_VALIDATION.value:
+            return self._artifact_validation_step(state)
         if state.current_stage in {Stage.INITIALIZING.value, Stage.READY.value}:
             scheduled = schedule(self.config, state)
             self.logger.emit("transition", from_stage=state.current_stage, to_stage=scheduled.current_stage)
@@ -208,6 +211,54 @@ class Orchestrator:
         if state.current_stage in AGENT_STAGES:
             return self._agent_step(state)
         return StepResult(state, "waiting")
+
+    def _artifact_validation_step(self, state: WorkflowState) -> StepResult:
+        artifact_id = state.current_artifact_id
+        spec = next((item for item in self.config.artifact_pipeline if item.id == artifact_id), None)
+        artifact = state.artifacts.get(artifact_id) if artifact_id else None
+        if spec is None or artifact is None:
+            stopped = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, stop_reason="ARTIFACT_VALIDATION has no configured current artifact", stop_code="PROJECT_VALIDATOR_EXECUTION_FAILED", blocked_stage=Stage.ARTIFACT_VALIDATION.value, recoverable=False, updated_at=now_iso())
+            return StepResult(self._save(stopped), "hard_stop")
+        result: ProjectValidatorResult = execute_project_validator(
+            self.config,
+            state,
+            artifact,
+            spec,
+            state_root=self.store.root,
+            upstream_hashes=artifact.metadata.get("dependency_revisions", []),
+            timeout_seconds=self.config.runner.timeout_seconds,
+        )
+        evidence = result.evidence
+        metadata = {**artifact.metadata, "validator": evidence}
+        if result.kind == "INFRA_FAIL":
+            attempts = int(artifact.metadata.get("validator_attempts", 0)) + 1
+            metadata["validator_attempts"] = attempts
+            metadata["validator_error"] = {"code": result.code, "message": result.message}
+            updated_artifact = replace(artifact, metadata=metadata)
+            updated = replace(state, artifacts={**state.artifacts, artifact_id: updated_artifact}, last_outcome={"validator": evidence, "error_code": result.code, "summary": result.message}, updated_at=now_iso())
+            self.store.save_artifact(updated_artifact.to_dict())
+            if result.code == "REAL_PROJECT_CHANGED_DURING_RUN" or attempts >= self.config.policy.max_attempts_per_stage:
+                stopped = replace(updated, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, stop_reason=f"{result.code}: {result.message}", stop_code=result.code or "PROJECT_VALIDATOR_EXECUTION_FAILED", blocked_stage=Stage.ARTIFACT_VALIDATION.value, recoverable=False, updated_at=now_iso())
+                self.logger.emit("project_validator_execution_failed", artifact_id=artifact_id, validator_role=artifact.validator_role, code=result.code, attempts=attempts)
+                return StepResult(self._save(stopped), "hard_stop")
+            self.logger.emit("project_validator_retry", artifact_id=artifact_id, validator_role=artifact.validator_role, code=result.code, attempt=attempts)
+            return StepResult(self._save(updated), "validator_retry", self.config.policy.retry_backoff_seconds)
+        if result.kind == "ARTIFACT_FAIL":
+            updated_artifact = replace(artifact, status=ArtifactStatus.REQUIRES_PATCH.value, metadata=metadata)
+            updated = replace(state, artifacts={**state.artifacts, artifact_id: updated_artifact}, current_stage=Stage.ARTIFACT_PATCH.value, current_artifact_id=artifact_id, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome={"verdict": Verdict.REQUIRES_PATCH.value, "summary": result.message, "validator": evidence}, status=WorkflowStatus.RUNNING.value, updated_at=now_iso())
+            self.store.save_artifact(updated_artifact.to_dict())
+            self.logger.emit("project_validator_failed", artifact_id=artifact_id, validator_role=artifact.validator_role, status=evidence.get("status"))
+            return StepResult(self._save(updated), "artifact_validation_failed")
+
+        status = ArtifactStatus.REVIEW_REQUIRED.value if artifact.review_required else ArtifactStatus.APPROVED.value
+        updated_artifact = replace(artifact, status=status, metadata={**metadata, "validator_attempts": 0})
+        artifacts = {**state.artifacts, artifact_id: updated_artifact}
+        updated = replace(state, artifacts=artifacts, current_artifact_id=artifact_id if updated_artifact.status == ArtifactStatus.REVIEW_REQUIRED.value else None, current_stage=Stage.ARTIFACT_REVIEW.value if updated_artifact.status == ArtifactStatus.REVIEW_REQUIRED.value else Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome={"validator": evidence, "summary": "project validator passed"}, status=WorkflowStatus.RUNNING.value, updated_at=now_iso())
+        self.store.save_artifact(updated_artifact.to_dict())
+        self.logger.emit("project_validator_passed", artifact_id=artifact_id, validator_role=artifact.validator_role, status=evidence.get("status"))
+        if updated_artifact.status == ArtifactStatus.APPROVED.value:
+            return self._prepare_artifact_promotion(updated, artifact_id)
+        return StepResult(self._save(updated), "artifact_validation_passed")
 
     def _agent_step(self, state: WorkflowState) -> StepResult:
         stage = state.current_stage
@@ -402,15 +453,12 @@ class Orchestrator:
             if raw.get("candidate_content") is not None:
                 candidate_path = str(self.store.save_artifact_candidate(artifact_id, str(raw["candidate_content"])))
             status = ArtifactStatus.REVIEW_REQUIRED.value if current.review_required else ArtifactStatus.APPROVED.value
-            validator = raw.get("validator")
             metadata = {
-                **current.metadata,
+                **{key: value for key, value in current.metadata.items() if key not in {"validator", "review", "validator_error"}},
                 "last_outcome": outcome.get("summary", ""),
                 "dependency_revisions": dependency_revisions(self.config, state, next(item for item in self.config.artifact_pipeline if item.id == artifact_id)),
             }
-            if isinstance(validator, dict):
-                metadata["validator"] = validator
-            updated_artifact = replace(current, status=status, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata=metadata)
+            updated_artifact = replace(current, status=status if not current.validator_role else ArtifactStatus.CANDIDATE.value, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata=metadata)
         else:
             verdict = Verdict(outcome["verdict"])
             if verdict == Verdict.REQUIRES_PATCH:
@@ -418,8 +466,6 @@ class Orchestrator:
             elif verdict == Verdict.APPROVED:
                 review = raw.get("review") or {}
                 metadata = {**current.metadata, "review": {"verdict": verdict.value, **review}}
-                if isinstance(raw.get("validator"), dict):
-                    metadata["validator"] = raw["validator"]
                 updated_artifact = replace(current, status=ArtifactStatus.APPROVED.value, version_hash=current.candidate_hash, metadata=metadata)
             elif verdict in SCOPED_DECISION_VERDICTS:
                 updated_artifact = replace(current, status=ArtifactStatus.BLOCKED.value, metadata={**current.metadata, "review": {"verdict": verdict.value, **(raw.get("review") or {})}})
@@ -427,6 +473,9 @@ class Orchestrator:
                 return self._invalid_or_failed(state, [f"unsupported artifact review verdict {verdict.value}"])
         artifacts = {**state.artifacts, artifact_id: updated_artifact}
         self.store.save_artifact(updated_artifact.to_dict())
+        if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_PATCH.value} and requires_project_validation(updated_artifact.validator_role):
+            validation_state = replace(state, artifacts=artifacts, current_artifact_id=artifact_id, current_stage=Stage.ARTIFACT_VALIDATION.value, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome=outcome, status=WorkflowStatus.RUNNING.value)
+            return StepResult(self._save(validation_state), "artifact_validation")
         updated = replace(state, artifacts=artifacts, current_artifact_id=None, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome=outcome, status=WorkflowStatus.RUNNING.value)
         if stage == Stage.ARTIFACT_REVIEW.value and Verdict(outcome["verdict"]) in SCOPED_DECISION_VERDICTS:
             decision_outcome = {

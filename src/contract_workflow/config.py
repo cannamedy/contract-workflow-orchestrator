@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import shlex
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .artifacts import validate_artifact_graph
-from .models import ARTIFACT_KINDS, PROMOTION_POLICIES, ArtifactSpec, AuthoritativeSource, GroupSpec, Policy, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
+from .models import ARTIFACT_KINDS, PROMOTION_POLICIES, ArtifactSpec, AuthoritativeSource, GroupSpec, Policy, ProjectValidatorConfig, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
 
 
 class WorkflowConfigError(ValueError):
@@ -61,6 +63,39 @@ def _safe_branch(value: str) -> bool:
     return bool(value) and not value.startswith("/") and not value.endswith("/") and ".." not in value.split("/") and not any(char.isspace() or char in "~^\\:" for char in value)
 
 
+def _project_validator(value: Any) -> ProjectValidatorConfig | None:
+    if value is None:
+        return None
+    raw = _mapping(value, "project_validators")
+    entrypoint = raw.get("entrypoint")
+    invocation = raw.get("invocation")
+    if not isinstance(entrypoint, str) or not entrypoint:
+        raise WorkflowConfigError("project_validators.entrypoint is required")
+    entry_path = Path(entrypoint)
+    if entry_path.is_absolute() or ".." in entry_path.parts or ".git" in entry_path.parts:
+        raise WorkflowConfigError("project_validators.entrypoint must be a safe project-relative path")
+    if not isinstance(invocation, str) or not invocation.strip():
+        raise WorkflowConfigError("project_validators.invocation is required")
+    try:
+        tokens = shlex.split(invocation)
+    except ValueError as exc:
+        raise WorkflowConfigError(f"project_validators.invocation is not shell-tokenizable: {exc}") from exc
+    placeholders = set(re.findall(r"\{([^{}]+)\}", invocation))
+    allowed = {"entrypoint", "validator_role", "project"}
+    unknown = placeholders - allowed
+    if unknown:
+        raise WorkflowConfigError(f"project_validators.invocation has unsupported placeholders: {', '.join(sorted(unknown))}")
+    missing = allowed - placeholders
+    if missing:
+        raise WorkflowConfigError(f"project_validators.invocation is missing placeholders: {', '.join(sorted(missing))}")
+    if not tokens:
+        raise WorkflowConfigError("project_validators.invocation must not be empty")
+    roles = _mapping(raw.get("roles", {}), "project_validators.roles")
+    if not all(isinstance(key, str) and isinstance(item, str) and item for key, item in roles.items()):
+        raise WorkflowConfigError("project_validators.roles must map non-empty role names to strings")
+    return ProjectValidatorConfig(entrypoint=entrypoint, invocation=invocation, roles=dict(roles))
+
+
 def load_workflow(path: str | Path, project_override: str | Path | None = None) -> WorkflowConfig:
     workflow_path = Path(path).expanduser().resolve()
     if not workflow_path.is_file():
@@ -110,6 +145,7 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
     policy = Policy(**{key: policy_raw[key] for key in Policy.__dataclass_fields__ if key in policy_raw})
     if policy.max_attempts_per_stage < 1 or policy.max_total_steps < 1:
         raise WorkflowConfigError("retry and step limits must be positive")
+    project_validators = _project_validator(raw.get("project_validators"))
     groups: list[GroupSpec] = []
     for index, item in enumerate(raw.get("groups", []) or []):
         group = _mapping(item, f"groups[{index}]")
@@ -152,7 +188,7 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
         graph_errors = validate_artifact_graph(artifact_specs)
         if graph_errors:
             raise WorkflowConfigError("; ".join(graph_errors))
-    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), authority_remote=authority_remote, authority_branch=authority_branch, artifact_pipeline=tuple(artifact_specs), artifact_pipeline_explicit=artifact_explicit, workflow_file=str(workflow_path), digest=digest_file(workflow_path))
+    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), authority_remote=authority_remote, authority_branch=authority_branch, project_validators=project_validators, artifact_pipeline=tuple(artifact_specs), artifact_pipeline_explicit=artifact_explicit, workflow_file=str(workflow_path), digest=digest_file(workflow_path))
 
 
 def default_workflow(project: Path) -> str:

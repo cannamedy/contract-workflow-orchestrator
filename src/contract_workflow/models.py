@@ -29,6 +29,7 @@ class Stage(str, Enum):
     PLAN_GRAPH_BUILD = "PLAN_GRAPH_BUILD"
     TASK_REBASE_ANALYSIS = "TASK_REBASE_ANALYSIS"
     ARTIFACT_GENERATION = "ARTIFACT_GENERATION"
+    ARTIFACT_VALIDATION = "ARTIFACT_VALIDATION"
     ARTIFACT_REVIEW = "ARTIFACT_REVIEW"
     ARTIFACT_PATCH = "ARTIFACT_PATCH"
     HUMAN_FINAL_ACCEPTANCE = "HUMAN_FINAL_ACCEPTANCE"
@@ -245,6 +246,15 @@ class RunnerConfig:
 
 
 @dataclass(frozen=True)
+class ProjectValidatorConfig:
+    """Project-owned deterministic validator invocation contract."""
+
+    entrypoint: str
+    invocation: str
+    roles: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Policy:
     auto_patch: bool = True
     auto_rereview: bool = True
@@ -273,6 +283,7 @@ class WorkflowConfig:
     hard_stops: tuple[str, ...] = ()
     authority_remote: str = "origin"
     authority_branch: str = "main"
+    project_validators: ProjectValidatorConfig | None = None
     artifact_pipeline: tuple[ArtifactSpec, ...] = ()
     artifact_pipeline_explicit: bool = False
     workflow_file: str = ""

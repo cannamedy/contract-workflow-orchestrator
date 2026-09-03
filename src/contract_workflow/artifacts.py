@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import ARTIFACT_KINDS, ArtifactSpec, ArtifactStatus, DecisionStatus, EngineeringArtifact, WorkflowConfig, WorkflowState
+from .project_validator import INTERNAL_VALIDATOR_ROLES
 
 
 def validate_artifact_graph(specs: Iterable[ArtifactSpec]) -> list[str]:
@@ -296,7 +297,11 @@ def reconcile_artifact_staleness(config: WorkflowConfig, state: WorkflowState) -
                 "status": ArtifactStatus.PENDING.value,
                 "candidate_hash": None,
                 "candidate_path": None,
-                "metadata": {**artifact.metadata, "stale_reason": "DOWNSTREAM_STALE", "previous_dependency_revisions": recorded},
+                "metadata": {
+                    **{key: value for key, value in artifact.metadata.items() if key not in {"validator", "review", "validator_error"}},
+                    "stale_reason": "DOWNSTREAM_STALE",
+                    "previous_dependency_revisions": recorded,
+                },
             }
         )
         for decision_id, decision in decisions.items():
@@ -335,10 +340,15 @@ def validate_artifact_promotion(config: WorkflowConfig, state: WorkflowState, ar
     if artifact.review_required and (not isinstance(review, dict) or review.get("verdict") != "APPROVED"):
         return [f"artifact {artifact_id} has no approved semantic review evidence"]
     validator = artifact.metadata.get("validator")
-    if artifact.validator_role and (not isinstance(validator, dict) or validator.get("status") != "PASS"):
+    external_validator = artifact.validator_role and artifact.validator_role not in INTERNAL_VALIDATOR_ROLES
+    if external_validator and (not isinstance(validator, dict) or validator.get("status") not in {"PASS", "PASS_WITH_WARNINGS"}):
         return [f"artifact {artifact_id} has no passing deterministic validator evidence"]
     if isinstance(validator, dict) and validator.get("status") == "FAIL":
         return [f"artifact {artifact_id} deterministic validator failed"]
+    if external_validator and isinstance(validator, dict) and validator.get("validator_role") not in {None, artifact.validator_role}:
+        return [f"artifact {artifact_id} validator role evidence is stale"]
+    if external_validator and isinstance(validator, dict) and validator.get("source_sha256") != artifact.candidate_hash:
+        return [f"artifact {artifact_id} validator candidate hash evidence is stale"]
     if not _dependencies_satisfied(config, state, spec):
         return [f"artifact {artifact_id} has unaccepted upstream dependencies"]
     expected_revisions = artifact.metadata.get("dependency_revisions")

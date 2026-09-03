@@ -15,7 +15,9 @@
 | PLAN_REVISION_REVIEW | REQUIRES_PATCH | automatic Plan revision and re-review |
 | PLAN_GRAPH_BUILD | APPROVED | deterministic graph reconciliation, then `TASK_REBASE_ANALYSIS` or promotion request |
 | TASK_REBASE_ANALYSIS | APPROVED | existing scoped promotion Decision Request |
-| ARTIFACT_GENERATION | APPROVED | ARTIFACT_REVIEW when review is required, otherwise promotion |
+| ARTIFACT_GENERATION | APPROVED | ARTIFACT_VALIDATION when a project validator is configured; otherwise ARTIFACT_REVIEW or promotion |
+| ARTIFACT_VALIDATION | PASS / PASS_WITH_WARNINGS | ARTIFACT_REVIEW when review is required, otherwise promotion |
+| ARTIFACT_VALIDATION | FAIL / ARTIFACT_MISSING | ARTIFACT_PATCH |
 | ARTIFACT_REVIEW | REQUIRES_PATCH | ARTIFACT_PATCH |
 | ARTIFACT_REVIEW | APPROVED | promotion policy: AUTO, HUMAN_GATE, or EXTERNAL |
 | ARTIFACT_PATCH | APPROVED | ARTIFACT_REVIEW when review is required, otherwise promotion |
