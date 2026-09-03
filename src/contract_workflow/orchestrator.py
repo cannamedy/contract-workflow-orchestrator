@@ -33,6 +33,7 @@ from .runners import AgentRunner, CodexCliRunner, MockRunner, RunnerResult
 from .state_machine import AGENT_STAGES, HUMAN_GATES, approve, initial_state, stop, transition_after_outcome, transition_ready
 from .state_store import StateStore, StateStoreError
 from .scheduler import AGENT_STAGE_NAMES, HUMAN_GATE_NAMES, dependency_closure, pending_decisions, recompute, ready_work, schedule
+from .workspace import RunWorkspace, TargetDriftError, WorkspaceError, apply_validated_diff
 
 
 class OrchestratorError(RuntimeError):
@@ -43,6 +44,25 @@ READ_ONLY_RECOVERY_STAGES = frozenset({
     Stage.TASK_INDEPENDENT_REVIEW.value,
     Stage.PLAN_REVISION_REVIEW.value,
     Stage.FINAL_VERIFICATION.value,
+})
+
+STRICT_WORKSPACE_STAGES = frozenset({
+    Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+    Stage.CHANGE_PROPAGATION_PLANNING.value,
+    Stage.CONTRACT_REVISION_REVIEW.value,
+    Stage.PLAN_REVISION_REVIEW.value,
+    Stage.PLAN_GRAPH_BUILD.value,
+    Stage.TASK_REBASE_ANALYSIS.value,
+    Stage.TASK_INDEPENDENT_REVIEW.value,
+    Stage.FINAL_VERIFICATION.value,
+})
+CANDIDATE_WORKSPACE_STAGES = frozenset({
+    Stage.CONTRACT_REVISION.value,
+    Stage.PLAN_REVISION.value,
+})
+PROJECT_MUTATING_STAGES = frozenset({
+    Stage.TASK_EXECUTION.value,
+    Stage.TASK_PATCH.value,
 })
 
 
@@ -182,8 +202,11 @@ class Orchestrator:
             valid, outcome, errors = validate_outcome(outcome_path, state.run_id, stage)
             metadata = _read_json(run_dir / "metadata.json")
             if valid and outcome:
+                if metadata.get("status") == "running":
+                    workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+                    return self._workspace_stop(state, workspace, "RECOVERY_UNCERTAIN: Agent outcome exists while invocation is still marked running", "RECOVERY_UNCERTAIN")
                 self.logger.emit("state_recovered", run_id=state.run_id, stage=stage, reason="valid outcome reconciled")
-                return self._apply_outcome(state, outcome)
+                return self._finalize_agent_outcome(state, outcome, run_dir, metadata)
             if metadata.get("status") == "running" and not outcome_path.exists():
                 new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="RECOVERY_UNCERTAIN: prior Agent invocation has no completed artifact", stop_code="RECOVERY_UNCERTAIN", blocked_stage=stage, recoverable=False, updated_at=now_iso())
                 self.logger.emit("hard_stop_entered", reason=new_state.stop_reason)
@@ -198,27 +221,114 @@ class Orchestrator:
             state = replace(state, work_items={**state.work_items, state.current_task: replace(item, status=WorkItemStatus.REQUIRES_PATCH.value if stage == Stage.TASK_PATCH.value else WorkItemStatus.RUNNING.value, attempt=state.attempt)})
         self._save(state)
         outcome_path = run_dir / "outcome.json"
-        prompt = self.prompt_builder.build(self.config, state, outcome_path)
-        (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
         authority_before = authority_snapshot(self.config, self.store)
-        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "running", "started_at": now_iso(), "authority_snapshot": authority_before})
+        try:
+            workspace = RunWorkspace.create(Path(self.config.project_path), self.store.root, run_id)
+        except Exception as exc:
+            _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "failed", "error": str(exc), "started_at": now_iso()})
+            return self._workspace_stop(state, None, f"could not create isolated Agent workspace: {exc}", "WORKSPACE_SETUP_FAILED")
+        workspace_metadata = {
+            "workspace_path": str(workspace.path),
+            "workspace_baseline": workspace.baseline,
+            "real_baseline": workspace.real_baseline,
+            "excluded_roots": [str(item) for item in workspace.excluded_roots],
+        }
+        prompt = self.prompt_builder.build(self.config, state, outcome_path, execution_workspace=workspace.path)
+        (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "running", "started_at": now_iso(), "authority_snapshot": authority_before, **workspace_metadata})
         self.logger.emit("stage_entered", stage=stage, group=state.current_group, task=state.current_task)
-        self.logger.emit("agent_run_started", run_id=run_id, stage=stage, attempt=state.attempt)
-        result = self.runner.run(Path(self.config.project_path), prompt, run_dir, self.config.runner.timeout_seconds, env={"CWO_RUN_ID": run_id, "CWO_OUTCOME_PATH": str(outcome_path)})
-        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "completed", "started_at": result.started_at, "finished_at": result.finished_at, "exit_code": result.exit_code, "timed_out": result.timed_out, "runner_metadata": result.runner_metadata})
-        self.logger.emit("agent_run_finished", run_id=run_id, stage=stage, exit_code=result.exit_code, timed_out=result.timed_out)
+        self.logger.emit("agent_run_started", run_id=run_id, stage=stage, attempt=state.attempt, workspace_path=str(workspace.path))
+        try:
+            result = self.runner.run(workspace.path, prompt, run_dir, self.config.runner.timeout_seconds, env={"CWO_RUN_ID": run_id, "CWO_OUTCOME_PATH": str(outcome_path)})
+        except Exception as exc:
+            workspace.discard()
+            _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "failed", "error": str(exc), "started_at": now_iso(), **workspace_metadata})
+            return self._workspace_stop(state, None, f"Agent runner failed before completion: {exc}", "RUNNER_FAILURE")
+        changes = workspace.diff()
+        workspace.record_diff(run_dir, changes)
+        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "completed", "started_at": result.started_at, "finished_at": result.finished_at, "exit_code": result.exit_code, "timed_out": result.timed_out, "runner_metadata": result.runner_metadata, "workspace_diff_count": len(changes), **workspace_metadata})
+        self.logger.emit("agent_run_finished", run_id=run_id, stage=stage, exit_code=result.exit_code, timed_out=result.timed_out, workspace_diff_count=len(changes))
+        if not workspace.real_unchanged():
+            authority_paths = self._authority_relative_paths()
+            before_tree = workspace.real_baseline.get("tree", {})
+            after_tree = workspace.current_real_fingerprint().get("tree", {})
+            changed_real = {path for path in set(before_tree) | set(after_tree) if before_tree.get(path) != after_tree.get(path)}
+            stop_code = "UNAUTHORIZED_AUTHORITY_MUTATION" if changed_real & authority_paths else "REAL_PROJECT_CHANGED_DURING_RUN"
+            return self._workspace_stop(state, workspace, f"{stop_code}: real project changed during Agent invocation", stop_code)
         if authority_before != authority_snapshot(self.config, self.store):
-            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="UNAUTHORIZED_AUTHORITY_MUTATION: authority changed during Agent invocation", stop_code="UNAUTHORIZED_AUTHORITY_MUTATION", blocked_stage=stage, recoverable=False, updated_at=now_iso())
-            self.logger.emit("hard_stop_entered", reason=new_state.stop_reason, stop_code=new_state.stop_code)
-            return StepResult(self._save(new_state), "hard_stop")
+            return self._workspace_stop(state, workspace, "UNAUTHORIZED_AUTHORITY_MUTATION: authority changed during Agent invocation", "UNAUTHORIZED_AUTHORITY_MUTATION")
         valid, outcome, errors = validate_outcome(outcome_path, run_id, stage)
         if result.exit_code != 0 or result.timed_out:
+            workspace.discard()
             errors = ["runner timed out" if result.timed_out else f"runner process failed with exit code {result.exit_code}"]
             return self._invalid_or_failed(state, errors)
         if not valid or not outcome:
+            workspace.discard()
             return self._invalid_or_failed(state, errors)
         self.logger.emit("outcome_validated", run_id=run_id, stage=stage, verdict=outcome["verdict"])
+        return self._finalize_agent_outcome(state, outcome, run_dir, _read_json(run_dir / "metadata.json"))
+
+    def _workspace_stop(self, state: WorkflowState, workspace: RunWorkspace | None, reason: str, stop_code: str) -> StepResult:
+        if workspace:
+            workspace.discard()
+        stopped = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code=stop_code, blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
+        self.logger.emit("hard_stop_entered", reason=reason, stop_code=stop_code)
+        return StepResult(self._save(stopped), "hard_stop")
+
+    def _finalize_agent_outcome(self, state: WorkflowState, outcome: dict[str, Any], run_dir: Path, metadata: dict[str, Any]) -> StepResult:
+        stage = state.current_stage
+        try:
+            workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+        except WorkspaceError as exc:
+            return self._workspace_stop(state, None, str(exc), "RECOVERY_UNCERTAIN")
+        changes = workspace.diff() if workspace and workspace.path.exists() else []
+        if workspace:
+            workspace.record_diff(run_dir, changes)
+            if not workspace.real_unchanged():
+                return self._workspace_stop(state, workspace, "REAL_PROJECT_CHANGED_DURING_RUN: real project changed before outcome reconciliation", "REAL_PROJECT_CHANGED_DURING_RUN")
+        if stage in STRICT_WORKSPACE_STAGES and changes:
+            return self._workspace_stop(state, workspace, f"workspace mutation is forbidden during {stage}", "WORKSPACE_MUTATION_VIOLATION")
+        if stage in PROJECT_MUTATING_STAGES and outcome.get("verdict") == Verdict.APPROVED.value and changes:
+            task = self.config.task_at(state.current_group, state.current_task)
+            if not task:
+                return self._workspace_stop(state, workspace, "project-mutating stage has no bounded task", "UNAUTHORIZED_WORKSPACE_MUTATION")
+            allowed = tuple(task.allowed_paths) + tuple(task.expected_outputs)
+            protected = self._authority_relative_paths()
+            if any(str(change.get("path", "")) in protected for change in changes):
+                return self._workspace_stop(state, workspace, "Agent attempted to mutate an authority artifact", "UNAUTHORIZED_AUTHORITY_MUTATION")
+            try:
+                if workspace is None:
+                    raise WorkspaceError("project-mutating outcome has no isolated workspace")
+                apply_validated_diff(workspace, changes, allowed)
+            except TargetDriftError as exc:
+                return self._workspace_stop(state, workspace, str(exc), "TARGET_DRIFT")
+            except WorkspaceError as exc:
+                return self._workspace_stop(state, workspace, str(exc), "UNAUTHORIZED_WORKSPACE_MUTATION")
+        if workspace:
+            workspace.discard()
         return self._apply_outcome(state, outcome)
+
+    def _authority_relative_paths(self) -> set[str]:
+        project = Path(self.config.project_path).resolve()
+        paths: set[str] = set()
+        for source in self.config.authoritative_sources:
+            path = Path(source.path)
+            path = path if path.is_absolute() else project / path
+            if path.resolve().is_relative_to(project):
+                paths.add(path.resolve().relative_to(project).as_posix())
+        ledger = self.store.load_authority_ledger() or {}
+        for entry in (ledger.get("sources", {}) or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            for key in ("path", "configured_path", "candidate_path"):
+                raw = entry.get(key)
+                if not isinstance(raw, str):
+                    continue
+                path = Path(raw)
+                path = path if path.is_absolute() else project / path
+                if path.resolve().is_relative_to(project):
+                    paths.add(path.resolve().relative_to(project).as_posix())
+        return paths
 
     def _apply_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         stage = state.current_stage

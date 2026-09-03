@@ -16,6 +16,7 @@ from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
 from contract_workflow.runners import CodexCliRunner, MockRunner
+from contract_workflow.runners.codex_cli import _bind_execution_directory
 from contract_workflow.state_machine import transition_after_outcome
 from contract_workflow.state_store import StateStore, StateStoreError
 
@@ -155,6 +156,15 @@ groups:
         self.assertIn("outcome.json", prompt)
         self.assertIn("Use APPROVED when the requested implementation and tests are complete", prompt)
 
+    def test_prompt_distinguishes_execution_workspace_from_authoritative_origin(self):
+        config = self.workflow()
+        state = WorkflowState(project="test-project", current_stage=Stage.TASK_EXECUTION.value, current_group="g", current_task="t")
+        workspace = self.root / "state" / "workspaces" / "run" / "project"
+        prompt = PromptBuilder().build(config, state, self.root / "run" / "outcome.json", execution_workspace=workspace)
+        self.assertIn(f"EXECUTION WORKSPACE: {workspace}", prompt)
+        self.assertIn(f"AUTHORITATIVE ORIGIN: {self.project}", prompt)
+        self.assertIn("Do not access or modify the authoritative origin repository directly", prompt)
+
     def test_review_prompt_contains_complete_nested_issue_schema(self):
         config = self.workflow()
         run_id = "exact-review-run"
@@ -221,6 +231,11 @@ groups:
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.timed_out)
         self.assertEqual((run_dir / "stdout.log").read_text(encoding="utf-8").strip(), "ok")
+
+    def test_codex_command_cannot_keep_configured_authoritative_cwd(self):
+        command = ["codex", "exec", "-C", str(self.project), "-"]
+        workspace = self.root / "state" / "workspaces" / "run" / "project"
+        self.assertEqual(_bind_execution_directory(command, workspace)[3], str(workspace))
 
     def test_plan_task_defect_e2e_stops_at_plan_freeze(self):
         outcomes = "    TASK_EXECUTION: {verdict: APPROVED}\n    TASK_INDEPENDENT_REVIEW: {verdict: PLAN_TASK_DEFECT}\n    PLAN_DEFECT_RESOLUTION: {verdict: APPROVED}\n    PLAN_REVISION_REVIEW: {verdict: APPROVED}\n    FINAL_VERIFICATION: {verdict: COMPLETED}\n"

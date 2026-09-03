@@ -61,7 +61,7 @@ class PromptBuilder:
     def __init__(self, template_dir: Path | None = None):
         self.template_dir = template_dir or Path(__file__).resolve().parents[2] / "templates"
 
-    def build(self, config: WorkflowConfig, state: WorkflowState, outcome_path: Path) -> str:
+    def build(self, config: WorkflowConfig, state: WorkflowState, outcome_path: Path, execution_workspace: Path | None = None) -> str:
         stage = state.current_stage
         template_name = DEFAULT_TEMPLATES.get(stage)
         template = DEFAULT_TEXTS.get(stage, "")
@@ -97,8 +97,9 @@ class PromptBuilder:
         if stage in {Stage.CHANGE_PROPAGATION_PLANNING.value, Stage.CONTRACT_REVISION.value, Stage.CONTRACT_REVISION_REVIEW.value, Stage.PLAN_REVISION.value, Stage.PLAN_REVISION_REVIEW.value, Stage.PLAN_GRAPH_BUILD.value, Stage.TASK_REBASE_ANALYSIS.value}:
             active = state.propagation.get(state.current_authority_change_id or "", {})
             authority_context = "Registered propagation context: " + str(active or "unavailable") + ". Candidate artifacts are external runtime evidence and must not be written over accepted project authorities."
+        execution_path = str(execution_workspace or config.project_path)
         values = {
-            "project_path": config.project_path, "project": config.project_name, "stage": stage,
+            "project_path": execution_path, "authoritative_origin": config.project_path, "project": config.project_name, "stage": stage,
             "group": state.current_group or "", "task": state.current_task or "",
             "run_id": state.run_id or outcome_path.parent.name,
             "skill_path": skill.path if skill else "(no Skill configured)", "frozen_authority": frozen,
@@ -113,14 +114,14 @@ class PromptBuilder:
             body = template.format(**values)
         except (KeyError, ValueError):
             body = template
-        context = f"PROJECT: {config.project_name}\nPROJECT PATH: {config.project_path}\nCURRENT STAGE: {stage}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {values['run_id']}"
+        context = f"PROJECT ID: {config.project_name}\nEXECUTION WORKSPACE: {execution_path}\nAUTHORITATIVE ORIGIN: {config.project_path}\nCURRENT STAGE: {stage}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {values['run_id']}"
         return context + "\n\n" + body.rstrip() + "\n\n" + self._contract(values)
 
     @staticmethod
     def _contract(values: dict[str, str]) -> str:
         return f'''## ORCHESTRATOR OUTPUT CONTRACT
 
-Re-read the relevant `SKILL.md` at `{values['skill_path']}` before acting. Execute only the current stage `{values['stage']}` for project `{values['project']}` at `{values['project_path']}`. Respect the frozen authority metadata below and the allowed scope. Write a human-readable report, then write valid machine-readable JSON exactly to `{values['outcome_path']}`. Do not modify orchestrator workflow state or infer transitions from prose.
+Re-read the relevant `SKILL.md` at `{values['skill_path']}` before acting. Execute only the current stage `{values['stage']}` for project `{values['project']}` in execution workspace `{values['project_path']}`. The authoritative origin repository is `{values['authoritative_origin']}`. Do not access or modify the authoritative origin repository directly. Respect the frozen authority metadata below and the allowed scope. Write a human-readable report, then write valid machine-readable JSON exactly to `{values['outcome_path']}`. Do not modify orchestrator workflow state or infer transitions from prose.
 
 Frozen authority:
 {values['frozen_authority']}

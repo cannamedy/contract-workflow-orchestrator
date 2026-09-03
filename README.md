@@ -26,7 +26,7 @@ cwo decision show ./my-project <decision-id>
 cwo decide ./my-project <decision-id> --option <option>
 ```
 
-The default policy is conservative: gated mode, no automatic commit, push, tag, merge, release, or external side effect. `cwo doctor` is read-only. `cwo resume` continues from durable state. Live Codex integration is available only when `codex` is found on PATH; the adapter uses the locally audited `codex exec -C <project> -` contract and never parses prose verdicts.
+The default policy is conservative: gated mode, no automatic Git commit, push, tag, merge, release, or external side effect. `cwo doctor` is read-only. `cwo resume` continues from durable state. Live Codex integration is available only when `codex` is found on PATH; each invocation runs from an external disposable Run Workspace, and the adapter binds any configured `-C` directory to that workspace rather than the authoritative project.
 
 Projects declare `.contract-workflow/workflow.yaml`. See `examples/workflow.yaml` for a generic configuration. Runtime state defaults to `~/.local/share/contract-workflow/<project-key>` and can be redirected with `CWO_STATE_DIR`; it is kept outside the target Git repository.
 
@@ -37,6 +37,10 @@ When a declared authority file changes between bounded Agent runs, CWO records a
 The Plan Graph is a runtime projection of the human-readable Implementation Plan, not a second authority. It is validated as a DAG with traceable requirements, anchors, paths, and outputs; graph reconciliation preserves completed unaffected work, marks superseded work terminal, and adds only new or affected work to scheduling. A project workflow may bootstrap with a bounded task declaration; after propagation, the active graph supplies the complete task set without editing the workflow YAML.
 
 Every Agent run writes `runs/<run-id>/outcome.json`, `prompt.md`, separated stdout/stderr, and metadata. Only a schema-validated outcome plus deterministic checks can select the next transition. Missing, malformed, mismatched, or unknown outcomes are retryable up to the configured bound; unresolved uncertainty becomes a hard stop.
+
+## Agent Run Isolation
+
+Each run snapshots the current working-tree view, including tracked modifications, deletions, and relevant untracked files, into `workspaces/<run-id>/project` under external runtime state. Strict stages discard workspace changes. Candidate stages externalize only validated candidate artifacts. Task execution stages can apply only a validated diff inside the task scope, after confirming the authoritative origin has not drifted. Authority files remain protected even if a task declares a broad path pattern. Promotion is performed by deterministic CWO code after its hash and decision checks.
 
 ## Scoped Human Gates
 

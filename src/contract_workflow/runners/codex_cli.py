@@ -23,6 +23,7 @@ class CodexCliRunner:
             command = shlex.split(self.command)
         else:
             command = ["codex", "exec", "-C", str(cwd), "-"]
+        command = _bind_execution_directory(command, cwd)
         if "{prompt}" in command:
             command = [prompt if item == "{prompt}" else item for item in command]
             stdin = None
@@ -48,3 +49,13 @@ class CodexCliRunner:
         except (OSError, ValueError) as exc:
             stderr_path.write_text(str(exc) + "\n", encoding="utf-8")
         return RunnerResult(exit_code, stdout_path, stderr_path, started, _time(), timed_out, {"runner": "codex_cli", "command": " ".join(command[:3])})
+
+
+def _bind_execution_directory(command: list[str], cwd: Path) -> list[str]:
+    """Prevent a configured absolute Codex -C from escaping the run workspace."""
+    result = list(command)
+    for index, item in enumerate(result[:-1]):
+        if item in {"-C", "--cd"}:
+            result[index + 1] = str(cwd)
+            return result
+    return result
