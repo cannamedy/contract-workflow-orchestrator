@@ -22,6 +22,9 @@ DEFAULT_TEMPLATES = {
     "PLAN_REVISION_REVIEW": "task-review.md",
     "PLAN_GRAPH_BUILD": "authority-change-analysis.md",
     "TASK_REBASE_ANALYSIS": "authority-change-analysis.md",
+    "ARTIFACT_GENERATION": "authority-change-analysis.md",
+    "ARTIFACT_REVIEW": "task-review.md",
+    "ARTIFACT_PATCH": "authority-change-analysis.md",
 }
 DEFAULT_TEXTS = {
     "TASK_EXECUTION": "# Task Execution\n\nWork only on the current task using the configured Skill.",
@@ -38,6 +41,9 @@ DEFAULT_TEXTS = {
     "PLAN_REVISION_REVIEW": "# Plan Revision Review\n\nIndependently verify the candidate Plan and its Requirement-to-Contract-to-Task closure.",
     "PLAN_GRAPH_BUILD": "# Plan Graph Build\n\nEmit a complete machine-readable Plan Graph projection. Do not infer it from unvalidated prose in later stages.",
     "TASK_REBASE_ANALYSIS": "# Task Rebase Analysis\n\nCompare affected task definitions and existing implementation/review evidence, preserving the smallest required rebase work.",
+    "ARTIFACT_GENERATION": "# Artifact Generation\n\nProduce the configured candidate artifact using its routed Skill. Do not modify accepted project authority.",
+    "ARTIFACT_REVIEW": "# Artifact Review\n\nIndependently review the candidate artifact against its declared inputs and traceability.",
+    "ARTIFACT_PATCH": "# Artifact Patch\n\nRepair only the reported candidate artifact defects, preserving unaffected content.",
 }
 STAGE_VERDICT_GUIDANCE = {
     "TASK_EXECUTION": "Use APPROVED when the requested implementation and tests are complete; COMPLETED is not valid for this stage.",
@@ -54,6 +60,9 @@ STAGE_VERDICT_GUIDANCE = {
     "PLAN_REVISION_REVIEW": "Use APPROVED when the candidate Plan is complete and graph-valid, or REQUIRES_PATCH for a repairable defect.",
     "PLAN_GRAPH_BUILD": "Use APPROVED only with a complete valid plan_graph object.",
     "TASK_REBASE_ANALYSIS": "Use APPROVED when affected task rebase evidence is complete; do not modify implementation files in this stage.",
+    "ARTIFACT_GENERATION": "Use APPROVED when the candidate artifact is complete; include its id, kind, candidate_hash, and candidate_content or external candidate evidence.",
+    "ARTIFACT_REVIEW": "Use APPROVED when the candidate artifact is valid and traceable, or REQUIRES_PATCH for a machine-repairable defect.",
+    "ARTIFACT_PATCH": "Use APPROVED when the repaired candidate artifact is complete; report a scoped decision only for genuine authority ambiguity.",
 }
 
 
@@ -75,6 +84,12 @@ class PromptBuilder:
         task_paths = []
         task_requirements = "none declared"
         task_anchors = "none declared"
+        artifact_context = "none"
+        artifact_spec = next((item for item in config.artifact_pipeline if item.id == state.current_artifact_id), None)
+        if artifact_spec:
+            artifact_context = f"id={artifact_spec.id}, kind={artifact_spec.kind}, dependencies={list(artifact_spec.dependencies)}, validator_role={artifact_spec.validator_role or 'none'}, review_required={artifact_spec.review_required}"
+        if stage == Stage.FINAL_VERIFICATION.value and config.artifact_pipeline_explicit:
+            artifact_context = "approved CONFORMANCE_SPEC is required; emit conformance_results mapping requirement_id to conformance_id, evidence, and PASS/FAIL"
         if task:
             task_paths.extend(task.expected_outputs)
             task_paths.extend(path for path in task.allowed_paths if path not in task_paths)
@@ -113,12 +128,13 @@ class PromptBuilder:
             "attempt": str(state.attempt), "previous_issue_summary": previous_issues,
             "verdict_guidance": STAGE_VERDICT_GUIDANCE.get(stage, "Use only a verdict valid for the current stage."),
             "authority_context": authority_context,
+            "artifact_context": artifact_context,
         }
         try:
             body = template.format(**values)
         except (KeyError, ValueError):
             body = template
-        context = f"PROJECT ID: {config.project_name}\nEXECUTION WORKSPACE: {execution_path}\nAUTHORITATIVE ORIGIN: {config.project_path}\nCURRENT STAGE: {stage}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {values['run_id']}"
+        context = f"PROJECT ID: {config.project_name}\nEXECUTION WORKSPACE: {execution_path}\nAUTHORITATIVE ORIGIN: {config.project_path}\nCURRENT STAGE: {stage}\nCURRENT ARTIFACT: {state.current_artifact_id or ''}\nARTIFACT CONTEXT: {artifact_context}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {values['run_id']}"
         return context + "\n\n" + body.rstrip() + "\n\n" + self._contract(values)
 
     @staticmethod
@@ -138,14 +154,17 @@ Hard stops: {values['hard_stops']}
 Task Requirement IDs: {values['task_requirements']}
 Task Contract anchors: {values['task_anchors']}
 Authority change context: {values['authority_context']}
+Artifact context: {values['artifact_context']}
 Stage verdict guidance: {values['verdict_guidance']}
 Previous issue summary: {values['previous_issue_summary']}
 
 For `ARCHITECTURE_DECISION_REQUIRED` or an unresolved `OPEN_CONTRACT_ISSUE`, include `decision_id` or `decision_requests`, `directly_affected_work`, and `blocking_scope` in the machine-readable outcome.
 
-For `AUTHORITY_CHANGE_ANALYSIS`, include an `authority_change` object with change_id, base_sha256, candidate_sha256, classification (C0-C4), semantic_change, affected_requirements, affected_contract_anchors, directly_affected_tasks, dependency_affected_tasks, unaffected_tasks, machine_resolvable, human_decision_required, human_decision_requests, required_propagation, and a concise analysis_summary. Do not include chain-of-thought.
+For `AUTHORITY_CHANGE_ANALYSIS`, include an `authority_change` object with change_id, base_sha256, candidate_sha256, classification (C0-C4), semantic_change, affected_requirements, affected_contract_anchors, directly_affected_tasks, dependency_affected_tasks, unaffected_tasks, directly_affected_artifacts (when an artifact pipeline is configured), dependency_affected_artifacts, machine_resolvable, human_decision_required, human_decision_requests, required_propagation, and a concise analysis_summary. Do not include chain-of-thought.
 
 For propagation stages, emit only structured fields appropriate to the stage: `propagation_plan`, `candidate_artifacts`, `contract_revision_report`, `plan_revision_report`, `plan_graph`, or `task_rebase` as requested by the prompt. Candidate artifact content is evidence in CWO external state and must never be written to accepted project authority files by the Agent.
+
+For generic artifact stages, emit an `artifact` object with the current artifact `id` and `kind`. Generation and patch stages must include `candidate_hash` and may include `candidate_content`; review stages must include a concise `review` object. CWO validates lifecycle and dependency state deterministically.
 
 {render_outcome_contract(values['run_id'], values['stage'], values['project'], values['group'], values['task'])}
 Do not include private chain-of-thought.'''
@@ -178,6 +197,11 @@ def _skill_for_stage(config: WorkflowConfig, stage: str, state: WorkflowState):
             if "planner" in key.lower() or "implementation-planner" in spec.path:
                 return spec
         return None
+    if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value}:
+        artifact = next((item for item in config.artifact_pipeline if item.id == state.current_artifact_id), None)
+        if artifact and artifact.skill_role and artifact.skill_role in config.skills:
+            return config.skills[artifact.skill_role]
+        return config.skills.get("artifact") or config.skills.get("engineering-spec")
     task = config.task_at(state.current_group, state.current_task)
     if task and task.skill_role and task.skill_role in config.skills:
         return config.skills[task.skill_role]

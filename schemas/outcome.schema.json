@@ -15,7 +15,9 @@
     "decision_id": {"type": "string"},
     "directly_affected_work": {"type": "array", "items": {"type": "string"}},
     "blocking_scope": {"type": "object"},
-    "decision_requests": {"type": "array", "items": {"type": "object"}}
+    "decision_requests": {"type": "array", "items": {"type": "object"}},
+    "artifact": {"type": "object"},
+    "conformance_results": {"type": "array", "items": {"type": "object"}}
   },
   "additionalProperties": true
 }

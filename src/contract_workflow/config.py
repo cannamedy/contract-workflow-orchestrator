@@ -7,7 +7,8 @@ from typing import Any
 
 import yaml
 
-from .models import AuthoritativeSource, GroupSpec, Policy, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
+from .artifacts import validate_artifact_graph
+from .models import ARTIFACT_KINDS, ArtifactSpec, AuthoritativeSource, GroupSpec, Policy, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
 
 
 class WorkflowConfigError(ValueError):
@@ -49,6 +50,10 @@ def _task(value: Any, group: str, index: int) -> TaskSpec:
         requirement_ids=_strings(value.get("requirement_ids")),
         contract_anchors=_strings(value.get("contract_anchors")),
         skill_role=value.get("skill_role"),
+        engineering_spec_anchors=_strings(value.get("engineering_spec_anchors")),
+        machine_contract_refs=_strings(value.get("machine_contract_refs")),
+        conformance_ids=_strings(value.get("conformance_ids")),
+        implementation_design_refs=_strings(value.get("implementation_design_refs")),
     )
 
 
@@ -123,7 +128,26 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
             unknown = set(task.dependencies) - known_tasks
             if unknown:
                 raise WorkflowConfigError(f"task {task.id} depends on unknown task(s): {', '.join(sorted(unknown))}")
-    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), authority_remote=authority_remote, authority_branch=authority_branch, workflow_file=str(workflow_path), digest=digest_file(workflow_path))
+    artifact_raw = raw.get("artifact_pipeline")
+    artifact_explicit = artifact_raw is not None
+    artifact_values = artifact_raw.get("artifacts", artifact_raw.get("nodes", [])) if isinstance(artifact_raw, dict) else artifact_raw
+    artifact_specs: list[ArtifactSpec] = []
+    if artifact_values is not None:
+        if not isinstance(artifact_values, list):
+            raise WorkflowConfigError("artifact_pipeline must be an array or an object containing artifacts")
+        for index, item in enumerate(artifact_values):
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("kind"), str):
+                raise WorkflowConfigError(f"artifact_pipeline[{index}] requires id and kind")
+            artifact_specs.append(ArtifactSpec(
+                id=item["id"], kind=item["kind"], dependencies=_strings(item.get("dependencies", item.get("depends_on"))),
+                optional=bool(item.get("optional", False)), enabled=bool(item.get("enabled", True)), skill_role=item.get("skill_role"),
+                review_required=bool(item.get("review_required", True)), validator_role=item.get("validator_role"),
+                candidate_path=item.get("candidate_path"), accepted_path=item.get("accepted_path"), derived_from=_strings(item.get("derived_from")),
+            ))
+        graph_errors = validate_artifact_graph(artifact_specs)
+        if graph_errors:
+            raise WorkflowConfigError("; ".join(graph_errors))
+    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), authority_remote=authority_remote, authority_branch=authority_branch, artifact_pipeline=tuple(artifact_specs), artifact_pipeline_explicit=artifact_explicit, workflow_file=str(workflow_path), digest=digest_file(workflow_path))
 
 
 def default_workflow(project: Path) -> str:

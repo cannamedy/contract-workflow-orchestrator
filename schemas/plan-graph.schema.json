@@ -21,6 +21,10 @@
           "contract_anchors": {"type": "array", "items": {"type": "string"}},
           "allowed_paths": {"type": "array", "items": {"type": "string"}},
           "expected_outputs": {"type": "array", "items": {"type": "string"}},
+          "engineering_spec_anchors": {"type": "array", "items": {"type": "string"}},
+          "machine_contract_refs": {"type": "array", "items": {"type": "string"}},
+          "conformance_ids": {"type": "array", "items": {"type": "string"}},
+          "implementation_design_refs": {"type": "array", "items": {"type": "string"}},
           "skill_role": {"type": ["string", "null"]}
         },
         "additionalProperties": false

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import AuthoritativeSource, WorkflowConfig, WorkflowState
+from .artifacts import artifact_impact_closure, artifact_specs
 from .scheduler import AGENT_STAGE_NAMES, dependency_closure
 
 
@@ -151,6 +152,9 @@ def _new_change(config: WorkflowConfig, source: AuthoritativeSource, sid: str, c
         "human_decision_required": None,
         "human_decision_requests": [],
         "required_propagation": [],
+        "affected_artifacts": [],
+        "directly_affected_artifacts": [],
+        "dependency_affected_artifacts": [],
         "analysis_summary": "",
         "status": "CHANGE_PENDING",
     }
@@ -356,6 +360,19 @@ def validate_analysis(config: WorkflowConfig, store: Any, state: WorkflowState, 
     if isinstance(anchors, list):
         text = _known_authority_text(config, store, state)
         errors.extend(f"untraceable contract anchor: {item}" for item in anchors if not _anchor_is_traceable(item, text))
+    direct_artifacts = raw.get("directly_affected_artifacts", raw.get("affected_artifacts", []))
+    dependency_artifacts = raw.get("dependency_affected_artifacts", [])
+    if not isinstance(direct_artifacts, list) or not all(isinstance(item, str) for item in direct_artifacts):
+        errors.append("directly_affected_artifacts must be a list of strings")
+        direct_artifacts = []
+    if not isinstance(dependency_artifacts, list) or not all(isinstance(item, str) for item in dependency_artifacts):
+        errors.append("dependency_affected_artifacts must be a list of strings")
+        dependency_artifacts = []
+    known_artifacts = {item.id for item in artifact_specs(config)}
+    errors.extend(f"unknown artifact id: {item}" for item in (set(direct_artifacts) | set(dependency_artifacts)) - known_artifacts)
+    computed_artifacts = artifact_impact_closure(config, direct_artifacts)
+    if direct_artifacts and sorted(dependency_artifacts) != sorted(computed_artifacts - set(direct_artifacts)):
+        errors.append(f"artifact dependency closure mismatch: expected {sorted(computed_artifacts - set(direct_artifacts))}")
     known = _known_task_ids(config, state)
     direct = raw.get("directly_affected_tasks", [])
     reported_dependencies = raw.get("dependency_affected_tasks", [])

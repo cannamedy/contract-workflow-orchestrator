@@ -15,6 +15,9 @@
 | PLAN_REVISION_REVIEW | REQUIRES_PATCH | automatic Plan revision and re-review |
 | PLAN_GRAPH_BUILD | APPROVED | deterministic graph reconciliation, then `TASK_REBASE_ANALYSIS` or promotion request |
 | TASK_REBASE_ANALYSIS | APPROVED | existing scoped promotion Decision Request |
+| ARTIFACT_GENERATION | APPROVED | ARTIFACT_REVIEW when review is required, otherwise next artifact |
+| ARTIFACT_REVIEW | REQUIRES_PATCH | ARTIFACT_PATCH |
+| ARTIFACT_PATCH | APPROVED | ARTIFACT_REVIEW when review is required, otherwise next artifact |
 | TASK_EXECUTION | APPROVED | TASK_INDEPENDENT_REVIEW |
 | TASK_INDEPENDENT_REVIEW | REQUIRES_PATCH | TASK_PATCH |
 | TASK_PATCH | APPROVED | TASK_INDEPENDENT_REVIEW |
@@ -34,6 +37,8 @@
 `HUMAN_PLAN_FREEZE`, `HUMAN_GROUP_APPROVAL`, and `HUMAN_FINAL_ACCEPTANCE` cannot be bypassed by a model outcome. `approve` only releases the exact pending gate.
 
 An authority candidate is not accepted as the new baseline merely because its hash changed. `AUTHORITY_CHANGE_ANALYSIS` persists the candidate and its propagation requirements. Only a C0/C1 analysis with `semantic_change=false` and no affected task auto-accepts. Machine-resolvable semantic changes create external candidate Contract/Plan artifacts and a re-buildable `plan_graph`; accepted artifacts are promoted together only after independent reviews and the existing scoped HumanDecision. An active Agent's unauthorized authority mutation remains `UNAUTHORIZED_AUTHORITY_MUTATION` and enters `HARD_STOP`.
+
+An explicitly configured typed artifact pipeline schedules only artifacts whose dependencies are accepted or approved. Optional disabled artifacts are skipped; unaffected artifacts retain their lifecycle state. Artifact candidate generation and review use generic stages carrying `current_artifact_id`, while task scheduling remains the existing scheduler path.
 
 ## Scoped Human Gates
 

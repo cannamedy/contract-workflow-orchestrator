@@ -14,6 +14,7 @@ from .models import (
     WorkflowState,
     WorkflowStatus,
 )
+from .artifacts import next_artifact
 
 
 # Kept local to avoid making the scheduler depend on the state-machine's transition table.
@@ -32,6 +33,7 @@ AGENT_STAGE_NAMES = frozenset({
     Stage.PLAN_REVISION_REVIEW.value,
     Stage.PLAN_GRAPH_BUILD.value,
     Stage.TASK_REBASE_ANALYSIS.value,
+    Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value,
 })
 HUMAN_GATE_NAMES = frozenset({
     Stage.HUMAN_PLAN_FREEZE.value,
@@ -50,7 +52,9 @@ def _task_map(config: WorkflowConfig, state: WorkflowState | None = None) -> dic
                 id=raw["id"], expected_outputs=tuple(raw.get("expected_outputs", ()) or ()),
                 allowed_paths=tuple(raw.get("allowed_paths", ()) or ()), dependencies=tuple(raw.get("dependencies", ()) or ()),
                 requirement_ids=tuple(raw.get("requirement_ids", ()) or ()), contract_anchors=tuple(raw.get("contract_anchors", ()) or ()),
-                skill_role=raw.get("skill_role"),
+                skill_role=raw.get("skill_role"), engineering_spec_anchors=tuple(raw.get("engineering_spec_anchors", ()) or ()),
+                machine_contract_refs=tuple(raw.get("machine_contract_refs", ()) or ()), conformance_ids=tuple(raw.get("conformance_ids", ()) or ()),
+                implementation_design_refs=tuple(raw.get("implementation_design_refs", ()) or ()),
             )
             result[task.id] = (str(raw.get("group", "default")), task)
         if result:
@@ -204,6 +208,16 @@ def schedule(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
         return state
     if state.current_stage in AGENT_STAGE_NAMES and state.current_task and state.run_id:
         return state
+    artifact = next_artifact(config, state)
+    if artifact:
+        artifact_state = state.artifacts.get(artifact.id)
+        if artifact_state and artifact_state.status == "REVIEW_REQUIRED":
+            stage = Stage.ARTIFACT_REVIEW.value
+        elif artifact_state and artifact_state.status == "REQUIRES_PATCH":
+            stage = Stage.ARTIFACT_PATCH.value
+        else:
+            stage = Stage.ARTIFACT_GENERATION.value
+        return replace(state, current_stage=stage, current_artifact_id=artifact.id, current_group=None, current_task=None, run_id=None, attempt=0, pending_human_gate=None, status=WorkflowStatus.RUNNING.value)
     ready = ready_work(config, state)
     if ready:
         item = ready[0]

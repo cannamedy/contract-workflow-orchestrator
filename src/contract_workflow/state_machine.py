@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+from .artifacts import initialize_artifacts
 from .models import BLOCKING_VERDICTS, SCOPED_DECISION_VERDICTS, Stage, StepResult, Verdict, WorkflowConfig, WorkflowState, WorkflowStatus, now_iso
 
 
@@ -15,12 +16,13 @@ AGENT_STAGES = {
     Stage.CONTRACT_REVISION_REVIEW.value, Stage.PLAN_REVISION.value,
     Stage.PLAN_REVISION_REVIEW.value, Stage.PLAN_GRAPH_BUILD.value,
     Stage.TASK_REBASE_ANALYSIS.value,
+    Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value,
 }
 HUMAN_GATES = {Stage.HUMAN_GROUP_APPROVAL.value, Stage.HUMAN_PLAN_FREEZE.value, Stage.HUMAN_FINAL_ACCEPTANCE.value}
 
 
 def initial_state(config: WorkflowConfig) -> WorkflowState:
-    return WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest)
+    return WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest, artifacts=initialize_artifacts(config))
 
 
 def _update(state: WorkflowState, **changes: Any) -> WorkflowState:

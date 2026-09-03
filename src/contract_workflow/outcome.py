@@ -68,6 +68,8 @@ OUTCOME_SCHEMA = {
         "plan_review": {"type": "object"},
         "plan_graph": {"type": "object"},
         "task_rebase": {"type": "object"},
+        "artifact": {"type": "object"},
+        "conformance_results": {"type": "array", "items": {"type": "object"}},
     },
 }
 

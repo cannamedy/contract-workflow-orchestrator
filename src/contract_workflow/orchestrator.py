@@ -11,6 +11,7 @@ from typing import Any
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity
 from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
+from .artifacts import artifact_impact_closure, effective_artifact_specs, missing_skill_roles, validate_artifact_outcome, validate_final_conformance, reconcile_artifact_impact
 from .plan_graph import reconcile_plan_graph, validate_plan_graph
 from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
 from .logging import EventLogger
@@ -44,6 +45,7 @@ READ_ONLY_RECOVERY_STAGES = frozenset({
     Stage.TASK_INDEPENDENT_REVIEW.value,
     Stage.PLAN_REVISION_REVIEW.value,
     Stage.FINAL_VERIFICATION.value,
+    Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value,
 })
 
 STRICT_WORKSPACE_STAGES = frozenset({
@@ -55,6 +57,7 @@ STRICT_WORKSPACE_STAGES = frozenset({
     Stage.TASK_REBASE_ANALYSIS.value,
     Stage.TASK_INDEPENDENT_REVIEW.value,
     Stage.FINAL_VERIFICATION.value,
+    Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value,
 })
 CANDIDATE_WORKSPACE_STAGES = frozenset({
     Stage.CONTRACT_REVISION.value,
@@ -337,6 +340,8 @@ class Orchestrator:
         stage = state.current_stage
         if stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value:
             return self._apply_authority_analysis(state, outcome)
+        if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value}:
+            return self._apply_artifact_outcome(state, outcome)
         # PLAN_REVISION_REVIEW is also an existing ordinary plan-defect stage.
         # Route it to propagation only when an active propagation record owns
         # the current stage; otherwise preserve the v0.3-A transition table.
@@ -347,6 +352,10 @@ class Orchestrator:
         )
         if stage in PROPAGATION_STAGES and (stage != Stage.PLAN_REVISION_REVIEW.value or active_propagation):
             return self._apply_propagation_outcome(state, outcome)
+        if stage == Stage.FINAL_VERIFICATION.value and self.config.artifact_pipeline_explicit:
+            conformance_errors = validate_final_conformance(state, outcome)
+            if conformance_errors:
+                return self._invalid_or_failed(state, conformance_errors)
         verdict = Verdict(outcome["verdict"])
         if verdict in SCOPED_DECISION_VERDICTS:
             state, unresolved = self._record_decisions(state, outcome)
@@ -369,6 +378,51 @@ class Orchestrator:
         self.logger.emit("transition", from_stage=state.current_stage, to_stage=new_state.current_stage, verdict=outcome["verdict"])
         return StepResult(self._save(new_state), result.action, result.retry_delay)
 
+    def _apply_artifact_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
+        stage = state.current_stage
+        raw, errors = validate_artifact_outcome(self.config, state, outcome.get("artifact"), stage=stage)
+        if errors or raw is None:
+            return self._invalid_or_failed(state, errors or ["invalid artifact outcome"])
+        artifact_id = str(raw["id"])
+        current = state.artifacts.get(artifact_id)
+        if current is None:
+            return self._invalid_or_failed(state, ["current artifact state is missing"])
+        from .models import ArtifactStatus
+        if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_PATCH.value}:
+            candidate_hash = raw.get("candidate_hash")
+            candidate_path = raw.get("candidate_path") or current.candidate_path
+            if raw.get("candidate_content") is not None:
+                candidate_path = str(self.store.save_artifact_candidate(artifact_id, str(raw["candidate_content"])))
+            status = ArtifactStatus.REVIEW_REQUIRED.value if current.review_required else ArtifactStatus.APPROVED.value
+            updated_artifact = replace(current, status=status, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata={**current.metadata, "last_outcome": outcome.get("summary", "")})
+        else:
+            verdict = Verdict(outcome["verdict"])
+            if verdict == Verdict.REQUIRES_PATCH:
+                updated_artifact = replace(current, status=ArtifactStatus.REQUIRES_PATCH.value, metadata={**current.metadata, "review": raw.get("review", {})})
+            elif verdict == Verdict.APPROVED:
+                updated_artifact = replace(current, status=ArtifactStatus.APPROVED.value, version_hash=current.candidate_hash, metadata={**current.metadata, "review": raw.get("review", {})})
+            elif verdict in SCOPED_DECISION_VERDICTS:
+                updated_artifact = replace(current, status=ArtifactStatus.BLOCKED.value, metadata={**current.metadata, "review": raw.get("review", {})})
+            else:
+                return self._invalid_or_failed(state, [f"unsupported artifact review verdict {verdict.value}"])
+        artifacts = {**state.artifacts, artifact_id: updated_artifact}
+        self.store.save_artifact(updated_artifact.to_dict())
+        updated = replace(state, artifacts=artifacts, current_artifact_id=None, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome=outcome, status=WorkflowStatus.RUNNING.value)
+        if stage == Stage.ARTIFACT_REVIEW.value and Verdict(outcome["verdict"]) in SCOPED_DECISION_VERDICTS:
+            decision_outcome = {
+                **outcome,
+                "decision_requests": [
+                    {
+                        **request,
+                        "source_artifact_id": request.get("source_artifact_id", artifact_id),
+                    }
+                    for request in (outcome.get("decision_requests") or [outcome])
+                    if isinstance(request, dict)
+                ],
+            }
+            updated, _ = self._record_decisions(updated, decision_outcome)
+        return StepResult(self._save(schedule(self.config, updated)), "artifact_outcome")
+
     def _apply_authority_analysis(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         analysis, errors = validate_analysis(self.config, self.store, state, outcome)
         if errors or analysis is None:
@@ -377,8 +431,12 @@ class Orchestrator:
         change = dict(state.authority_changes.get(change_id, {}))
         direct = list(analysis["directly_affected_tasks"])
         computed = sorted(dependency_tasks(self.config, direct, state))
+        direct_artifacts = list(analysis.get("directly_affected_artifacts", analysis.get("affected_artifacts", [])))
+        artifact_closure = sorted(artifact_impact_closure(self.config, direct_artifacts) - set(direct_artifacts))
         all_tasks = {str(item.get("id")) for item in (state.plan_graph or {}).get("tasks", []) if isinstance(item, dict) and isinstance(item.get("id"), str)} or {task.id for _, task in self.config.tasks}
-        record = {**change, **analysis, "dependency_affected_tasks": computed, "unaffected_tasks": sorted(all_tasks - set(direct) - set(computed)), "status": "CHANGE_PENDING" if analysis["human_decision_required"] else "PROPAGATING", "analyzed_at": now_iso()}
+        record = {**change, **analysis, "directly_affected_artifacts": direct_artifacts, "dependency_affected_artifacts": artifact_closure, "affected_artifacts": sorted(set(direct_artifacts) | set(artifact_closure)), "dependency_affected_tasks": computed, "unaffected_tasks": sorted(all_tasks - set(direct) - set(computed)), "status": "CHANGE_PENDING" if analysis["human_decision_required"] else "PROPAGATING", "analyzed_at": now_iso()}
+        if direct_artifacts:
+            record["artifact_impact"] = reconcile_artifact_impact(self.config, state, direct_artifacts)
         self.store.save_authority_change(record)
         ledger = bootstrap_ledger(self.config, self.store)
         entry = ledger.setdefault("sources", {}).setdefault(record["source_id"], {})
@@ -396,6 +454,14 @@ class Orchestrator:
         else:
             propagation = None
         updated = replace(state, authority_changes={**state.authority_changes, change_id: record}, current_authority_change_id=change_id if propagation else None, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False)
+        if direct_artifacts:
+            from .models import ArtifactStatus
+            blocked_artifacts = dict(updated.artifacts)
+            for artifact_id in set(direct_artifacts) | set(artifact_closure):
+                artifact = blocked_artifacts.get(artifact_id)
+                if artifact:
+                    blocked_artifacts[artifact_id] = replace(artifact, status=ArtifactStatus.BLOCKED.value, change_id=change_id)
+            updated = replace(updated, artifacts=blocked_artifacts)
         if propagation:
             updated = replace(updated, propagation={**updated.propagation, change_id: propagation})
         if analysis["human_decision_required"]:
@@ -632,6 +698,7 @@ class Orchestrator:
                 "allow_freeform": bool(raw.get("allow_freeform", outcome.get("allow_freeform", True))),
                 "source_change": raw.get("source_change", outcome.get("source_change", "")),
                 "source_stage": raw.get("source_stage", outcome.get("source_stage", state.current_stage)),
+                "source_artifact_id": raw.get("source_artifact_id", outcome.get("source_artifact_id", "")),
                 "affected_requirements": tuple(raw.get("affected_requirements", outcome.get("affected_requirements", ())) or ()),
                 "affected_contract_anchors": tuple(raw.get("affected_contract_anchors", outcome.get("affected_contract_anchors", ())) or ()),
                 "affected_tasks": tuple(raw.get("affected_tasks", outcome.get("affected_tasks", direct)) or ()),
@@ -657,7 +724,7 @@ class Orchestrator:
     def _matching_resolved_adr(candidate: HumanDecision, decisions: dict[str, HumanDecision]) -> dict[str, Any] | None:
         signature = (
             candidate.category, candidate.question, candidate.source_change, candidate.source_stage,
-            candidate.affected_requirements, candidate.affected_contract_anchors,
+            candidate.source_artifact_id, candidate.affected_requirements, candidate.affected_contract_anchors,
             candidate.affected_tasks, candidate.directly_blocked_items,
         )
         for decision in decisions.values():
@@ -665,7 +732,7 @@ class Orchestrator:
                 continue
             other = (
                 decision.category, decision.question, decision.source_change, decision.source_stage,
-                decision.affected_requirements, decision.affected_contract_anchors,
+                decision.source_artifact_id, decision.affected_requirements, decision.affected_contract_anchors,
                 decision.affected_tasks, decision.directly_blocked_items,
             )
             if signature == other:
@@ -714,6 +781,17 @@ class Orchestrator:
             "created_at": resolved_at,
         }
         next_state = replace(state, decisions=decisions, adrs={**state.adrs, str(resolved.adr_id): adr}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
+        if resolved.source_artifact_id and resolved.source_artifact_id in next_state.artifacts:
+            artifact = next_state.artifacts[resolved.source_artifact_id]
+            if artifact.status == "BLOCKED":
+                resumed_status = "REVIEW_REQUIRED" if artifact.candidate_hash else "PENDING"
+                next_state = replace(
+                    next_state,
+                    artifacts={
+                        **next_state.artifacts,
+                        resolved.source_artifact_id: replace(artifact, status=resumed_status),
+                    },
+                )
         promoted = resolved.category == "AUTHORITY_PROMOTION" and value == "promote"
         if promoted:
             next_state = self._promote_authority_change(next_state, resolved)
@@ -829,6 +907,9 @@ class Orchestrator:
             "propagation": state.propagation,
             "plan_graph": state.plan_graph,
             "plan_graph_reconciliation": state.plan_graph_reconciliation,
+            "artifact_pipeline": [spec.__dict__ for spec in effective_artifact_specs(self.config)],
+            "artifact_pipeline_mode": "explicit" if self.config.artifact_pipeline_explicit else "legacy-adapter",
+            "missing_skill_roles": missing_skill_roles(self.config),
             "unaffected_work_continues": state.status == WorkflowStatus.RUNNING.value and bool(ready_work(self.config, state)),
             "state": state.to_dict(),
         }

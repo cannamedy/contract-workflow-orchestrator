@@ -28,6 +28,7 @@ class StateStore:
         self.remote_cache_path = self.remote_path / "git-cache"
         self.remote_state_path = self.authority_path / "remote-state.json"
         self.remote_snapshots_path = self.authority_path / "snapshots"
+        self.artifacts_path = root / "artifacts"
 
     def ensure(self) -> None:
         self.runs_path.mkdir(parents=True, exist_ok=True)
@@ -37,6 +38,7 @@ class StateStore:
         self.propagation_path.mkdir(parents=True, exist_ok=True)
         self.remote_path.mkdir(parents=True, exist_ok=True)
         self.remote_snapshots_path.mkdir(parents=True, exist_ok=True)
+        self.artifacts_path.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> WorkflowState | None:
         if not self.state_path.exists():
@@ -124,6 +126,25 @@ class StateStore:
     def save_remote_state(self, state: dict[str, object]) -> None:
         self.ensure()
         self._atomic_write(self.remote_state_path, json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+    def save_artifact(self, artifact: dict[str, object]) -> Path:
+        self.ensure()
+        artifact_id = str(artifact.get("id", ""))
+        if not artifact_id or Path(artifact_id).name != artifact_id:
+            raise StateStoreError("artifact requires a safe id")
+        path = self.artifacts_path / f"{artifact_id}.json"
+        self._atomic_write(path, json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        return path
+
+    def save_artifact_candidate(self, artifact_id: str, content: str) -> Path:
+        self.ensure()
+        if not artifact_id or Path(artifact_id).name != artifact_id:
+            raise StateStoreError("artifact requires a safe id")
+        directory = self.artifacts_path / artifact_id
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "candidate"
+        self._atomic_write(path, content)
+        return path
 
     def save_authority_change(self, change: dict[str, object]) -> None:
         self.ensure()

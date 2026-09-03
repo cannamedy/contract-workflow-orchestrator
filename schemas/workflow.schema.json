@@ -23,6 +23,10 @@
             "allowed_paths": {"type": "array", "items": {"type": "string"}},
             "requirement_ids": {"type": "array", "items": {"type": "string"}},
             "contract_anchors": {"type": "array", "items": {"type": "string"}},
+            "engineering_spec_anchors": {"type": "array", "items": {"type": "string"}},
+            "machine_contract_refs": {"type": "array", "items": {"type": "string"}},
+            "conformance_ids": {"type": "array", "items": {"type": "string"}},
+            "implementation_design_refs": {"type": "array", "items": {"type": "string"}},
             "skill_role": {"type": "string"}
           }}
         ]}
@@ -33,6 +37,28 @@
     "authority": {"type": "object", "properties": {"remote": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}}},
     "authority_remote": {"type": "string", "minLength": 1},
     "authority_branch": {"type": "string", "minLength": 1}
+    ,"artifact_pipeline": {
+      "oneOf": [
+        {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+        {"type": "object", "required": ["artifacts"], "properties": {"artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}}}}
+      ]
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["id", "kind"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["HUMAN_GUIDE", "ENGINEERING_SPEC", "MACHINE_CONTRACT", "CONFORMANCE_SPEC", "IMPLEMENTATION_DESIGN", "IMPLEMENTATION_PLAN", "PLAN_GRAPH", "TASK_CONTRACT"]},
+        "dependencies": {"type": "array", "items": {"type": "string"}},
+        "optional": {"type": "boolean"}, "enabled": {"type": "boolean"},
+        "skill_role": {"type": "string"}, "review_required": {"type": "boolean"},
+        "validator_role": {"type": "string"}, "candidate_path": {"type": "string"},
+        "accepted_path": {"type": "string"}, "derived_from": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": true
 }

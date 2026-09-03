@@ -40,6 +40,10 @@ When a declared authority file changes between bounded Agent runs, CWO records a
 
 The Plan Graph is a runtime projection of the human-readable Implementation Plan, not a second authority. It is validated as a DAG with traceable requirements, anchors, paths, and outputs; graph reconciliation preserves completed unaffected work, marks superseded work terminal, and adds only new or affected work to scheduling. A project workflow may bootstrap with a bounded task declaration; after propagation, the active graph supplies the complete task set without editing the workflow YAML.
 
+## Typed engineering artifacts
+
+An optional `artifact_pipeline` turns artifact production into a typed DAG. Supported kinds are `HUMAN_GUIDE`, `ENGINEERING_SPEC`, `MACHINE_CONTRACT`, `CONFORMANCE_SPEC`, `IMPLEMENTATION_DESIGN`, `IMPLEMENTATION_PLAN`, `PLAN_GRAPH`, and `TASK_CONTRACT`. CWO owns artifact identity, lifecycle, dependency scheduling, candidate isolation, and validation hooks; the configured `skill_role` owns artifact content. Generic `ARTIFACT_GENERATION`, `ARTIFACT_REVIEW`, and `ARTIFACT_PATCH` stages preserve candidate/accepted separation. Workflows without this configuration continue through the legacy Contract/Plan adapter.
+
 Every Agent run writes `runs/<run-id>/outcome.json`, `prompt.md`, separated stdout/stderr, and metadata. Only a schema-validated outcome plus deterministic checks can select the next transition. Missing, malformed, mismatched, or unknown outcomes are retryable up to the configured bound; unresolved uncertainty becomes a hard stop.
 
 ## Agent Run Isolation

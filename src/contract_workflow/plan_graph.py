@@ -53,8 +53,12 @@ def validate_plan_graph(config: WorkflowConfig, graph: Any, *, contract_text: st
         if not isinstance(group, str) or not group:
             errors.append(f"tasks[{index}].group is required")
         values: dict[str, Any] = {"id": task_id, "group": group or "", "dependencies": raw.get("dependencies", []), "requirement_ids": raw.get("requirement_ids", []), "contract_anchors": raw.get("contract_anchors", []), "allowed_paths": raw.get("allowed_paths", []), "expected_outputs": raw.get("expected_outputs", [])}
-        for key in ("dependencies", "requirement_ids", "contract_anchors", "allowed_paths", "expected_outputs"):
-            if not isinstance(values[key], list) or not all(isinstance(item, str) for item in values[key]):
+        for key in ("engineering_spec_anchors", "machine_contract_refs", "conformance_ids", "implementation_design_refs"):
+            if key in raw:
+                values[key] = raw[key]
+        for key in ("dependencies", "requirement_ids", "contract_anchors", "allowed_paths", "expected_outputs", "engineering_spec_anchors", "machine_contract_refs", "conformance_ids", "implementation_design_refs"):
+            value = values.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 errors.append(f"tasks[{index}].{key} must be an array of strings")
         for requirement in values["requirement_ids"] if isinstance(values["requirement_ids"], list) else []:
             if not REQUIREMENT_ID.fullmatch(requirement):
@@ -117,4 +121,4 @@ def reconcile_plan_graph(config: WorkflowConfig, state: WorkflowState, graph: di
 
 
 def task_specs(graph: dict[str, Any]) -> tuple[tuple[str, TaskSpec], ...]:
-    return tuple((str(raw.get("group", "default")), TaskSpec(id=str(raw["id"]), expected_outputs=tuple(raw.get("expected_outputs", ())), allowed_paths=tuple(raw.get("allowed_paths", ())), dependencies=tuple(raw.get("dependencies", ())), requirement_ids=tuple(raw.get("requirement_ids", ())), contract_anchors=tuple(raw.get("contract_anchors", ())), skill_role=raw.get("skill_role"))) for raw in graph.get("tasks", []) if isinstance(raw, dict) and isinstance(raw.get("id"), str))
+    return tuple((str(raw.get("group", "default")), TaskSpec(id=str(raw["id"]), expected_outputs=tuple(raw.get("expected_outputs", ())), allowed_paths=tuple(raw.get("allowed_paths", ())), dependencies=tuple(raw.get("dependencies", ())), requirement_ids=tuple(raw.get("requirement_ids", ())), contract_anchors=tuple(raw.get("contract_anchors", ())), skill_role=raw.get("skill_role"), engineering_spec_anchors=tuple(raw.get("engineering_spec_anchors", ())), machine_contract_refs=tuple(raw.get("machine_contract_refs", ())), conformance_ids=tuple(raw.get("conformance_ids", ())), implementation_design_refs=tuple(raw.get("implementation_design_refs", ())))) for raw in graph.get("tasks", []) if isinstance(raw, dict) and isinstance(raw.get("id"), str))

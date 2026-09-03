@@ -28,6 +28,9 @@ class Stage(str, Enum):
     PLAN_REVISION_REVIEW = "PLAN_REVISION_REVIEW"
     PLAN_GRAPH_BUILD = "PLAN_GRAPH_BUILD"
     TASK_REBASE_ANALYSIS = "TASK_REBASE_ANALYSIS"
+    ARTIFACT_GENERATION = "ARTIFACT_GENERATION"
+    ARTIFACT_REVIEW = "ARTIFACT_REVIEW"
+    ARTIFACT_PATCH = "ARTIFACT_PATCH"
     HUMAN_FINAL_ACCEPTANCE = "HUMAN_FINAL_ACCEPTANCE"
     WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
     WAITING_FOR_AUTHORITY_CHANGE = "WAITING_FOR_AUTHORITY_CHANGE"
@@ -86,6 +89,25 @@ class WorkItemStatus(str, Enum):
     RECOVERY_UNCERTAIN = "RECOVERY_UNCERTAIN"
 
 
+class ArtifactStatus(str, Enum):
+    MISSING = "MISSING"
+    PENDING = "PENDING"
+    GENERATING = "GENERATING"
+    CANDIDATE = "CANDIDATE"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    REQUIRES_PATCH = "REQUIRES_PATCH"
+    APPROVED = "APPROVED"
+    ACCEPTED = "ACCEPTED"
+    SUPERSEDED = "SUPERSEDED"
+    BLOCKED = "BLOCKED"
+
+
+ARTIFACT_KINDS = frozenset({
+    "HUMAN_GUIDE", "ENGINEERING_SPEC", "MACHINE_CONTRACT", "CONFORMANCE_SPEC",
+    "IMPLEMENTATION_DESIGN", "IMPLEMENTATION_PLAN", "PLAN_GRAPH", "TASK_CONTRACT",
+})
+
+
 class DecisionStatus(str, Enum):
     PENDING = "PENDING"
     RESOLVED = "RESOLVED"
@@ -101,6 +123,52 @@ class AuthoritativeSource:
     mutable_after_start: bool = False
     source_id: str | None = None
     role: str | None = None
+
+
+@dataclass(frozen=True)
+class ArtifactSpec:
+    id: str
+    kind: str
+    dependencies: tuple[str, ...] = ()
+    optional: bool = False
+    enabled: bool = True
+    skill_role: str | None = None
+    review_required: bool = True
+    validator_role: str | None = None
+    candidate_path: str | None = None
+    accepted_path: str | None = None
+    derived_from: tuple[str, ...] = ()
+
+
+@dataclass
+class EngineeringArtifact:
+    id: str
+    kind: str
+    status: str = ArtifactStatus.MISSING.value
+    version_hash: str | None = None
+    accepted_hash: str | None = None
+    candidate_hash: str | None = None
+    derived_from: list[str] = field(default_factory=list)
+    affected_requirements: list[str] = field(default_factory=list)
+    affected_contract_anchors: list[str] = field(default_factory=list)
+    skill_role: str | None = None
+    review_required: bool = True
+    validator_role: str | None = None
+    candidate_path: str | None = None
+    accepted_path: str | None = None
+    change_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "EngineeringArtifact":
+        payload = {key: item for key, item in value.items() if key in cls.__dataclass_fields__}
+        for key in ("derived_from", "affected_requirements", "affected_contract_anchors"):
+            payload[key] = list(payload.get(key, ()) or ())
+        payload["metadata"] = dict(payload.get("metadata", {}) or {})
+        return cls(**payload)
 
 
 @dataclass
@@ -124,6 +192,9 @@ class AuthorityChange:
     human_decision_required: bool | None = None
     human_decision_requests: list[dict[str, Any]] = field(default_factory=list)
     required_propagation: list[str] = field(default_factory=list)
+    affected_artifacts: list[str] = field(default_factory=list)
+    directly_affected_artifacts: list[str] = field(default_factory=list)
+    dependency_affected_artifacts: list[str] = field(default_factory=list)
     analysis_summary: str = ""
     status: str = "CHANGE_PENDING"
 
@@ -146,6 +217,10 @@ class TaskSpec:
     requirement_ids: tuple[str, ...] = ()
     contract_anchors: tuple[str, ...] = ()
     skill_role: str | None = None
+    engineering_spec_anchors: tuple[str, ...] = ()
+    machine_contract_refs: tuple[str, ...] = ()
+    conformance_ids: tuple[str, ...] = ()
+    implementation_design_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -191,6 +266,8 @@ class WorkflowConfig:
     hard_stops: tuple[str, ...] = ()
     authority_remote: str = "origin"
     authority_branch: str = "main"
+    artifact_pipeline: tuple[ArtifactSpec, ...] = ()
+    artifact_pipeline_explicit: bool = False
     workflow_file: str = ""
     digest: str = ""
 
@@ -233,11 +310,14 @@ class WorkflowState:
     propagation: dict[str, dict[str, Any]] = field(default_factory=dict)
     plan_graph: dict[str, Any] | None = None
     plan_graph_reconciliation: dict[str, Any] = field(default_factory=dict)
+    artifacts: dict[str, EngineeringArtifact] = field(default_factory=dict)
+    current_artifact_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = self.__dict__.copy()
         value["work_items"] = {key: item.to_dict() for key, item in self.work_items.items()}
         value["decisions"] = {key: item.to_dict() for key, item in self.decisions.items()}
+        value["artifacts"] = {key: item.to_dict() for key, item in self.artifacts.items()}
         return value
 
     @classmethod
@@ -251,6 +331,10 @@ class WorkflowState:
         payload["decisions"] = {
             key: HumanDecision.from_dict(item) if isinstance(item, dict) else item
             for key, item in (payload.get("decisions") or {}).items()
+        }
+        payload["artifacts"] = {
+            key: EngineeringArtifact.from_dict(item) if isinstance(item, dict) else item
+            for key, item in (payload.get("artifacts") or {}).items()
         }
         return cls(**payload)
 
@@ -311,6 +395,7 @@ class HumanDecision:
     allow_freeform: bool = True
     source_change: str = ""
     source_stage: str = ""
+    source_artifact_id: str = ""
     affected_requirements: tuple[str, ...] = ()
     affected_contract_anchors: tuple[str, ...] = ()
     affected_tasks: tuple[str, ...] = ()
