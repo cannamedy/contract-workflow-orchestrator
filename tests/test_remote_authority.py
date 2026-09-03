@@ -113,6 +113,8 @@ class RemoteAuthorityTests(unittest.TestCase):
         result = check_remote_authority(config, StateStore(self.root / "missing-state"), self.state)
         self.assertEqual(result.status, REMOTE_AUTHORITY_SOURCE_MISSING)
         self.assertTrue(result.errors[0].startswith(REMOTE_AUTHORITY_SOURCE_MISSING))
+        remote_state = json.loads((self.root / "missing-state" / "authority" / "remote-state.json").read_text())
+        self.assertEqual(remote_state["sources"]["human-guide"]["last_seen_remote_commit"], result.snapshot.commit_sha)
 
     def test_fetch_failure_preserves_ledger(self):
         check_remote_authority(self.config, self.store, self.state)

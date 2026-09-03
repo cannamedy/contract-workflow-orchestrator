@@ -146,9 +146,13 @@ def check_remote_authority(config: WorkflowConfig, store: Any, state: WorkflowSt
     blob, error = _tree_entry(cache, commit, source.path)
     observed = datetime.now(timezone.utc).isoformat()
     if error:
-        return RemoteCheck(RemoteAuthoritySnapshot(url, config.authority_branch, commit, source.path, None, None, None, observed, REMOTE_AUTHORITY_SOURCE_MISSING), errors=(error,), status=REMOTE_AUTHORITY_SOURCE_MISSING)
+        snapshot = RemoteAuthoritySnapshot(url, config.authority_branch, commit, source.path, None, None, None, observed, REMOTE_AUTHORITY_SOURCE_MISSING)
+        _record_missing_remote_state(store, source, snapshot, dry_run)
+        return RemoteCheck(snapshot, errors=(error,), status=REMOTE_AUTHORITY_SOURCE_MISSING)
     if blob is None:
-        return RemoteCheck(RemoteAuthoritySnapshot(url, config.authority_branch, commit, source.path, None, None, None, observed, REMOTE_AUTHORITY_SOURCE_MISSING), errors=(f"{REMOTE_AUTHORITY_SOURCE_MISSING}: {source.path} is absent at {commit}",), status=REMOTE_AUTHORITY_SOURCE_MISSING)
+        snapshot = RemoteAuthoritySnapshot(url, config.authority_branch, commit, source.path, None, None, None, observed, REMOTE_AUTHORITY_SOURCE_MISSING)
+        _record_missing_remote_state(store, source, snapshot, dry_run)
+        return RemoteCheck(snapshot, errors=(f"{REMOTE_AUTHORITY_SOURCE_MISSING}: {source.path} is absent at {commit}",), status=REMOTE_AUTHORITY_SOURCE_MISSING)
     content = _snapshot_content(cache, commit, source.path)
     if content is None:
         return RemoteCheck(None, errors=(f"{REMOTE_CHECK_FAILED}: cannot read remote authority blob {blob}",), status=REMOTE_CHECK_FAILED)
@@ -199,6 +203,18 @@ def check_remote_authority(config: WorkflowConfig, store: Any, state: WorkflowSt
     store.save_authority_ledger(ledger)
     store.save_remote_state(remote_state)
     return RemoteCheck(snapshot, changed=True, new_change=change, status="AUTHORITY_CHANGE_DETECTED")
+
+
+def _record_missing_remote_state(store: Any, source: AuthoritativeSource, snapshot: RemoteAuthoritySnapshot, dry_run: bool) -> None:
+    if dry_run:
+        return
+    from .authority import source_id
+    value = store.load_remote_state() or {"schema_version": "1.0", "sources": {}}
+    sources = value.setdefault("sources", {})
+    sid = source_id(source)
+    prior = sources.get(sid, {}) if isinstance(sources.get(sid, {}), dict) else {}
+    sources[sid] = {**prior, **snapshot.to_dict(), "last_seen_remote_commit": snapshot.commit_sha, "status": REMOTE_AUTHORITY_SOURCE_MISSING}
+    store.save_remote_state(value)
 
 
 def scan_remote_authority_changes(config: WorkflowConfig, store: Any, state: WorkflowState):
