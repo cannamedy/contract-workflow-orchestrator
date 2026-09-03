@@ -29,7 +29,10 @@
       }}
       }
     },
-    "hard_stops": {"type": "array", "items": {"type": "string"}}
+    "hard_stops": {"type": "array", "items": {"type": "string"}},
+    "authority": {"type": "object", "properties": {"remote": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}}},
+    "authority_remote": {"type": "string", "minLength": 1},
+    "authority_branch": {"type": "string", "minLength": 1}
   },
   "additionalProperties": true
 }

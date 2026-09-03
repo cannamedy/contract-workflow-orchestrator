@@ -24,6 +24,10 @@ class StateStore:
         self.authority_ledger_path = self.authority_path / "ledger.json"
         self.authority_changes_path = self.authority_path / "changes"
         self.propagation_path = root / "propagation"
+        self.remote_path = root / "remote"
+        self.remote_cache_path = self.remote_path / "git-cache"
+        self.remote_state_path = self.authority_path / "remote-state.json"
+        self.remote_snapshots_path = self.authority_path / "snapshots"
 
     def ensure(self) -> None:
         self.runs_path.mkdir(parents=True, exist_ok=True)
@@ -31,6 +35,8 @@ class StateStore:
         self.adrs_path.mkdir(parents=True, exist_ok=True)
         self.authority_changes_path.mkdir(parents=True, exist_ok=True)
         self.propagation_path.mkdir(parents=True, exist_ok=True)
+        self.remote_path.mkdir(parents=True, exist_ok=True)
+        self.remote_snapshots_path.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> WorkflowState | None:
         if not self.state_path.exists():
@@ -103,6 +109,21 @@ class StateStore:
     def save_authority_ledger(self, ledger: dict[str, object]) -> None:
         self.ensure()
         self._atomic_write(self.authority_ledger_path, json.dumps(ledger, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+    def load_remote_state(self) -> dict[str, object] | None:
+        if not self.remote_state_path.exists():
+            return None
+        try:
+            value = json.loads(self.remote_state_path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("remote state root is not an object")
+            return value
+        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+            raise StateStoreError(f"corrupt remote authority state: {self.remote_state_path}: {exc}") from exc
+
+    def save_remote_state(self, state: dict[str, object]) -> None:
+        self.ensure()
+        self._atomic_write(self.remote_state_path, json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
     def save_authority_change(self, change: dict[str, object]) -> None:
         self.ensure()

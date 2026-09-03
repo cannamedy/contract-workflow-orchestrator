@@ -52,6 +52,10 @@ def _task(value: Any, group: str, index: int) -> TaskSpec:
     )
 
 
+def _safe_branch(value: str) -> bool:
+    return bool(value) and not value.startswith("/") and not value.endswith("/") and ".." not in value.split("/") and not any(char.isspace() or char in "~^\\:" for char in value)
+
+
 def load_workflow(path: str | Path, project_override: str | Path | None = None) -> WorkflowConfig:
     workflow_path = Path(path).expanduser().resolve()
     if not workflow_path.is_file():
@@ -67,6 +71,13 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
     if not isinstance(project_name, str) or not project_name:
         raise WorkflowConfigError("project.name is required")
     project_path = Path(project_override or project.get("path") or workflow_path.parent).expanduser().resolve()
+    authority_raw = _mapping(raw.get("authority"), "authority")
+    authority_remote = authority_raw.get("remote", raw.get("authority_remote", "origin"))
+    authority_branch = authority_raw.get("branch", raw.get("authority_branch", "main"))
+    if not isinstance(authority_remote, str) or not authority_remote:
+        raise WorkflowConfigError("authority.remote must be a non-empty string")
+    if not isinstance(authority_branch, str) or not _safe_branch(authority_branch):
+        raise WorkflowConfigError("authority.branch must be a safe non-empty branch name")
     mode = raw.get("mode", "gated")
     if isinstance(mode, dict):
         mode = mode.get("value", "gated")
@@ -112,7 +123,7 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
             unknown = set(task.dependencies) - known_tasks
             if unknown:
                 raise WorkflowConfigError(f"task {task.id} depends on unknown task(s): {', '.join(sorted(unknown))}")
-    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), workflow_file=str(workflow_path), digest=digest_file(workflow_path))
+    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), authority_remote=authority_remote, authority_branch=authority_branch, workflow_file=str(workflow_path), digest=digest_file(workflow_path))
 
 
 def default_workflow(project: Path) -> str:

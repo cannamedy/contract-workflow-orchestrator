@@ -30,6 +30,10 @@ The default policy is conservative: gated mode, no automatic Git commit, push, t
 
 Projects declare `.contract-workflow/workflow.yaml`. See `examples/workflow.yaml` for a generic configuration. Runtime state defaults to `~/.local/share/contract-workflow/<project-key>` and can be redirected with `CWO_STATE_DIR`; it is kept outside the target Git repository.
 
+## Submitted authority checks
+
+The local project checkout is a Human Draft Workspace. For a declared `HUMAN_GUIDE`, authority checks read `origin/main` (or `authority.remote` / `authority.branch`) through an external bare cache; local Human Guide edits do not enqueue a Change Record. Use `cwo authority check <project> --dry-run` for a one-shot check or `cwo authority watch <project> --interval 300` to poll the same check. Remote snapshots, commit/blob provenance, and remote state are kept under the external runtime directory.
+
 ## Authority Change Intake
 
 When a declared authority file changes between bounded Agent runs, CWO records a runtime-only Change Record under `authority/changes/` and runs `AUTHORITY_CHANGE_ANALYSIS`. The ledger separates the workflow digest from accepted authority revisions, so normal Human Guide evolution does not require editing `workflow.yaml`. The Agent classifies C0-C4 and declares direct impact; CWO validates the declaration and computes downstream dependency closure. Directly affected work is `BLOCKED_BY_AUTHORITY_CHANGE`, its descendants wait for dependencies, and independent READY work continues. C0/C1 changes with no semantic or task impact are auto-accepted. Machine-resolvable C2-C4 changes continue through candidate Contract/Plan revision and independent review, a complete `plan_graph` projection, and affected-task rebase analysis. Candidates remain outside accepted project authority until one existing scoped HumanDecision promotes the reviewed baseline.

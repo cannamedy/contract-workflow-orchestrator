@@ -135,11 +135,14 @@ class Orchestrator:
             new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code="UNAUTHORIZED_AUTHORITY_MUTATION", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
             self.logger.emit("hard_stop_entered", reason=reason, stop_code="UNAUTHORIZED_AUTHORITY_MUTATION")
             return StepResult(self._save(new_state), "hard_stop")
-        if scan.errors:
+        nonblocking_remote_errors = tuple(error for error in scan.errors if error.startswith("REMOTE_CHECK_FAILED") or error.startswith("REMOTE_AUTHORITY_SOURCE_MISSING"))
+        if scan.errors and len(nonblocking_remote_errors) != len(scan.errors):
             reason = "; ".join(scan.errors)
             new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code="FROZEN_SOURCE_MISMATCH", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
             self.logger.emit("hard_stop_entered", reason=reason, stop_code="FROZEN_SOURCE_MISMATCH")
             return StepResult(self._save(new_state), "hard_stop")
+        if nonblocking_remote_errors:
+            self.logger.emit("remote_authority_check_failed", errors=list(nonblocking_remote_errors))
         unanalyzed = [item for item in scan.changes if str(item.get("change_id")) not in state.authority_changes or state.authority_changes.get(str(item.get("change_id")), {}).get("classification") is None]
         if unanalyzed and state.current_stage != Stage.AUTHORITY_CHANGE_ANALYSIS.value:
             change = sorted(unanalyzed, key=lambda item: str(item.get("change_id", "")))[0]
@@ -763,7 +766,7 @@ class Orchestrator:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(content, encoding="utf-8")
             before_after.append({"path": artifact["path"], "before_sha256": old_digest, "after_sha256": artifact["sha256"]})
-        candidate_source = safe_project_path(project, str(change.get("source_path", "")))
+        candidate_source = Path(str(change.get("candidate_snapshot_path", ""))) if change.get("authority_origin") == "git-remote" else safe_project_path(project, str(change.get("source_path", "")))
         configured_source = safe_project_path(project, str(change.get("configured_source_path", "")))
         if candidate_source is None or configured_source is None or not candidate_source.is_file():
             raise OrchestratorError("Human Guide candidate is missing or unsafe")
@@ -796,6 +799,8 @@ class Orchestrator:
             })
         entry = ledger.setdefault("sources", {}).setdefault(str(change.get("source_id")), {})
         entry.update({"accepted_sha256": change.get("candidate_sha256"), "candidate_sha256": change.get("candidate_sha256"), "status": "ACCEPTED", "change_id": change_id, "path": change.get("configured_source_path")})
+        if change.get("authority_origin") == "git-remote":
+            entry.update({"accepted_remote_commit": change.get("candidate_commit"), "accepted_remote_blob": change.get("candidate_blob_sha"), "accepted_authority_blob": change.get("candidate_blob_sha"), "accepted_content_sha256": change.get("candidate_sha256"), "accepted_authority_content_sha256": change.get("candidate_sha256"), "candidate_remote_commit": change.get("candidate_commit"), "candidate_remote_blob": change.get("candidate_blob_sha"), "candidate_authority_blob": change.get("candidate_blob_sha"), "candidate_content_sha256": change.get("candidate_sha256")})
         self.store.save_authority_ledger(ledger)
         change = {**change, "status": "PROMOTED", "promoted_at": now_iso(), "promotion": {"decision_id": decision.decision_id, "before_after": before_after}}
         propagation = {**propagation, "status": "PROMOTED", "promoted_at": now_iso(), "promotion": {"decision_id": decision.decision_id, "before_after": before_after}}

@@ -189,6 +189,8 @@ class WorkflowConfig:
     policy: Policy
     groups: tuple[GroupSpec, ...]
     hard_stops: tuple[str, ...] = ()
+    authority_remote: str = "origin"
+    authority_branch: str = "main"
     workflow_file: str = ""
     digest: str = ""
 

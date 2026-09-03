@@ -158,7 +158,7 @@ def _new_change(config: WorkflowConfig, source: AuthoritativeSource, sid: str, c
     return change
 
 
-def scan_authority_changes(config: WorkflowConfig, store: Any, state: WorkflowState) -> AuthorityScan:
+def scan_local_authority_changes(config: WorkflowConfig, store: Any, state: WorkflowState) -> AuthorityScan:
     ledger = bootstrap_ledger(config, store)
     sources = ledger.setdefault("sources", {})
     changes: list[dict[str, Any]] = []
@@ -220,6 +220,21 @@ def scan_authority_changes(config: WorkflowConfig, store: Any, state: WorkflowSt
     return AuthorityScan(tuple(changes), tuple(new_changes), overrides, tuple(sorted(registered)), tuple(errors), tuple(unauthorized))
 
 
+def scan_authority_changes(config: WorkflowConfig, store: Any, state: WorkflowState) -> AuthorityScan:
+    """Scan submitted authority, never the local Human Draft Workspace."""
+    from .remote import scan_remote_authority_changes
+    remote = scan_remote_authority_changes(config, store, state)
+    # Legacy workflows without a declared Human Guide or without any origin
+    # remote retain the pre-0.5 local authority behavior.  A configured
+    # remote that exists but cannot be fetched never falls back: that is a
+    # non-blocking REMOTE_CHECK_FAILED and the local draft remains inert.
+    if not remote.changes and (not config.authoritative_sources or not any((item.role or "").upper() == "HUMAN_GUIDE" or item.source_id == "human-guide" or "human" in item.path.lower() or "架构原理" in item.path for item in config.authoritative_sources)):
+        return scan_local_authority_changes(config, store, state)
+    if remote.errors and any("cannot resolve git remote" in error for error in remote.errors):
+        return scan_local_authority_changes(config, store, state)
+    return remote
+
+
 def authority_snapshot(config: WorkflowConfig, store: Any) -> dict[str, str]:
     ledger = bootstrap_ledger(config, store)
     snapshot: dict[str, str] = {}
@@ -240,7 +255,7 @@ def dependency_tasks(config: WorkflowConfig, direct: list[str], state: WorkflowS
     return sorted(dependency_closure(config, direct, state))
 
 
-def _known_authority_text(config: WorkflowConfig) -> str:
+def _known_authority_text(config: WorkflowConfig, store: Any | None = None, state: WorkflowState | None = None) -> str:
     chunks: list[str] = []
     root = Path(config.project_path)
     for source in config.authoritative_sources:
@@ -258,6 +273,14 @@ def _known_authority_text(config: WorkflowConfig) -> str:
             chunks.append(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             pass
+    if store is not None and state is not None:
+        for change in state.authority_changes.values():
+            snapshot = change.get("candidate_snapshot_path")
+            if isinstance(snapshot, str) and Path(snapshot).is_file():
+                try:
+                    chunks.append(Path(snapshot).read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
     return "\n".join(chunks)
 
 
@@ -331,7 +354,7 @@ def validate_analysis(config: WorkflowConfig, store: Any, state: WorkflowState, 
         errors.extend(f"invalid requirement id: {item}" for item in requirements if not re.fullmatch(r"(?:REQ|OCS)-[A-Za-z0-9_.-]+", item))
     anchors = raw.get("affected_contract_anchors", [])
     if isinstance(anchors, list):
-        text = _known_authority_text(config)
+        text = _known_authority_text(config, store, state)
         errors.extend(f"untraceable contract anchor: {item}" for item in anchors if not _anchor_is_traceable(item, text))
     known = _known_task_ids(config, state)
     direct = raw.get("directly_affected_tasks", [])
@@ -360,7 +383,7 @@ def validate_analysis(config: WorkflowConfig, store: Any, state: WorkflowState, 
             errors.append("base_sha256 does not match the registered change")
         if str(raw.get("candidate_sha256", "")).lower() != str(change.get("candidate_sha256", "")).lower():
             errors.append("candidate_sha256 does not match the registered change")
-        candidate = Path(config.project_path) / str(change.get("source_path", ""))
+        candidate = Path(str(change.get("candidate_snapshot_path", ""))) if change.get("candidate_snapshot_path") else Path(config.project_path) / str(change.get("source_path", ""))
         if not candidate.is_file() or _hash(candidate).lower() != str(change.get("candidate_sha256", "")).lower():
             errors.append("candidate hash does not match the current authority file")
     return (raw, errors) if not errors else (None, errors)

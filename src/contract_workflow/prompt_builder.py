@@ -91,7 +91,11 @@ class PromptBuilder:
         pending = [change for change in state.authority_changes.values() if change.get("status") in {"CHANGE_PENDING", "PROPAGATING"}]
         authority_context = "none"
         if stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value and state.current_authority_change_id:
-            authority_context = str(state.authority_changes.get(state.current_authority_change_id, "registered change unavailable"))
+            change = state.authority_changes.get(state.current_authority_change_id, {})
+            authority_context = str(change)
+            snapshot = change.get("candidate_snapshot_path") if isinstance(change, dict) else None
+            if snapshot:
+                authority_context += f" Read the immutable remote candidate snapshot at `{snapshot}`; do not use the local Human Draft Workspace copy as the candidate."
         elif pending and state.current_task and any(state.current_task in change.get("unaffected_tasks", []) for change in pending):
             authority_context = "There is a registered pending authority change " + ", ".join(str(change.get("change_id")) for change in pending) + ". This task has been deterministically classified as unaffected. Do not modify affected authority artifacts. Operate only within this task's allowed scope."
         if stage in {Stage.CHANGE_PROPAGATION_PLANNING.value, Stage.CONTRACT_REVISION.value, Stage.CONTRACT_REVISION_REVIEW.value, Stage.PLAN_REVISION.value, Stage.PLAN_REVISION_REVIEW.value, Stage.PLAN_GRAPH_BUILD.value, Stage.TASK_REBASE_ANALYSIS.value}:

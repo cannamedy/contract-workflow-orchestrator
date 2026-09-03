@@ -3,6 +3,9 @@ project:
   name: generic-example
   path: .
 mode: gated
+authority:
+  remote: origin
+  branch: main
 authoritative_sources: []
 skills: {}
 runner:

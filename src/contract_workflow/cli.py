@@ -3,14 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
-from .config import default_workflow
-from .orchestrator import Orchestrator, OrchestratorError, doctor
+from .config import default_workflow, load_workflow
+from .orchestrator import Orchestrator, OrchestratorError, doctor, state_root
+from .remote import check_remote_authority
+from .state_store import StateStore
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.4.0")
+    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.5.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)
@@ -34,6 +37,15 @@ def _parser() -> argparse.ArgumentParser:
     decide.add_argument("--option")
     decide.add_argument("--answer")
     decide.add_argument("--rationale")
+    authority = sub.add_parser("authority", help="inspect submitted remote authority")
+    authority_sub = authority.add_subparsers(dest="authority_command", required=True)
+    check = authority_sub.add_parser("check", help="check remote authority once")
+    check.add_argument("project", type=Path)
+    check.add_argument("--dry-run", action="store_true")
+    watch = authority_sub.add_parser("watch", help="poll remote authority")
+    watch.add_argument("project", type=Path)
+    watch.add_argument("--interval", type=float, default=300.0)
+    watch.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -60,6 +72,25 @@ def main(argv: list[str] | None = None) -> int:
         report = doctor(args.project)
         _dump(report)
         return 0 if report.get("ok") else 1
+    if args.command == "authority":
+        project = args.project.expanduser().resolve()
+        workflow = project / ".contract-workflow" / "workflow.yaml"
+        config = load_workflow(workflow, project_override=project)
+        store = StateStore(state_root(project))
+        if args.authority_command == "check":
+            result = check_remote_authority(config, store, store.load(), dry_run=args.dry_run)
+            _dump({"status": result.status, "changed": result.changed, "snapshot": result.snapshot.to_dict() if result.snapshot else None, "change": result.new_change, "errors": list(result.errors), "dry_run": args.dry_run})
+            return 0 if not result.errors else 1
+        if args.interval <= 0:
+            print("cwo: --interval must be positive", file=sys.stderr)
+            return 2
+        try:
+            while True:
+                result = check_remote_authority(config, store, store.load(), dry_run=args.dry_run)
+                _dump({"status": result.status, "changed": result.changed, "snapshot": result.snapshot.to_dict() if result.snapshot else None, "change": result.new_change, "errors": list(result.errors), "dry_run": args.dry_run})
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            return 0
     try:
         orchestrator = Orchestrator.for_project(args.project)
         if args.command == "status":
