@@ -119,6 +119,23 @@ class WorkspaceIsolationTests(unittest.TestCase):
         self.assertEqual((self.project / "src" / "a.py").read_text(), "patched\n")
         self.assertFalse(list((self.state / "workspaces").glob("*/project")))
 
+    def test_preexisting_dirty_allowed_target_is_a_safe_commit_back_baseline(self):
+        (self.project / "src" / "a.py").write_text("user-baseline\n", encoding="utf-8")
+        runner = WorkspaceRunner(lambda cwd, real: (cwd / "src" / "a.py").write_text("patched\n", encoding="utf-8"), self.project)
+        result = self.start_task(runner).step().state
+        self.assertEqual(result.current_stage, Stage.TASK_INDEPENDENT_REVIEW.value)
+        self.assertEqual((self.project / "src" / "a.py").read_text(), "patched\n")
+
+    def test_agent_change_to_preexisting_unrelated_file_is_rejected(self):
+        unrelated = self.project / "user-notes.txt"
+        unrelated.write_text("baseline\n", encoding="utf-8")
+        def mutate(cwd, real):
+            (cwd / "src" / "a.py").write_text("patched\n", encoding="utf-8")
+            (cwd / "user-notes.txt").write_text("agent\n", encoding="utf-8")
+        stopped = self.start_task(WorkspaceRunner(mutate, self.project)).step().state
+        self.assertEqual(stopped.stop_code, "UNAUTHORIZED_WORKSPACE_MUTATION")
+        self.assertEqual(unrelated.read_text(), "baseline\n")
+
     def test_allowed_plus_authority_change_is_rejected_transactionally(self):
         def mutate(cwd, real):
             (cwd / "src" / "a.py").write_text("patched\n", encoding="utf-8")

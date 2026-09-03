@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from contract_workflow.artifacts import artifact_impact_closure, dependency_revisions, missing_skill_roles, reconcile_artifact_staleness, validate_artifact_graph, validate_artifact_promotion, validate_final_conformance
+from contract_workflow.artifacts import artifact_impact_closure, dependency_revisions, initialize_artifacts, missing_skill_roles, reconcile_artifact_staleness, validate_artifact_graph, validate_artifact_promotion, validate_final_conformance
 from contract_workflow.config import WorkflowConfigError, load_workflow
 from contract_workflow.models import ArtifactSpec, ArtifactStatus, EngineeringArtifact, Stage, WorkflowState
 from contract_workflow.orchestrator import Orchestrator
@@ -193,6 +193,67 @@ class ArtifactPipelineTests(unittest.TestCase):
         state = WorkflowState(artifacts={"conf": __import__("contract_workflow.models", fromlist=["EngineeringArtifact"]).EngineeringArtifact("conf", "CONFORMANCE_SPEC", ArtifactStatus.APPROVED.value)})
         self.assertTrue(validate_final_conformance(state, {"conformance_results": []}))
         self.assertFalse(validate_final_conformance(state, {"conformance_results": [{"requirement_id": "REQ-1", "conformance_id": "CONF-1", "status": "PASS", "evidence": "test-1"}]}))
+
+    def test_remote_accepted_human_guide_projects_without_reading_local_draft(self):
+        local = self.project / "guide.md"
+        local.write_text("local draft\n", encoding="utf-8")
+        old = b"remote R1\n"
+        old_hash = hashlib.sha256(old).hexdigest()
+        workflow = self.project / ".contract-workflow" / "workflow.yaml"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text(f'''version: "1"\nproject:\n  name: remote-artifact-fixture\n  path: {self.project}\nmode: autonomous\nauthority:\n  remote: origin\n  branch: main\nauthoritative_sources:\n  - source_id: human-guide\n    role: HUMAN_GUIDE\n    path: guide.md\n    sha256: {old_hash}\nskills: {{}}\nrunner:\n  type: mock\ngroups:\n  - id: g\n    tasks:\n      - id: task\nartifact_pipeline:\n  artifacts:\n    - id: human-guide\n      kind: HUMAN_GUIDE\n      promotion_policy: EXTERNAL\n      review_required: false\n''', encoding="utf-8")
+        config = load_workflow(workflow, self.project)
+        snapshot = self.state_root / "authority" / "snapshots" / "r1" / "human-guide.md"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_bytes(old)
+        store = StateStore(self.state_root)
+        store.save_authority_ledger({"schema_version": "1.0", "sources": {"human-guide": {
+            "source_id": "human-guide", "status": "ACCEPTED", "accepted_remote_commit": "commit-r1",
+            "accepted_remote_blob": "blob-r1", "accepted_content_sha256": old_hash,
+            "accepted_authority_content_sha256": old_hash, "accepted_snapshot_path": str(snapshot),
+        }}})
+        store.save_remote_state({"schema_version": "1.0", "sources": {"human-guide": {
+            "remote_url": "https://example.invalid/pais.git", "branch": "main", "commit_sha": "commit-r1",
+            "git_blob_sha": "blob-r1", "content_sha256": old_hash, "snapshot_path": str(snapshot),
+        }}})
+        artifact = initialize_artifacts(config, store)["human-guide"]
+        self.assertEqual(artifact.status, ArtifactStatus.ACCEPTED.value)
+        self.assertEqual(artifact.accepted_hash, old_hash)
+        self.assertEqual(artifact.accepted_path, str(snapshot))
+        self.assertEqual(artifact.metadata["accepted_source"]["commit_sha"], "commit-r1")
+        self.assertEqual(local.read_text(), "local draft\n")
+
+    def test_remote_candidate_does_not_replace_old_accepted_projection(self):
+        local = self.project / "guide.md"
+        local.write_text("local draft\n", encoding="utf-8")
+        old, new = b"remote R1\n", b"remote R2\n"
+        old_hash, new_hash = hashlib.sha256(old).hexdigest(), hashlib.sha256(new).hexdigest()
+        workflow = self.project / ".contract-workflow" / "workflow.yaml"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text(f'''version: "1"\nproject:\n  name: remote-candidate-fixture\n  path: {self.project}\nmode: autonomous\nauthority:\n  remote: origin\n  branch: main\nauthoritative_sources:\n  - source_id: human-guide\n    role: HUMAN_GUIDE\n    path: guide.md\n    sha256: {old_hash}\nskills: {{}}\nrunner:\n  type: mock\ngroups:\n  - id: g\n    tasks:\n      - id: task\nartifact_pipeline:\n  artifacts:\n    - id: human-guide\n      kind: HUMAN_GUIDE\n      promotion_policy: EXTERNAL\n      review_required: false\n''', encoding="utf-8")
+        config = load_workflow(workflow, self.project)
+        old_snapshot = self.state_root / "authority" / "snapshots" / "r1" / "human-guide.md"
+        new_snapshot = self.state_root / "authority" / "snapshots" / "r2" / "human-guide.md"
+        old_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        new_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        old_snapshot.write_bytes(old)
+        new_snapshot.write_bytes(new)
+        store = StateStore(self.state_root)
+        store.save_authority_ledger({"schema_version": "1.0", "sources": {"human-guide": {
+            "source_id": "human-guide", "status": "CHANGE_PENDING", "accepted_remote_commit": "commit-r1",
+            "accepted_remote_blob": "blob-r1", "accepted_content_sha256": old_hash,
+            "accepted_authority_content_sha256": old_hash, "accepted_snapshot_path": str(old_snapshot),
+            "candidate_remote_commit": "commit-r2", "candidate_remote_blob": "blob-r2",
+            "candidate_content_sha256": new_hash,
+        }}})
+        store.save_remote_state({"schema_version": "1.0", "sources": {"human-guide": {
+            "remote_url": "https://example.invalid/pais.git", "branch": "main", "commit_sha": "commit-r2",
+            "git_blob_sha": "blob-r2", "content_sha256": new_hash, "snapshot_path": str(new_snapshot),
+        }}})
+        artifact = initialize_artifacts(config, store)["human-guide"]
+        self.assertEqual(artifact.status, ArtifactStatus.ACCEPTED.value)
+        self.assertEqual(artifact.accepted_hash, old_hash)
+        self.assertEqual(artifact.accepted_path, str(old_snapshot))
 
 
 if __name__ == "__main__":

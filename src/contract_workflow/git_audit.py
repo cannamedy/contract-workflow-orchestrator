@@ -18,6 +18,7 @@ class GitClassification(str, Enum):
     REGISTERED_AUTHORITY_CHANGE = "REGISTERED_AUTHORITY_CHANGE"
     UNEXPECTED_RELATED_CHANGE = "UNEXPECTED_RELATED_CHANGE"
     UNEXPECTED_UNRELATED_CHANGE = "UNEXPECTED_UNRELATED_CHANGE"
+    PRESERVED_BASELINE_CHANGE = "PRESERVED_BASELINE_CHANGE"
     MERGE_CONFLICT = "MERGE_CONFLICT"
     UNKNOWN = "UNKNOWN"
 
@@ -67,7 +68,31 @@ def _decode_git_path(value: str) -> str:
     return value
 
 
-def audit_git(project: Path, config: WorkflowConfig, registered_authority_paths: tuple[str, ...] = (), additional_expected_paths: tuple[str, ...] = ()) -> GitAudit:
+def _status_path_set(output: str) -> set[str]:
+    paths: set[str] = set()
+    for line in output.splitlines():
+        if len(line) < 3:
+            continue
+        raw_path = line[3:]
+        paths.add(_decode_git_path(raw_path.split(" -> ")[-1]))
+    return paths
+
+
+def working_tree_paths(project: Path) -> tuple[str, ...]:
+    """Return paths dirty before an invocation, normalized to project paths."""
+    result = _git(project, "status", "--porcelain=v1", "-uall")
+    if result.returncode != 0:
+        return ()
+    return tuple(sorted(_status_path_set(result.stdout)))
+
+
+def audit_git(
+    project: Path,
+    config: WorkflowConfig,
+    registered_authority_paths: tuple[str, ...] = (),
+    additional_expected_paths: tuple[str, ...] = (),
+    baseline_paths: tuple[str, ...] = (),
+) -> GitAudit:
     root = _git(project, "rev-parse", "--show-toplevel")
     if root.returncode != 0:
         return GitAudit(False, (), (GitClassification.UNKNOWN,), True, root.stderr.strip() or "not a git repository")
@@ -76,6 +101,10 @@ def audit_git(project: Path, config: WorkflowConfig, registered_authority_paths:
         return GitAudit(True, (), (GitClassification.UNKNOWN,), True, result.stderr.strip())
     frozen = _source_paths(project, tuple(source for source in config.authoritative_sources if not source.mutable_after_start))
     registered = {str(Path(path).resolve()) for path in registered_authority_paths}
+    baseline = {
+        str((project / path).resolve()) if not Path(path).is_absolute() else str(Path(path).resolve())
+        for path in baseline_paths
+    }
     expected: list[str] = []
     for _, task in config.tasks:
         expected.extend(task.expected_outputs)
@@ -98,6 +127,8 @@ def audit_git(project: Path, config: WorkflowConfig, registered_authority_paths:
             kind = GitClassification.AUTHORIZED_MUTABLE_TRACKER
         elif _matches(path, tuple(expected), project):
             kind = GitClassification.EXPECTED_TARGET_ARTIFACT
+        elif absolute in baseline:
+            kind = GitClassification.PRESERVED_BASELINE_CHANGE
         elif any(part in path.lower() for part in ("plan", "task", "traceability", "contract")):
             kind = GitClassification.UNEXPECTED_RELATED_CHANGE
         else:

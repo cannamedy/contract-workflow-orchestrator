@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from contract_workflow.config import load_workflow
-from contract_workflow.git_audit import GitClassification, audit_git
+from contract_workflow.git_audit import GitClassification, audit_git, working_tree_paths
 from contract_workflow.models import DecisionStatus, Stage, Verdict, WorkItemStatus, WorkflowState
 from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
@@ -147,6 +147,21 @@ groups:
         classes = {item.classification for item in audit_git(self.project, self.workflow()).changes}
         self.assertIn(GitClassification.MERGE_CONFLICT, classes)
 
+    def test_preexisting_unrelated_change_is_preserved_at_invocation_baseline(self):
+        config = self.workflow()
+        (self.project / "user-notes.txt").write_text("draft\n", encoding="utf-8")
+        baseline = working_tree_paths(self.project)
+        audit = audit_git(self.project, config, baseline_paths=baseline)
+        self.assertIn(GitClassification.PRESERVED_BASELINE_CHANGE, {item.classification for item in audit.changes})
+        self.assertFalse(audit.blocking)
+
+    def test_orchestrator_dry_start_does_not_block_preexisting_unrelated_change(self):
+        config = self.workflow()
+        (self.project / "user-notes.txt").write_text("draft\n", encoding="utf-8")
+        state = Orchestrator(config, runner=MockRunner()).step().state
+        self.assertEqual(state.current_stage, Stage.TASK_EXECUTION.value)
+        self.assertEqual(state.status, "RUNNING")
+
     def test_prompt_builder_includes_bounded_context_and_contract(self):
         config = self.workflow()
         state = WorkflowState(project="test-project", current_stage=Stage.TASK_EXECUTION.value, current_group="g", current_task="t")
@@ -282,20 +297,11 @@ groups:
         store.save(WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest, current_stage=Stage.FINAL_VERIFICATION.value, current_group="g", current_task="t"))
         (self.project / "unexpected.tmp").write_text("fixture contamination", encoding="utf-8")
         orchestrator = Orchestrator(config, store=store, runner=MockRunner())
-        stopped = orchestrator.step().state
-        self.assertEqual(stopped.current_stage, Stage.HARD_STOP.value)
-        self.assertEqual(stopped.stop_code, "UNEXPECTED_UNRELATED_CHANGE")
-        self.assertEqual(stopped.blocked_stage, Stage.FINAL_VERIFICATION.value)
-        self.assertTrue(stopped.recoverable)
-        self.assertEqual(orchestrator.recover().current_stage, Stage.HARD_STOP.value)
-        (self.project / "unexpected.tmp").unlink()
-        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
-        self.assertEqual(recovered.current_stage, Stage.FINAL_VERIFICATION.value)
-        self.assertEqual(recovered.status, "RUNNING")
-        self.assertIsNone(recovered.stop_code)
-        self.assertFalse(recovered.recoverable)
-        resumed = Orchestrator(config, store=store, runner=MockRunner()).step().state
-        self.assertEqual(resumed.current_stage, Stage.HUMAN_FINAL_ACCEPTANCE.value)
+        continued = orchestrator.step().state
+        self.assertEqual(continued.current_stage, Stage.HUMAN_FINAL_ACCEPTANCE.value)
+        self.assertEqual(continued.status, "WAITING_HUMAN")
+        self.assertIsNone(continued.stop_code)
+        self.assertFalse(continued.recoverable)
 
     def test_schema_recovery_restores_exact_read_only_stage_without_coding(self):
         config = self.workflow()

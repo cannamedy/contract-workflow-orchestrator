@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contract-workflow-orchestrator"
-version = "0.6.1"
+version = "0.6.2"
 description = "A project-neutral, safety-first contract workflow orchestrator."
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0"]

@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
-from .git_audit import GitAudit, audit_git, source_integrity
+from .git_audit import GitAudit, audit_git, source_integrity, working_tree_paths
 from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
-from .artifacts import artifact_impact_closure, dependency_revisions, effective_artifact_specs, missing_skill_roles, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
+from .artifacts import artifact_impact_closure, dependency_revisions, effective_artifact_specs, hydrate_external_artifacts, missing_skill_roles, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
 from .plan_graph import reconcile_plan_graph, validate_plan_graph
 from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
 from .logging import EventLogger
@@ -106,7 +106,7 @@ class Orchestrator:
         except StateStoreError:
             raise
         if state is None:
-            state = initial_state(self.config)
+            state = initial_state(self.config, self.store)
             state = recompute(self.config, state)
             bootstrap_ledger(self.config, self.store)
             self.store.save(state)
@@ -126,16 +126,22 @@ class Orchestrator:
         scan = scan or scan_authority_changes(self.config, self.store, self._load_or_initialize_state_only())
         integrity = source_integrity(Path(self.config.project_path), self.config.authoritative_sources, scan.integrity_overrides or {})
         configured_authority_paths = tuple(str((Path(source.path) if Path(source.path).is_absolute() else Path(self.config.project_path) / source.path).resolve()) for source in self.config.authoritative_sources if not source.mutable_after_start)
-        plan_expected = tuple(path for raw in (self._load_or_initialize_state_only().plan_graph or {}).get("tasks", []) if isinstance(raw, dict) for path in tuple(raw.get("expected_outputs", ()) or ()) + tuple(raw.get("allowed_paths", ()) or ()))
-        audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected)
+        audit_state = self._load_or_initialize_state_only()
+        plan_expected = tuple(path for raw in (audit_state.plan_graph or {}).get("tasks", []) if isinstance(raw, dict) for path in tuple(raw.get("expected_outputs", ()) or ()) + tuple(raw.get("allowed_paths", ()) or ()))
+        active_invocation = bool(audit_state.run_id and audit_state.current_stage in AGENT_STAGE_NAMES)
+        baseline_paths = () if active_invocation or audit_state.current_stage == Stage.HARD_STOP.value else working_tree_paths(Path(self.config.project_path))
+        audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected, baseline_paths=baseline_paths)
         self.logger.emit("doctor_check", git_blocking=audit.blocking, integrity_errors=len(integrity), classifications=[item.value for item in audit.classifications])
         return audit, integrity, scan
 
     def _load_or_initialize_state_only(self) -> WorkflowState:
-        return self.store.load() or initial_state(self.config)
+        return self.store.load() or initial_state(self.config, self.store)
 
     def _authority_gate(self, state: WorkflowState) -> StepResult | None:
         scan = scan_authority_changes(self.config, self.store, state)
+        hydrated = hydrate_external_artifacts(self.config, state, self.store)
+        if hydrated.artifacts != state.artifacts:
+            state = self._save(hydrated)
         if scan.unauthorized:
             reason = "; ".join(scan.unauthorized)
             new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code="UNAUTHORIZED_AUTHORITY_MUTATION", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
@@ -1277,8 +1283,9 @@ class Orchestrator:
         return self._load_or_initialize()
 
     def dry_run(self) -> dict[str, Any]:
-        state = self.store.load() or initial_state(self.config)
+        state = self.store.load() or initial_state(self.config, self.store)
         audit, integrity, scan = self._audit_gate()
+        state = hydrate_external_artifacts(self.config, state, self.store)
         run_id = state.run_id or "dry-run"
         dry_changes = {str(change["change_id"]): change for change in scan.changes}
         dry_state = replace(state, run_id=run_id, current_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value if scan.changes else state.current_stage, current_authority_change_id=str(scan.changes[0]["change_id"]) if scan.changes else state.current_authority_change_id, authority_changes={**state.authority_changes, **dry_changes})

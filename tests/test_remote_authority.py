@@ -65,6 +65,7 @@ class RemoteAuthorityTests(unittest.TestCase):
         self.assertEqual(len(list(self.store.authority_changes_path.glob("CR-*.json"))), 0)
         ledger = json.loads(self.store.authority_ledger_path.read_text())
         self.assertTrue(ledger["sources"]["human-guide"]["accepted_remote_blob"])
+        self.assertTrue(Path(ledger["sources"]["human-guide"]["accepted_snapshot_path"]).is_file())
 
     def test_unrelated_remote_commit_does_not_trigger(self):
         check_remote_authority(self.config, self.store, self.state)

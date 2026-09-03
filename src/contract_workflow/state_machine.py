@@ -21,8 +21,8 @@ AGENT_STAGES = {
 HUMAN_GATES = {Stage.HUMAN_GROUP_APPROVAL.value, Stage.HUMAN_PLAN_FREEZE.value, Stage.HUMAN_FINAL_ACCEPTANCE.value}
 
 
-def initial_state(config: WorkflowConfig) -> WorkflowState:
-    return WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest, artifacts=initialize_artifacts(config))
+def initial_state(config: WorkflowConfig, store: Any | None = None) -> WorkflowState:
+    return WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest, artifacts=initialize_artifacts(config, store))
 
 
 def _update(state: WorkflowState, **changes: Any) -> WorkflowState:

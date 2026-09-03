@@ -82,13 +82,61 @@ def legacy_artifact_specs(config: WorkflowConfig) -> tuple[ArtifactSpec, ...]:
     )
 
 
-def initialize_artifacts(config: WorkflowConfig) -> dict[str, EngineeringArtifact]:
+def _remote_human_guide_revision(config: WorkflowConfig, store: Any | None) -> dict[str, Any] | None:
+    if store is None:
+        return None
+    source = next((item for item in config.authoritative_sources if (item.role or "").upper() == "HUMAN_GUIDE" or item.source_id == "human-guide"), None)
+    if source is None:
+        return None
+    sid = source.source_id or "human-guide"
+    ledger = store.load_authority_ledger() or {}
+    entry = (ledger.get("sources", {}) or {}).get(sid, {})
+    if not isinstance(entry, dict) or entry.get("status") not in {"ACCEPTED", "CHANGE_PENDING", "PROPAGATING", "WAITING_DECISION", "NEWER_REMOTE_REVISION_AVAILABLE"}:
+        return None
+    accepted_hash = entry.get("accepted_authority_content_sha256") or entry.get("accepted_content_sha256")
+    commit = entry.get("accepted_remote_commit")
+    blob = entry.get("accepted_remote_blob") or entry.get("accepted_authority_blob")
+    remote = store.load_remote_state() or {}
+    remote_entry = (remote.get("sources", {}) or {}).get(sid, {})
+    if isinstance(remote_entry, dict):
+        accepted_hash = accepted_hash or remote_entry.get("content_sha256")
+        commit = commit or remote_entry.get("commit_sha")
+        blob = blob or remote_entry.get("git_blob_sha")
+    snapshot_raw = entry.get("accepted_snapshot_path")
+    if not snapshot_raw and entry.get("status") == "ACCEPTED":
+        snapshot_raw = entry.get("snapshot_path")
+    if not snapshot_raw and entry.get("status") == "ACCEPTED" and isinstance(remote_entry, dict):
+        snapshot_raw = remote_entry.get("snapshot_path")
+    remote_url = remote_entry.get("remote_url") if isinstance(remote_entry, dict) else None
+    branch = remote_entry.get("branch") if isinstance(remote_entry, dict) else None
+    if not isinstance(accepted_hash, str) or not isinstance(snapshot_raw, str) or not isinstance(commit, str) or not isinstance(blob, str):
+        return None
+    snapshot = Path(snapshot_raw).expanduser().resolve()
+    if not snapshot.is_file() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != accepted_hash:
+        return None
+    return {
+        "accepted_hash": accepted_hash,
+        "snapshot_path": str(snapshot),
+        "remote": remote_url or config.authority_remote,
+        "branch": branch or config.authority_branch,
+        "commit_sha": commit,
+        "git_blob_sha": blob,
+    }
+
+
+def initialize_artifacts(config: WorkflowConfig, store: Any | None = None) -> dict[str, EngineeringArtifact]:
     result: dict[str, EngineeringArtifact] = {}
     root = Path(config.project_path)
     for spec in artifact_specs(config):
         accepted_hash = None
         status = ArtifactStatus.MISSING.value
-        if spec.accepted_path:
+        metadata: dict[str, Any] = {}
+        external_revision = _remote_human_guide_revision(config, store) if spec.kind == "HUMAN_GUIDE" and spec.promotion_policy == "EXTERNAL" else None
+        if external_revision:
+            accepted_hash = external_revision["accepted_hash"]
+            status = ArtifactStatus.ACCEPTED.value
+            metadata["accepted_source"] = {"kind": "GIT_REMOTE", **external_revision}
+        elif spec.accepted_path:
             path = Path(spec.accepted_path) if Path(spec.accepted_path).is_absolute() else root / spec.accepted_path
             if path.is_file():
                 accepted_hash = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -101,7 +149,8 @@ def initialize_artifacts(config: WorkflowConfig) -> dict[str, EngineeringArtifac
             review_required=spec.review_required, validator_role=spec.validator_role,
             promotion_policy=spec.promotion_policy,
             consume_approved_dependencies=spec.consume_approved_dependencies,
-            accepted_path=spec.accepted_path, candidate_path=spec.candidate_path,
+            accepted_path=(external_revision["snapshot_path"] if external_revision else spec.accepted_path), candidate_path=spec.candidate_path,
+            metadata=metadata,
         )
     for spec in artifact_specs(config):
         if spec.dependencies and spec.id in result:
@@ -117,6 +166,25 @@ def initialize_artifacts(config: WorkflowConfig) -> dict[str, EngineeringArtifac
                 if dependency_id in result
             ]
     return result
+
+
+def hydrate_external_artifacts(config: WorkflowConfig, state: WorkflowState, store: Any) -> WorkflowState:
+    """Refresh accepted external revisions without reading local draft files."""
+    projected = initialize_artifacts(config, store)
+    artifacts = dict(state.artifacts)
+    changed = False
+    for spec in artifact_specs(config):
+        if spec.kind != "HUMAN_GUIDE" or spec.promotion_policy != "EXTERNAL":
+            continue
+        candidate = projected.get(spec.id)
+        current = artifacts.get(spec.id)
+        if not candidate or candidate.status != ArtifactStatus.ACCEPTED.value:
+            continue
+        if current is None or current.status in {ArtifactStatus.MISSING.value, ArtifactStatus.ACCEPTED.value}:
+            if current is None or current.to_dict() != candidate.to_dict():
+                artifacts[spec.id] = candidate
+                changed = True
+    return state if not changed else replace(state, artifacts=artifacts)
 
 
 def dependency_revisions(config: WorkflowConfig, state: WorkflowState, spec: ArtifactSpec) -> list[dict[str, Any]]:
