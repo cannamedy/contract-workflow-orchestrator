@@ -55,7 +55,10 @@
         "optional": {"type": "boolean"}, "enabled": {"type": "boolean"},
         "skill_role": {"type": "string"}, "review_required": {"type": "boolean"},
         "validator_role": {"type": "string"}, "candidate_path": {"type": "string"},
-        "accepted_path": {"type": "string"}, "derived_from": {"type": "array", "items": {"type": "string"}}
+        "accepted_path": {"type": "string"}, "derived_from": {"type": "array", "items": {"type": "string"}},
+        "promotion_policy": {"enum": ["AUTO", "HUMAN_GATE", "EXTERNAL"]},
+        "consume_approved_dependencies": {"type": "boolean"},
+        "allow_approved_dependencies": {"type": "boolean"}
       },
       "additionalProperties": false
     }

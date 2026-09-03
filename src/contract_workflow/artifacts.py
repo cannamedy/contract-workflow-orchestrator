@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import ARTIFACT_KINDS, ArtifactSpec, ArtifactStatus, EngineeringArtifact, WorkflowConfig, WorkflowState
+from .models import ARTIFACT_KINDS, ArtifactSpec, ArtifactStatus, DecisionStatus, EngineeringArtifact, WorkflowConfig, WorkflowState
 
 
 def validate_artifact_graph(specs: Iterable[ArtifactSpec]) -> list[str]:
@@ -98,30 +99,81 @@ def initialize_artifacts(config: WorkflowConfig) -> dict[str, EngineeringArtifac
             id=spec.id, kind=spec.kind, status=status, version_hash=accepted_hash,
             accepted_hash=accepted_hash, derived_from=list(spec.derived_from), skill_role=spec.skill_role,
             review_required=spec.review_required, validator_role=spec.validator_role,
+            promotion_policy=spec.promotion_policy,
+            consume_approved_dependencies=spec.consume_approved_dependencies,
             accepted_path=spec.accepted_path, candidate_path=spec.candidate_path,
         )
+    for spec in artifact_specs(config):
+        if spec.dependencies and spec.id in result:
+            result[spec.id].metadata["dependency_revisions"] = [
+                {
+                    "artifact_id": dependency_id,
+                    "status": result[dependency_id].status,
+                    "hash": result[dependency_id].accepted_hash,
+                    "accepted_hash": result[dependency_id].accepted_hash,
+                    "candidate_hash": result[dependency_id].candidate_hash,
+                }
+                for dependency_id in spec.dependencies
+                if dependency_id in result
+            ]
     return result
 
 
-def _satisfied(status: str) -> bool:
-    return status in {ArtifactStatus.APPROVED.value, ArtifactStatus.ACCEPTED.value}
+def dependency_revisions(config: WorkflowConfig, state: WorkflowState, spec: ArtifactSpec) -> list[dict[str, Any]]:
+    revisions: list[dict[str, Any]] = []
+    for dependency_id in spec.dependencies:
+        dependency = state.artifacts.get(dependency_id)
+        if dependency is None:
+            revisions.append({"artifact_id": dependency_id, "status": ArtifactStatus.MISSING.value, "hash": None, "accepted_hash": None, "candidate_hash": None})
+            continue
+        revision_hash = dependency.accepted_hash
+        if dependency.status in {ArtifactStatus.APPROVED.value, ArtifactStatus.PROMOTION_READY.value}:
+            revision_hash = dependency.candidate_hash
+        revisions.append({"artifact_id": dependency_id, "status": dependency.status, "hash": revision_hash, "accepted_hash": dependency.accepted_hash, "candidate_hash": dependency.candidate_hash})
+    return revisions
+
+
+def _dependencies_satisfied(config: WorkflowConfig, state: WorkflowState, spec: ArtifactSpec) -> bool:
+    for dependency_id in spec.dependencies:
+        dependency_spec = next((item for item in artifact_specs(config) if item.id == dependency_id), None)
+        dependency = state.artifacts.get(dependency_id)
+        if dependency_spec and dependency_spec.optional and not dependency_spec.enabled:
+            continue
+        if dependency is None or dependency.status == ArtifactStatus.ACCEPTED.value:
+            if dependency is None:
+                return False
+            continue
+        if dependency.status == ArtifactStatus.APPROVED.value and spec.consume_approved_dependencies:
+            continue
+        return False
+    return True
+
+
+def dependency_revisions_match(recorded: Any, current: list[dict[str, Any]]) -> bool:
+    """Compare derivation identity, not a transient APPROVED/ACCEPTED status."""
+    if not isinstance(recorded, list) or len(recorded) != len(current):
+        return False
+    for old, new in zip(recorded, current):
+        if not isinstance(old, dict) or old.get("artifact_id") != new.get("artifact_id") or old.get("hash") != new.get("hash"):
+            return False
+    return True
 
 
 def next_artifact(config: WorkflowConfig, state: WorkflowState) -> ArtifactSpec | None:
     specs = artifact_specs(config)
-    by_id = {item.id: item for item in specs}
     for spec in specs:
         current = state.artifacts.get(spec.id)
         if not current or current.status in {
             ArtifactStatus.SUPERSEDED.value,
             ArtifactStatus.APPROVED.value,
+            ArtifactStatus.PROMOTION_READY.value,
             ArtifactStatus.ACCEPTED.value,
             ArtifactStatus.BLOCKED.value,
         }:
             continue
         if not spec.enabled and spec.optional:
             continue
-        if all(_satisfied(state.artifacts.get(dep, EngineeringArtifact(dep, "", ArtifactStatus.MISSING.value)).status) or (by_id.get(dep) is not None and by_id[dep].optional and not by_id[dep].enabled) for dep in spec.dependencies):
+        if _dependencies_satisfied(config, state, spec):
             return spec
     return None
 
@@ -157,6 +209,90 @@ def reconcile_artifact_impact(config: WorkflowConfig, state: WorkflowState, dire
     }
 
 
+def reconcile_artifact_staleness(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
+    """Reset downstream candidates whose recorded input revisions changed."""
+    changed: dict[str, EngineeringArtifact] = dict(state.artifacts)
+    decisions = dict(state.decisions)
+    for spec in artifact_specs(config):
+        artifact = changed.get(spec.id)
+        if not artifact or not spec.dependencies:
+            continue
+        recorded = artifact.metadata.get("dependency_revisions")
+        if dependency_revisions_match(recorded, dependency_revisions(config, state, spec)):
+            continue
+        if artifact.status in {ArtifactStatus.MISSING.value, ArtifactStatus.PENDING.value, ArtifactStatus.SUPERSEDED.value}:
+            continue
+        changed[spec.id] = EngineeringArtifact(
+            **{
+                **artifact.to_dict(),
+                "status": ArtifactStatus.PENDING.value,
+                "candidate_hash": None,
+                "candidate_path": None,
+                "metadata": {**artifact.metadata, "stale_reason": "DOWNSTREAM_STALE", "previous_dependency_revisions": recorded},
+            }
+        )
+        for decision_id, decision in decisions.items():
+            if decision.status == DecisionStatus.PENDING.value and decision.source_artifact_id == spec.id:
+                decisions[decision_id] = replace(decision, status=DecisionStatus.SUPERSEDED.value)
+    return state if changed == state.artifacts and decisions == state.decisions else replace(state, artifacts=changed, decisions=decisions)
+
+
+def _resolve_artifact_path(config: WorkflowConfig, raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return Path(config.project_path) / path
+
+
+def validate_artifact_promotion(config: WorkflowConfig, state: WorkflowState, artifact_id: str, *, allow_external: bool = False) -> list[str]:
+    """Validate all deterministic preconditions without changing state."""
+    spec = next((item for item in artifact_specs(config) if item.id == artifact_id), None)
+    artifact = state.artifacts.get(artifact_id)
+    if spec is None or artifact is None:
+        return [f"unknown artifact: {artifact_id}"]
+    if spec.promotion_policy == "EXTERNAL" and not allow_external:
+        return [f"artifact {artifact_id} has EXTERNAL promotion policy"]
+    if artifact.status not in {ArtifactStatus.APPROVED.value, ArtifactStatus.PROMOTION_READY.value}:
+        return [f"artifact {artifact_id} is not promotion-ready: {artifact.status}"]
+    if not isinstance(artifact.candidate_hash, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", artifact.candidate_hash):
+        return [f"artifact {artifact_id} has no valid candidate hash"]
+    candidate = _resolve_artifact_path(config, artifact.candidate_path)
+    if candidate is None or not candidate.is_file():
+        return [f"artifact {artifact_id} candidate is missing"]
+    if hashlib.sha256(candidate.read_bytes()).hexdigest() != artifact.candidate_hash:
+        return [f"artifact {artifact_id} candidate hash mismatch"]
+    review = artifact.metadata.get("review")
+    if artifact.review_required and (not isinstance(review, dict) or review.get("verdict") != "APPROVED"):
+        return [f"artifact {artifact_id} has no approved semantic review evidence"]
+    validator = artifact.metadata.get("validator")
+    if artifact.validator_role and (not isinstance(validator, dict) or validator.get("status") != "PASS"):
+        return [f"artifact {artifact_id} has no passing deterministic validator evidence"]
+    if isinstance(validator, dict) and validator.get("status") == "FAIL":
+        return [f"artifact {artifact_id} deterministic validator failed"]
+    if not _dependencies_satisfied(config, state, spec):
+        return [f"artifact {artifact_id} has unaccepted upstream dependencies"]
+    expected_revisions = artifact.metadata.get("dependency_revisions")
+    if spec.dependencies and not dependency_revisions_match(expected_revisions, dependency_revisions(config, state, spec)):
+        return [f"DOWNSTREAM_STALE: artifact {artifact_id} upstream revisions changed"]
+    if artifact.change_id:
+        change = state.authority_changes.get(artifact.change_id)
+        if not isinstance(change, dict) or change.get("status") in {"SUPERSEDED", "REJECTED"}:
+            return [f"artifact {artifact_id} Change Record is missing or superseded"]
+    if any(item.status == "PENDING" for item in state.decisions.values()):
+        return ["unresolved HumanDecision exists"]
+    if artifact.metadata.get("superseded_by"):
+        return [f"artifact {artifact_id} has a superseding candidate"]
+    accepted = _resolve_artifact_path(config, artifact.accepted_path)
+    if accepted:
+        if artifact.accepted_hash is None and accepted.exists():
+            return [f"artifact {artifact_id} accepted target drifted before first promotion"]
+        if artifact.accepted_hash is not None and (not accepted.is_file() or hashlib.sha256(accepted.read_bytes()).hexdigest() != artifact.accepted_hash):
+            return [f"artifact {artifact_id} accepted target drifted"]
+    return []
+
+
 def validate_artifact_outcome(config: WorkflowConfig, state: WorkflowState, raw: Any, *, stage: str) -> tuple[dict[str, Any] | None, list[str]]:
     if not isinstance(raw, dict):
         return None, ["artifact must be an object"]
@@ -188,6 +324,8 @@ def validate_artifact_outcome(config: WorkflowConfig, state: WorkflowState, raw:
             errors.append("artifact.candidate_path is unsafe")
     if stage == "ARTIFACT_REVIEW" and raw.get("review") is not None and not isinstance(raw.get("review"), dict):
         errors.append("artifact.review must be an object")
+    if raw.get("validator") is not None and not isinstance(raw.get("validator"), dict):
+        errors.append("artifact.validator must be an object")
     normalized = dict(raw)
     normalized["candidate_hash"] = candidate_hash if stage in {"ARTIFACT_GENERATION", "ARTIFACT_PATCH"} else raw.get("candidate_hash")
     return (normalized, errors) if not errors else (None, errors)

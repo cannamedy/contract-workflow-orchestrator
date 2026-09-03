@@ -14,7 +14,7 @@ from .models import (
     WorkflowState,
     WorkflowStatus,
 )
-from .artifacts import next_artifact
+from .artifacts import next_artifact, reconcile_artifact_staleness
 
 
 # Kept local to avoid making the scheduler depend on the state-machine's transition table.
@@ -204,6 +204,7 @@ def pending_decisions(state: WorkflowState) -> list[HumanDecision]:
 
 def schedule(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
     state = recompute(config, state)
+    state = reconcile_artifact_staleness(config, state)
     if state.current_stage in HUMAN_GATE_NAMES:
         return state
     if state.current_stage in AGENT_STAGE_NAMES and state.current_task and state.run_id:
@@ -243,6 +244,21 @@ def schedule(config: WorkflowConfig, state: WorkflowState) -> WorkflowState:
             attempt=0,
             pending_human_gate=None,
             status=WorkflowStatus.WAITING_HUMAN.value,
+        )
+    if any(
+        artifact.status == "PROMOTION_READY"
+        and any(spec.id == artifact.id and spec.promotion_policy == "EXTERNAL" for spec in config.artifact_pipeline)
+        for artifact in state.artifacts.values()
+    ):
+        return replace(
+            state,
+            current_stage=Stage.WAITING_FOR_AUTHORITY_CHANGE.value,
+            current_group=None,
+            current_task=None,
+            run_id=None,
+            attempt=0,
+            pending_human_gate=None,
+            status=WorkflowStatus.WAITING_AUTHORITY_CHANGE.value,
         )
     propagation = next((item for item in state.propagation.values() if item.get("status") == "RUNNING" and item.get("next_stage")), None)
     if propagation:

@@ -146,6 +146,38 @@ class StateStore:
         self._atomic_write(path, content)
         return path
 
+    def artifact_accepted_path(self, artifact_id: str) -> Path:
+        self.ensure()
+        if not artifact_id or Path(artifact_id).name != artifact_id:
+            raise StateStoreError("artifact requires a safe id")
+        directory = self.artifacts_path / artifact_id
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "accepted"
+
+    def save_artifact_promotion(self, artifact_id: str, record: dict[str, object]) -> Path:
+        self.ensure()
+        if not artifact_id or Path(artifact_id).name != artifact_id:
+            raise StateStoreError("artifact requires a safe id")
+        directory = self.artifacts_path / artifact_id
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "promotion.json"
+        self._atomic_write(path, json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        return path
+
+    def load_artifact_promotion(self, artifact_id: str) -> dict[str, object] | None:
+        if not artifact_id or Path(artifact_id).name != artifact_id:
+            raise StateStoreError("artifact requires a safe id")
+        path = self.artifacts_path / artifact_id / "promotion.json"
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("promotion root is not an object")
+            return value
+        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+            raise StateStoreError(f"corrupt artifact promotion: {path}: {exc}") from exc
+
     def save_authority_change(self, change: dict[str, object]) -> None:
         self.ensure()
         change_id = str(change.get("change_id", ""))

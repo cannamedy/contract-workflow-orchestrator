@@ -87,7 +87,7 @@ class PromptBuilder:
         artifact_context = "none"
         artifact_spec = next((item for item in config.artifact_pipeline if item.id == state.current_artifact_id), None)
         if artifact_spec:
-            artifact_context = f"id={artifact_spec.id}, kind={artifact_spec.kind}, dependencies={list(artifact_spec.dependencies)}, validator_role={artifact_spec.validator_role or 'none'}, review_required={artifact_spec.review_required}"
+            artifact_context = f"id={artifact_spec.id}, kind={artifact_spec.kind}, dependencies={list(artifact_spec.dependencies)}, validator_role={artifact_spec.validator_role or 'none'}, review_required={artifact_spec.review_required}, promotion_policy={artifact_spec.promotion_policy}, consume_approved_dependencies={artifact_spec.consume_approved_dependencies}"
         if stage == Stage.FINAL_VERIFICATION.value and config.artifact_pipeline_explicit:
             artifact_context = "approved CONFORMANCE_SPEC is required; emit conformance_results mapping requirement_id to conformance_id, evidence, and PASS/FAIL"
         if task:
@@ -164,7 +164,7 @@ For `AUTHORITY_CHANGE_ANALYSIS`, include an `authority_change` object with chang
 
 For propagation stages, emit only structured fields appropriate to the stage: `propagation_plan`, `candidate_artifacts`, `contract_revision_report`, `plan_revision_report`, `plan_graph`, or `task_rebase` as requested by the prompt. Candidate artifact content is evidence in CWO external state and must never be written to accepted project authority files by the Agent.
 
-For generic artifact stages, emit an `artifact` object with the current artifact `id` and `kind`. Generation and patch stages must include `candidate_hash` and may include `candidate_content`; review stages must include a concise `review` object. CWO validates lifecycle and dependency state deterministically.
+For generic artifact stages, emit an `artifact` object with the current artifact `id` and `kind`. Generation and patch stages must include `candidate_hash` and may include `candidate_content`; review stages must include a concise `review` object. CWO validates lifecycle and dependency state deterministically. Artifact promotion is performed by CWO according to the declared promotion_policy; do not copy or overwrite accepted artifacts from the Agent.
 
 {render_outcome_contract(values['run_id'], values['stage'], values['project'], values['group'], values['task'])}
 Do not include private chain-of-thought.'''

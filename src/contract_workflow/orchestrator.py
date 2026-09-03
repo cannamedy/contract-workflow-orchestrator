@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
+import tempfile
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -11,11 +13,12 @@ from typing import Any
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity
 from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
-from .artifacts import artifact_impact_closure, effective_artifact_specs, missing_skill_roles, validate_artifact_outcome, validate_final_conformance, reconcile_artifact_impact
+from .artifacts import artifact_impact_closure, dependency_revisions, effective_artifact_specs, missing_skill_roles, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
 from .plan_graph import reconcile_plan_graph, validate_plan_graph
 from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
 from .logging import EventLogger
 from .models import (
+    ArtifactStatus,
     DecisionStatus,
     HumanDecision,
     SCOPED_DECISION_VERDICTS,
@@ -387,22 +390,33 @@ class Orchestrator:
         current = state.artifacts.get(artifact_id)
         if current is None:
             return self._invalid_or_failed(state, ["current artifact state is missing"])
-        from .models import ArtifactStatus
         if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_PATCH.value}:
             candidate_hash = raw.get("candidate_hash")
             candidate_path = raw.get("candidate_path") or current.candidate_path
             if raw.get("candidate_content") is not None:
                 candidate_path = str(self.store.save_artifact_candidate(artifact_id, str(raw["candidate_content"])))
             status = ArtifactStatus.REVIEW_REQUIRED.value if current.review_required else ArtifactStatus.APPROVED.value
-            updated_artifact = replace(current, status=status, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata={**current.metadata, "last_outcome": outcome.get("summary", "")})
+            validator = raw.get("validator")
+            metadata = {
+                **current.metadata,
+                "last_outcome": outcome.get("summary", ""),
+                "dependency_revisions": dependency_revisions(self.config, state, next(item for item in self.config.artifact_pipeline if item.id == artifact_id)),
+            }
+            if isinstance(validator, dict):
+                metadata["validator"] = validator
+            updated_artifact = replace(current, status=status, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata=metadata)
         else:
             verdict = Verdict(outcome["verdict"])
             if verdict == Verdict.REQUIRES_PATCH:
                 updated_artifact = replace(current, status=ArtifactStatus.REQUIRES_PATCH.value, metadata={**current.metadata, "review": raw.get("review", {})})
             elif verdict == Verdict.APPROVED:
-                updated_artifact = replace(current, status=ArtifactStatus.APPROVED.value, version_hash=current.candidate_hash, metadata={**current.metadata, "review": raw.get("review", {})})
+                review = raw.get("review") or {}
+                metadata = {**current.metadata, "review": {"verdict": verdict.value, **review}}
+                if isinstance(raw.get("validator"), dict):
+                    metadata["validator"] = raw["validator"]
+                updated_artifact = replace(current, status=ArtifactStatus.APPROVED.value, version_hash=current.candidate_hash, metadata=metadata)
             elif verdict in SCOPED_DECISION_VERDICTS:
-                updated_artifact = replace(current, status=ArtifactStatus.BLOCKED.value, metadata={**current.metadata, "review": raw.get("review", {})})
+                updated_artifact = replace(current, status=ArtifactStatus.BLOCKED.value, metadata={**current.metadata, "review": {"verdict": verdict.value, **(raw.get("review") or {})}})
             else:
                 return self._invalid_or_failed(state, [f"unsupported artifact review verdict {verdict.value}"])
         artifacts = {**state.artifacts, artifact_id: updated_artifact}
@@ -421,7 +435,156 @@ class Orchestrator:
                 ],
             }
             updated, _ = self._record_decisions(updated, decision_outcome)
+            return StepResult(self._save(schedule(self.config, updated)), "artifact_outcome")
+        if updated_artifact.status == ArtifactStatus.APPROVED.value:
+            return self._prepare_artifact_promotion(updated, artifact_id)
         return StepResult(self._save(schedule(self.config, updated)), "artifact_outcome")
+
+    def _prepare_artifact_promotion(self, state: WorkflowState, artifact_id: str) -> StepResult:
+        spec = next(item for item in self.config.artifact_pipeline if item.id == artifact_id)
+        artifact = state.artifacts[artifact_id]
+        if artifact.status == ArtifactStatus.APPROVED.value:
+            artifact = replace(artifact, status=ArtifactStatus.PROMOTION_READY.value)
+            state = replace(state, artifacts={**state.artifacts, artifact_id: artifact})
+            self.store.save_artifact(artifact.to_dict())
+        validation_errors = validate_artifact_promotion(self.config, state, artifact_id, allow_external=spec.promotion_policy == "EXTERNAL")
+        if validation_errors:
+            return self._invalid_or_failed(state, validation_errors)
+        if spec.promotion_policy == "AUTO":
+            promoted = self._promote_artifact(state, artifact_id)
+            return StepResult(self._save(schedule(self.config, promoted)), "artifact_auto_promoted")
+        if spec.promotion_policy == "EXTERNAL":
+            promoted_artifact = replace(artifact, status=ArtifactStatus.PROMOTION_READY.value, metadata={**artifact.metadata, "external_acceptance_required": True})
+            updated = replace(state, artifacts={**state.artifacts, artifact_id: promoted_artifact})
+            self.store.save_artifact(promoted_artifact.to_dict())
+            self.logger.emit("artifact_promotion_external", artifact_id=artifact_id, kind=spec.kind)
+            return StepResult(self._save(schedule(self.config, updated)), "artifact_promotion_external")
+        decision_id = artifact.metadata.get("promotion_decision_id") or f"ADR-ARTIFACT-PROMOTION-{artifact_id}"
+        promoted_artifact = replace(artifact, status=ArtifactStatus.PROMOTION_READY.value, metadata={**artifact.metadata, "promotion_decision_id": decision_id})
+        request = {
+            "decision_id": decision_id,
+            "category": "ARTIFACT_PROMOTION",
+            "question": f"Accept artifact {artifact_id} ({spec.kind}) as the current artifact revision?",
+            "context": "The candidate passed semantic review and deterministic validation.",
+            "why_human_required": "This artifact explicitly declares promotion_policy=HUMAN_GATE.",
+            "options": ["promote"],
+            "recommended_option": "promote",
+            "allow_freeform": False,
+            "source_change": state.current_authority_change_id or "",
+            "source_stage": Stage.ARTIFACT_REVIEW.value,
+            "source_artifact_id": artifact_id,
+            "affected_requirements": artifact.affected_requirements,
+            "affected_contract_anchors": artifact.affected_contract_anchors,
+            "directly_blocked_items": [],
+        }
+        updated = replace(state, artifacts={**state.artifacts, artifact_id: promoted_artifact})
+        self.store.save_artifact(promoted_artifact.to_dict())
+        updated, _ = self._record_decisions(updated, {"decision_requests": [request]})
+        self.logger.emit("artifact_promotion_request_created", artifact_id=artifact_id, decision_id=decision_id)
+        return StepResult(self._save(schedule(self.config, updated)), "artifact_promotion_request")
+
+    @staticmethod
+    def _atomic_write_bytes(destination: Path, content: bytes) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+    def _artifact_acceptance_path(self, artifact_id: str) -> Path:
+        spec = next(item for item in self.config.artifact_pipeline if item.id == artifact_id)
+        if spec.accepted_path:
+            path = Path(spec.accepted_path)
+            return path if path.is_absolute() else Path(self.config.project_path) / path
+        return self.store.artifact_accepted_path(artifact_id)
+
+    def _promote_artifact(self, state: WorkflowState, artifact_id: str) -> WorkflowState:
+        artifact = state.artifacts[artifact_id]
+        spec = next(item for item in self.config.artifact_pipeline if item.id == artifact_id)
+        existing = self.store.load_artifact_promotion(artifact_id)
+        destination = self._artifact_acceptance_path(artifact_id)
+        if artifact.status == ArtifactStatus.ACCEPTED.value and artifact.accepted_hash == artifact.candidate_hash:
+            return state
+        if isinstance(existing, dict) and existing.get("status") == "COMMITTED" and existing.get("new_accepted_hash") == artifact.candidate_hash:
+            if destination.is_file() and hashlib.sha256(destination.read_bytes()).hexdigest() == artifact.candidate_hash:
+                return self._finalize_artifact_acceptance(state, artifact_id, destination, existing)
+        if isinstance(existing, dict) and existing.get("status") == "PREPARED":
+            target_hash = hashlib.sha256(destination.read_bytes()).hexdigest() if destination.is_file() else None
+            if target_hash == existing.get("new_accepted_hash") == artifact.candidate_hash:
+                existing["status"] = "COMMITTED"
+                existing["after_accepted_hash"] = target_hash
+                self.store.save_artifact_promotion(artifact_id, existing)
+                return self._finalize_artifact_acceptance(state, artifact_id, destination, existing)
+            if target_hash not in {None, existing.get("before_accepted_hash"), existing.get("previous_accepted_hash")}:
+                raise OrchestratorError("artifact promotion target drifted during recovery")
+        spec_uses_external_store = not spec.accepted_path
+        if spec_uses_external_store and destination.exists() and not isinstance(existing, dict):
+            raise OrchestratorError("artifact accepted target drifted before first promotion")
+        errors = validate_artifact_promotion(self.config, state, artifact_id)
+        if errors:
+            raise OrchestratorError("; ".join(errors))
+        candidate = Path(str(artifact.candidate_path))
+        content = candidate.read_bytes()
+        before_hash = hashlib.sha256(destination.read_bytes()).hexdigest() if destination.is_file() else None
+        if isinstance(existing, dict) and existing.get("status") == "PREPARED":
+            if existing.get("candidate_hash") != artifact.candidate_hash or existing.get("before_accepted_hash") != before_hash:
+                raise OrchestratorError("artifact promotion precondition changed during recovery")
+        review = artifact.metadata.get("review", {})
+        validator = artifact.metadata.get("validator", {})
+        record = {
+            "artifact_id": artifact_id,
+            "artifact_kind": spec.kind,
+            "status": "PREPARED",
+            "previous_accepted_hash": artifact.accepted_hash,
+            "before_accepted_hash": before_hash,
+            "new_accepted_hash": artifact.candidate_hash,
+            "candidate_hash": artifact.candidate_hash,
+            "change_id": artifact.change_id,
+            "derived_from": dependency_revisions(self.config, state, spec),
+            "review_evidence": review,
+            "validator_evidence": validator,
+            "promotion_policy": spec.promotion_policy,
+            "promotion_time": now_iso(),
+            "accepted_path": str(destination),
+        }
+        self.store.save_artifact_promotion(artifact_id, record)
+        self._atomic_write_bytes(destination, content)
+        record["status"] = "COMMITTED"
+        record["after_accepted_hash"] = artifact.candidate_hash
+        self.store.save_artifact_promotion(artifact_id, record)
+        return self._finalize_artifact_acceptance(state, artifact_id, destination, record)
+
+    def _finalize_artifact_acceptance(self, state: WorkflowState, artifact_id: str, destination: Path, record: dict[str, Any]) -> WorkflowState:
+        artifact = state.artifacts[artifact_id]
+        accepted = replace(
+            artifact,
+            status=ArtifactStatus.ACCEPTED.value,
+            version_hash=artifact.candidate_hash,
+            accepted_hash=artifact.candidate_hash,
+            accepted_path=str(destination),
+            metadata={
+                **artifact.metadata,
+                "promotion": record,
+                "promotion_history": [*(artifact.metadata.get("promotion_history", []) or []), record],
+            },
+        )
+        self.store.save_artifact(accepted.to_dict())
+        self.logger.emit("artifact_promoted", artifact_id=artifact_id, kind=accepted.kind, accepted_hash=accepted.accepted_hash)
+        return replace(state, artifacts={**state.artifacts, artifact_id: accepted})
 
     def _apply_authority_analysis(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         analysis, errors = validate_analysis(self.config, self.store, state, outcome)
@@ -793,8 +956,13 @@ class Orchestrator:
                     },
                 )
         promoted = resolved.category == "AUTHORITY_PROMOTION" and value == "promote"
+        artifact_promoted = resolved.category == "ARTIFACT_PROMOTION" and value == "promote"
         if promoted:
             next_state = self._promote_authority_change(next_state, resolved)
+        elif artifact_promoted:
+            if not resolved.source_artifact_id:
+                raise OrchestratorError("artifact promotion decision has no source artifact")
+            next_state = self._promote_artifact(next_state, resolved.source_artifact_id)
         elif resolved.source_stage == Stage.AUTHORITY_CHANGE_ANALYSIS.value:
             change = next((item for item in next_state.authority_changes.values() if item.get("change_id") == resolved.source_change or item.get("change_id") == resolved.source_change), None)
             if change and resolved.source_change not in next_state.propagation:
@@ -837,7 +1005,6 @@ class Orchestrator:
             if destination is None or not stored.is_file():
                 raise OrchestratorError("candidate artifact is missing or unsafe")
             content = stored.read_text(encoding="utf-8")
-            import hashlib
             if hashlib.sha256(content.encode()).hexdigest() != artifact.get("sha256"):
                 raise OrchestratorError("candidate artifact hash mismatch")
             old_digest = hashlib.sha256(destination.read_bytes()).hexdigest() if destination.is_file() else None
@@ -848,7 +1015,6 @@ class Orchestrator:
         configured_source = safe_project_path(project, str(change.get("configured_source_path", "")))
         if candidate_source is None or configured_source is None or not candidate_source.is_file():
             raise OrchestratorError("Human Guide candidate is missing or unsafe")
-        import hashlib
         if hashlib.sha256(candidate_source.read_bytes()).hexdigest() != change.get("candidate_sha256"):
             raise OrchestratorError("Human Guide candidate hash mismatch")
         if candidate_source.resolve() != configured_source.resolve():

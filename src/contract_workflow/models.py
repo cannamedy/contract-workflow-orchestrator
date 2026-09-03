@@ -97,6 +97,7 @@ class ArtifactStatus(str, Enum):
     REVIEW_REQUIRED = "REVIEW_REQUIRED"
     REQUIRES_PATCH = "REQUIRES_PATCH"
     APPROVED = "APPROVED"
+    PROMOTION_READY = "PROMOTION_READY"
     ACCEPTED = "ACCEPTED"
     SUPERSEDED = "SUPERSEDED"
     BLOCKED = "BLOCKED"
@@ -106,6 +107,8 @@ ARTIFACT_KINDS = frozenset({
     "HUMAN_GUIDE", "ENGINEERING_SPEC", "MACHINE_CONTRACT", "CONFORMANCE_SPEC",
     "IMPLEMENTATION_DESIGN", "IMPLEMENTATION_PLAN", "PLAN_GRAPH", "TASK_CONTRACT",
 })
+
+PROMOTION_POLICIES = frozenset({"AUTO", "HUMAN_GATE", "EXTERNAL"})
 
 
 class DecisionStatus(str, Enum):
@@ -135,6 +138,8 @@ class ArtifactSpec:
     skill_role: str | None = None
     review_required: bool = True
     validator_role: str | None = None
+    promotion_policy: str = "AUTO"
+    consume_approved_dependencies: bool = False
     candidate_path: str | None = None
     accepted_path: str | None = None
     derived_from: tuple[str, ...] = ()
@@ -154,6 +159,8 @@ class EngineeringArtifact:
     skill_role: str | None = None
     review_required: bool = True
     validator_role: str | None = None
+    promotion_policy: str = "AUTO"
+    consume_approved_dependencies: bool = False
     candidate_path: str | None = None
     accepted_path: str | None = None
     change_id: str | None = None

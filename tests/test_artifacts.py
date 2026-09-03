@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from contract_workflow.artifacts import artifact_impact_closure, missing_skill_roles, validate_artifact_graph, validate_final_conformance
+from contract_workflow.artifacts import artifact_impact_closure, dependency_revisions, missing_skill_roles, reconcile_artifact_staleness, validate_artifact_graph, validate_artifact_promotion, validate_final_conformance
 from contract_workflow.config import WorkflowConfigError, load_workflow
-from contract_workflow.models import ArtifactSpec, ArtifactStatus, Stage, WorkflowState
+from contract_workflow.models import ArtifactSpec, ArtifactStatus, EngineeringArtifact, Stage, WorkflowState
 from contract_workflow.orchestrator import Orchestrator
 from contract_workflow.outcome import make_outcome
 from contract_workflow.runners.base import RunnerResult, run_times
@@ -85,12 +85,100 @@ class ArtifactPipelineTests(unittest.TestCase):
         rereview = orchestrator.step().state
         self.assertEqual(rereview.current_stage, Stage.ARTIFACT_REVIEW.value)
         approved = orchestrator.step().state
-        self.assertEqual(approved.artifacts["spec"].status, ArtifactStatus.APPROVED.value)
+        self.assertEqual(approved.artifacts["spec"].status, ArtifactStatus.ACCEPTED.value)
         self.assertTrue(list((self.state_root / "artifacts" / "spec").glob("candidate")))
+        self.assertTrue((self.state_root / "artifacts" / "spec" / "accepted").is_file())
+        self.assertTrue((self.state_root / "artifacts" / "spec" / "promotion.json").is_file())
 
     def test_optional_artifact_can_be_skipped_and_missing_skill_is_diagnostic(self):
         config = self.config("    - id: optional\n      kind: MACHINE_CONTRACT\n      optional: true\n      enabled: false\n      skill_role: machine_contract\n")
         self.assertEqual(missing_skill_roles(config), ["machine_contract"])
+
+    def test_human_gate_reuses_decision_system_for_promotion(self):
+        config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n      promotion_policy: HUMAN_GATE\n")
+        runner = ArtifactRunner(config.project_name)
+        orchestrator = Orchestrator(config, store=StateStore(self.state_root), runner=runner)
+        self.assertEqual(orchestrator.step().state.current_stage, Stage.ARTIFACT_GENERATION.value)
+        state = orchestrator.run()
+        self.assertEqual(state.current_stage, Stage.WAITING_FOR_HUMAN.value)
+        decision = next(item for item in state.decisions.values() if item.status == "PENDING")
+        self.assertEqual(decision.category, "ARTIFACT_PROMOTION")
+        promoted = orchestrator.decide(decision.decision_id, option="promote")
+        self.assertEqual(promoted.artifacts["spec"].status, ArtifactStatus.ACCEPTED.value)
+
+    def test_external_policy_never_promotes_internally(self):
+        config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n      promotion_policy: EXTERNAL\n")
+        runner = ArtifactRunner(config.project_name)
+        state = Orchestrator(config, store=StateStore(self.state_root), runner=runner).run()
+        self.assertEqual(state.artifacts["spec"].status, ArtifactStatus.PROMOTION_READY.value)
+        self.assertEqual(state.current_stage, Stage.WAITING_FOR_AUTHORITY_CHANGE.value)
+        self.assertFalse(list((self.state_root / "artifacts" / "spec").glob("accepted")))
+
+    def test_promotion_rejects_hash_validator_and_review_failures(self):
+        config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n      validator_role: spec_validator\n")
+        store = StateStore(self.state_root)
+        candidate = store.save_artifact_candidate("spec", "candidate\n")
+        artifact = EngineeringArtifact(
+            "spec", "ENGINEERING_SPEC", ArtifactStatus.PROMOTION_READY.value,
+            candidate_hash="0" * 64, candidate_path=str(candidate),
+            validator_role="spec_validator", metadata={"review": {"verdict": "APPROVED"}, "validator": {"status": "FAIL"}},
+        )
+        state = WorkflowState(artifacts={"spec": artifact})
+        errors = validate_artifact_promotion(config, state, "spec")
+        self.assertTrue(any("hash mismatch" in error for error in errors))
+        artifact.candidate_hash = hashlib.sha256(b"candidate\n").hexdigest()
+        errors = validate_artifact_promotion(config, state, "spec")
+        self.assertTrue(any("validator" in error for error in errors))
+
+    def test_downstream_candidate_is_reset_when_upstream_revision_changes(self):
+        config = self.config(
+            "    - id: upstream\n      kind: ENGINEERING_SPEC\n      review_required: false\n"
+            "    - id: downstream\n      kind: IMPLEMENTATION_DESIGN\n      dependencies: [upstream]\n      review_required: false\n"
+        )
+        old = "a" * 64
+        new = "b" * 64
+        state = WorkflowState(artifacts={
+            "upstream": EngineeringArtifact("upstream", "ENGINEERING_SPEC", ArtifactStatus.ACCEPTED.value, accepted_hash=new, version_hash=new),
+            "downstream": EngineeringArtifact(
+                "downstream", "IMPLEMENTATION_DESIGN", ArtifactStatus.PROMOTION_READY.value,
+                accepted_hash="c" * 64, candidate_hash="d" * 64,
+                metadata={"dependency_revisions": [{"artifact_id": "upstream", "status": "ACCEPTED", "hash": old}]},
+            ),
+        })
+        reconciled = reconcile_artifact_staleness(config, state)
+        self.assertEqual(reconciled.artifacts["downstream"].status, ArtifactStatus.PENDING.value)
+        self.assertEqual(reconciled.artifacts["downstream"].candidate_hash, None)
+
+    def test_promotion_is_idempotent_and_persists_provenance(self):
+        config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n      review_required: false\n")
+        runner = ArtifactRunner(config.project_name)
+        orchestrator = Orchestrator(config, store=StateStore(self.state_root), runner=runner)
+        state = orchestrator.run()
+        self.assertEqual(state.artifacts["spec"].status, ArtifactStatus.ACCEPTED.value)
+        history_length = len(state.artifacts["spec"].metadata["promotion_history"])
+        repeated = orchestrator._promote_artifact(state, "spec")
+        self.assertEqual(repeated.artifacts["spec"].status, ArtifactStatus.ACCEPTED.value)
+        self.assertEqual(len(repeated.artifacts["spec"].metadata["promotion_history"]), history_length)
+
+    def test_prepared_promotion_recovers_without_accepting_half_a_revision(self):
+        config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n      review_required: false\n")
+        store = StateStore(self.state_root)
+        candidate = store.save_artifact_candidate("spec", "recoverable\n")
+        candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        state = WorkflowState(artifacts={
+            "spec": EngineeringArtifact(
+                "spec", "ENGINEERING_SPEC", ArtifactStatus.PROMOTION_READY.value,
+                candidate_hash=candidate_hash, candidate_path=str(candidate), review_required=False,
+            ),
+        })
+        broken = Orchestrator(config, store=store)
+        broken._atomic_write_bytes = lambda destination, content: (_ for _ in ()).throw(OSError("simulated interruption"))
+        with self.assertRaises(OSError):
+            broken._promote_artifact(state, "spec")
+        self.assertEqual(store.load_artifact_promotion("spec")["status"], "PREPARED")
+        recovered = Orchestrator(config, store=store)._promote_artifact(state, "spec")
+        self.assertEqual(recovered.artifacts["spec"].status, ArtifactStatus.ACCEPTED.value)
+        self.assertEqual(store.load_artifact_promotion("spec")["status"], "COMMITTED")
 
     def test_task_contract_fields_are_loaded(self):
         config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n")

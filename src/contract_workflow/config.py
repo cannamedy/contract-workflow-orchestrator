@@ -8,7 +8,7 @@ from typing import Any
 import yaml
 
 from .artifacts import validate_artifact_graph
-from .models import ARTIFACT_KINDS, ArtifactSpec, AuthoritativeSource, GroupSpec, Policy, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
+from .models import ARTIFACT_KINDS, PROMOTION_POLICIES, ArtifactSpec, AuthoritativeSource, GroupSpec, Policy, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
 
 
 class WorkflowConfigError(ValueError):
@@ -138,10 +138,15 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
         for index, item in enumerate(artifact_values):
             if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("kind"), str):
                 raise WorkflowConfigError(f"artifact_pipeline[{index}] requires id and kind")
+            promotion_policy = item.get("promotion_policy", "AUTO")
+            if promotion_policy not in PROMOTION_POLICIES:
+                raise WorkflowConfigError(f"artifact_pipeline[{index}].promotion_policy must be AUTO, HUMAN_GATE, or EXTERNAL")
             artifact_specs.append(ArtifactSpec(
                 id=item["id"], kind=item["kind"], dependencies=_strings(item.get("dependencies", item.get("depends_on"))),
                 optional=bool(item.get("optional", False)), enabled=bool(item.get("enabled", True)), skill_role=item.get("skill_role"),
                 review_required=bool(item.get("review_required", True)), validator_role=item.get("validator_role"),
+                promotion_policy=promotion_policy,
+                consume_approved_dependencies=bool(item.get("consume_approved_dependencies", item.get("allow_approved_dependencies", False))),
                 candidate_path=item.get("candidate_path"), accepted_path=item.get("accepted_path"), derived_from=_strings(item.get("derived_from")),
             ))
         graph_errors = validate_artifact_graph(artifact_specs)
