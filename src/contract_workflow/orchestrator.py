@@ -27,6 +27,7 @@ from .models import (
     StepResult,
     Verdict,
     WorkItemStatus,
+    ReviewFinding,
     WorkflowConfig,
     WorkflowState,
     WorkflowStatus,
@@ -35,6 +36,7 @@ from .models import (
 from .outcome import make_outcome, validate_outcome
 from .prompt_builder import PromptBuilder
 from .project_validator import ProjectValidatorResult, execute_project_validator, requires_project_validation
+from .review_evidence import ReviewFindingError, finding_identity, register_finding, resolve_finding, unresolved_for_task, validate_finding_payload
 from .runners import AgentRunner, CodexCliRunner, MockRunner, RunnerResult
 from .state_machine import AGENT_STAGES, HUMAN_GATES, approve, initial_state, stop, transition_after_outcome, transition_ready
 from .state_store import StateStore, StateStoreError
@@ -1404,6 +1406,8 @@ class Orchestrator:
                 for item in value:
                     visit(item)
 
+        for finding in unresolved_for_task(state, task_id):
+            add([finding.text])
         visit(state.last_outcome)
         item = state.work_items.get(task_id)
         if item:
@@ -1430,6 +1434,13 @@ class Orchestrator:
                 if isinstance(finding, str) and finding and finding not in merged:
                     merged.append(finding)
             task["preserved_review_findings"] = merged
+            carried_ids = [finding.finding_id for finding in unresolved_for_task(state, task_id)]
+            prior_ids = task.get("preserved_review_finding_ids", [])
+            if not isinstance(prior_ids, list):
+                prior_ids = []
+            task["preserved_review_finding_ids"] = list(dict.fromkeys(
+                [item for item in carried_ids + prior_ids if isinstance(item, str) and item]
+            ))
             tasks.append(task)
         return {**rebase, "tasks": tasks}
 
@@ -1863,12 +1874,99 @@ class Orchestrator:
             "propagation": state.propagation,
             "plan_graph": state.plan_graph,
             "plan_graph_reconciliation": state.plan_graph_reconciliation,
+            "review_findings": {key: item.to_dict() for key, item in state.review_findings.items()},
             "artifact_pipeline": [spec.__dict__ for spec in effective_artifact_specs(self.config)],
             "artifact_pipeline_mode": "explicit" if self.config.artifact_pipeline_explicit else "legacy-adapter",
             "missing_skill_roles": missing_skill_roles(self.config),
             "unaffected_work_continues": state.status == WorkflowStatus.RUNNING.value and bool(ready_work(self.config, state)),
             "state": state.to_dict(),
         }
+
+    def _known_review_work_items(self, state: WorkflowState) -> set[str]:
+        known = {task.id for _, task in self.config.tasks}
+        known.update(state.work_items)
+        known.update(
+            str(item.get("id")) for item in (state.plan_graph or {}).get("tasks", ())
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        )
+        for propagation in state.propagation.values():
+            task_rebase = propagation.get("task_rebase")
+            items = task_rebase.get("tasks", ()) if isinstance(task_rebase, dict) else ()
+            for item in items:
+                if isinstance(item, dict) and isinstance(item.get("task_id"), str):
+                    known.add(item["task_id"])
+        return {item for item in known if item}
+
+    def migrate_review_finding(
+        self,
+        *,
+        task_id: str,
+        text: str,
+        finding_id: str | None = None,
+        source_context: str | None = None,
+    ) -> dict[str, Any]:
+        """Register a previously confirmed review fact in canonical evidence.
+
+        This ingress deliberately creates no Decision, AuthorityChange, CR or
+        run outcome.  The caller is recording evidence, not requesting a
+        governance transition.
+        """
+        state = self._load_or_initialize()
+        project_path = Path(self.config.project_path)
+        if not project_path.is_dir():
+            raise OrchestratorError(f"target project does not exist: {project_path}")
+        canonical_id = finding_id or finding_identity(self.config.project_name, task_id, task_id, text)
+        validate_finding_payload(
+            project_path=str(project_path), known_work_items=self._known_review_work_items(state),
+            finding_id=canonical_id, work_item_id=task_id, task_id=task_id, text=text,
+            status="UNRESOLVED", provenance="HISTORICAL_REVIEW_MIGRATION",
+        )
+        registered_at = now_iso()
+        finding = ReviewFinding(
+            finding_id=canonical_id,
+            project=self.config.project_name,
+            work_item_id=task_id,
+            task_id=task_id,
+            text=text,
+            status="UNRESOLVED",
+            provenance="HISTORICAL_REVIEW_MIGRATION",
+            source_context={"description": source_context} if source_context else {},
+            migration_evidence={
+                "type": "MIGRATED_HISTORICAL_REVIEW_EVIDENCE",
+                "registered_at": registered_at,
+            },
+            registered_at=registered_at,
+        )
+        updated, result, existing = register_finding(state, finding)
+        if result == "CREATED":
+            self.logger.emit(
+                "historical_review_finding_migrated", finding_id=existing.finding_id,
+                task_id=existing.task_id, provenance=existing.provenance,
+            )
+            self._save(updated)
+        return {
+            "status": result,
+            "finding": existing.to_dict(),
+            "canonical_store": str(self.store.state_path),
+        }
+
+    def list_review_findings(self, task_id: str | None = None, unresolved_only: bool = True) -> list[ReviewFinding]:
+        state = self._load_or_initialize()
+        findings = list(state.review_findings.values())
+        if task_id:
+            findings = [item for item in findings if item.task_id == task_id]
+        if unresolved_only:
+            findings = [item for item in findings if item.status == "UNRESOLVED"]
+        return sorted(findings, key=lambda item: item.finding_id)
+
+    def resolve_review_finding(self, finding_id: str, rationale: str) -> dict[str, Any]:
+        state = self._load_or_initialize()
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise ReviewFindingError("resolution evidence is required")
+        updated, resolved = resolve_finding(state, finding_id, {"rationale": rationale})
+        self.logger.emit("review_finding_resolved", finding_id=finding_id, task_id=resolved.task_id)
+        self._save(updated)
+        return {"status": "RESOLVED", "finding": resolved.to_dict(), "canonical_store": str(self.store.state_path)}
 
     def recover(self) -> WorkflowState:
         state = self._load_or_initialize()

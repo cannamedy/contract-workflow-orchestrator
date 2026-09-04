@@ -7,11 +7,15 @@
 当作运行时真相。
 
 ```text
-Version: 0.7.1
-HEAD:    e5e7944eb098bbaa14812bcfe8481862df20fa6e
-Branch:  main
-Origin:  origin/main aligned at the same commit when this page was written
+Documented version: 0.7.2
+Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
+Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
+Repository snapshot observed when the previous state baseline was written:
+  3902849022da3898c1139e2b4c56fb4481806438
 ```
+
+这些是可追溯的历史基线，不是对未来 repository `HEAD` 的永久声明；本页随实现状态更新时
+应重新观察并记录新的 snapshot，而不应把本页自身的提交误写成永远的当前 HEAD。
 
 当前工作树在形成此状态记录前为 clean。PAIS 是 CWO 的真实集成案例，但不属于 CWO repository
 的 authority。
@@ -42,6 +46,9 @@ Origin:  origin/main aligned at the same commit when this page was written
 - Codex CLI adapter 的 workspace cwd binding；配置的 authoritative origin 不作为 Agent cwd。
 - recovery 对已完成 outcome、运行中 Agent、失败 runner、workflow digest 和遗留 drift 状态
   的受限处理。
+- canonical review evidence registry 位于 `WorkflowState` / 外部 runtime `state.json`；支持
+  historical review evidence migration、稳定 finding identity、幂等登记、结构化 provenance、
+  unresolved carry-forward 和正常 resolve 生命周期。
 
 ### PARTIAL
 
@@ -168,9 +175,9 @@ Project validator 负责确定性结构与 traceability，独立 Reviewer 负责
 
 ## 8. 当前明确限制与活动缺口
 
-- 尚无通用 CWO-supported historical review finding registration/migration mechanism。PAIS 的
-  TASK-002 unresolved finding “capabilities / frames scalar values were incorrectly converted
-  to tuple” 仍是 pending，不能写成已解决。
+- PAIS TASK-002 的历史 review finding “capabilities / frames scalar values were incorrectly
+  converted to tuple” 已通过 CWO canonical historical evidence migration 持久化；持久化缺口
+  已关闭，但 finding 本身仍为 `UNRESOLVED`，直到未来实现与独立 review 证明其解决。
 - CWO 本身不提供 PAIS-specific Engineering Spec、Machine Contract、Conformance 或 Design
   内容；这些内容需由项目配置的 Skill 和 validator 产生、审查和固化。
 - 当前文档体系没有把 Human Authority Set precedence 自动化；存在多个权威冲突时仍需明确

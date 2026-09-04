@@ -13,7 +13,7 @@ from .state_store import StateStore
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.7.1")
+    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.7.2")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)
@@ -46,6 +46,24 @@ def _parser() -> argparse.ArgumentParser:
     watch.add_argument("project", type=Path)
     watch.add_argument("--interval", type=float, default=300.0)
     watch.add_argument("--dry-run", action="store_true")
+    review = sub.add_parser("review", help="inspect and manage canonical review evidence")
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+    evidence = review_sub.add_parser("evidence", help="operate on persisted review findings")
+    evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
+    migrate = evidence_sub.add_parser("migrate", help="register historical review evidence")
+    migrate.add_argument("project", type=Path)
+    migrate.add_argument("--task-id", required=True)
+    migrate.add_argument("--finding", required=True)
+    migrate.add_argument("--finding-id")
+    migrate.add_argument("--source-context")
+    resolve = evidence_sub.add_parser("resolve", help="resolve a persisted review finding")
+    resolve.add_argument("project", type=Path)
+    resolve.add_argument("finding_id")
+    resolve.add_argument("--rationale", required=True)
+    listing = evidence_sub.add_parser("list", help="list persisted review findings")
+    listing.add_argument("project", type=Path)
+    listing.add_argument("--task-id")
+    listing.add_argument("--all", action="store_true", help="include resolved findings")
     return parser
 
 
@@ -93,7 +111,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
     try:
         orchestrator = Orchestrator.for_project(args.project)
-        if args.command == "status":
+        if args.command == "review":
+            if args.review_command != "evidence":
+                raise OrchestratorError("unsupported review command")
+            if args.evidence_command == "migrate":
+                _dump(orchestrator.migrate_review_finding(
+                    task_id=args.task_id, text=args.finding,
+                    finding_id=args.finding_id, source_context=args.source_context,
+                ))
+            elif args.evidence_command == "resolve":
+                _dump(orchestrator.resolve_review_finding(args.finding_id, args.rationale))
+            elif args.evidence_command == "list":
+                _dump([item.to_dict() for item in orchestrator.list_review_findings(args.task_id, unresolved_only=not args.all)])
+        elif args.command == "status":
             _dump(orchestrator.status_report())
         elif args.command == "resume":
             _dump(orchestrator.run())

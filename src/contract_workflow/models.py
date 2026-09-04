@@ -111,6 +111,11 @@ ARTIFACT_KINDS = frozenset({
 
 PROMOTION_POLICIES = frozenset({"AUTO", "HUMAN_GATE", "EXTERNAL"})
 
+REVIEW_FINDING_STATUSES = frozenset({"UNRESOLVED", "RESOLVED", "NOT_APPLICABLE"})
+REVIEW_FINDING_PROVENANCES = frozenset({
+    "HISTORICAL_REVIEW_MIGRATION", "AGENT_REVIEW", "IMPORTED_REVIEW",
+})
+
 
 class DecisionStatus(str, Enum):
     PENDING = "PENDING"
@@ -208,6 +213,43 @@ class AuthorityChange:
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
+
+
+@dataclass
+class ReviewFinding:
+    """Canonical structured review evidence attached to a work item.
+
+    Historical migration and normal review ingestion share this record and
+    lifecycle.  The provenance says how a fact entered the store; it does not
+    create a separate lifecycle or evidence repository.
+    """
+
+    finding_id: str
+    project: str
+    work_item_id: str
+    task_id: str | None
+    text: str
+    status: str = "UNRESOLVED"
+    provenance: str = "AGENT_REVIEW"
+    source_context: dict[str, Any] = field(default_factory=dict)
+    migration_evidence: dict[str, Any] = field(default_factory=dict)
+    registered_at: str = field(default_factory=now_iso)
+    resolved_at: str | None = None
+    resolution_evidence: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        value = dict(self.__dict__)
+        value["source_context"] = dict(self.source_context)
+        value["migration_evidence"] = dict(self.migration_evidence)
+        value["resolution_evidence"] = dict(self.resolution_evidence)
+        return value
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ReviewFinding":
+        payload = {key: item for key, item in value.items() if key in cls.__dataclass_fields__}
+        for key in ("source_context", "migration_evidence", "resolution_evidence"):
+            payload[key] = dict(payload.get(key, {}) or {})
+        return cls(**payload)
 
 
 @dataclass(frozen=True)
@@ -322,6 +364,7 @@ class WorkflowState:
     recoverable: bool = False
     work_items: dict[str, "WorkItemState"] = field(default_factory=dict)
     decisions: dict[str, "HumanDecision"] = field(default_factory=dict)
+    review_findings: dict[str, ReviewFinding] = field(default_factory=dict)
     adrs: dict[str, dict[str, Any]] = field(default_factory=dict)
     current_authority_change_id: str | None = None
     authority_changes: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -335,6 +378,7 @@ class WorkflowState:
         value = self.__dict__.copy()
         value["work_items"] = {key: item.to_dict() for key, item in self.work_items.items()}
         value["decisions"] = {key: item.to_dict() for key, item in self.decisions.items()}
+        value["review_findings"] = {key: item.to_dict() for key, item in self.review_findings.items()}
         value["artifacts"] = {key: item.to_dict() for key, item in self.artifacts.items()}
         return value
 
@@ -349,6 +393,10 @@ class WorkflowState:
         payload["decisions"] = {
             key: HumanDecision.from_dict(item) if isinstance(item, dict) else item
             for key, item in (payload.get("decisions") or {}).items()
+        }
+        payload["review_findings"] = {
+            key: ReviewFinding.from_dict(item) if isinstance(item, dict) else item
+            for key, item in (payload.get("review_findings") or {}).items()
         }
         payload["artifacts"] = {
             key: EngineeringArtifact.from_dict(item) if isinstance(item, dict) else item
