@@ -367,6 +367,21 @@ groups:
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.timed_out)
         self.assertEqual((run_dir / "stdout.log").read_text(encoding="utf-8").strip(), "ok")
+        self.assertEqual(result.runner_metadata["effective_cwd"], str(self.project.resolve()))
+        self.assertEqual(result.runner_metadata["sandbox_mode"], "default")
+
+    def test_codex_runner_binds_danger_full_access_to_workspace_and_records_argv(self):
+        run_dir = self.root / "codex-bound-run"
+        run_dir.mkdir()
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        runner = CodexCliRunner(command=f'{os.sys.executable} -c "import os; print(os.getcwd())" --sandbox danger-full-access -C {self.project}')
+        result = runner.run(workspace, "ignored", run_dir, timeout=5)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.runner_metadata["effective_cwd"], str(workspace.resolve()))
+        self.assertEqual(result.runner_metadata["sandbox_mode"], "danger-full-access")
+        self.assertIn(str(workspace.resolve()), result.runner_metadata["argv"])
+        self.assertNotIn(str(self.project.resolve()), result.runner_metadata["argv"])
 
     def test_codex_command_cannot_keep_configured_authoritative_cwd(self):
         command = ["codex", "exec", "-C", str(self.project), "-"]

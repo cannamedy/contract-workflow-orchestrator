@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import shutil
 import subprocess
@@ -8,6 +9,10 @@ from pathlib import Path
 from typing import Mapping
 
 from .base import RunnerResult, _time
+
+
+class RunnerBindingError(RuntimeError):
+    """The runner could not be bound to the disposable execution workspace."""
 
 
 class CodexCliRunner:
@@ -24,6 +29,9 @@ class CodexCliRunner:
         else:
             command = ["codex", "exec", "-C", str(cwd), "-"]
         command = _bind_execution_directory(command, cwd)
+        effective_cwd = str(cwd.resolve())
+        if _configured_execution_directory(command) not in {None, effective_cwd}:
+            raise RunnerBindingError("RUNNER_ORIGIN_CWD_FORBIDDEN: runner command is not bound to the RunWorkspace")
         if "{prompt}" in command:
             command = [prompt if item == "{prompt}" else item for item in command]
             stdin = None
@@ -48,14 +56,53 @@ class CodexCliRunner:
                 exit_code = process.returncode
         except (OSError, ValueError) as exc:
             stderr_path.write_text(str(exc) + "\n", encoding="utf-8")
-        return RunnerResult(exit_code, stdout_path, stderr_path, started, _time(), timed_out, {"runner": "codex_cli", "command": " ".join(command[:3])})
+        sandbox_mode = "default"
+        for index, item in enumerate(command[:-1]):
+            if item in {"--sandbox", "-s"}:
+                sandbox_mode = command[index + 1]
+                break
+            if item.startswith("--sandbox="):
+                sandbox_mode = item.split("=", 1)[1]
+                break
+        return RunnerResult(
+            exit_code,
+            stdout_path,
+            stderr_path,
+            started,
+            _time(),
+            timed_out,
+            {
+                "runner": "codex_cli",
+                "argv": json.dumps(command, ensure_ascii=False),
+                "command": " ".join(command[:3]),
+                "authoritative_origin": os.environ.get("CWO_AUTHORITATIVE_ORIGIN", ""),
+                "effective_cwd": effective_cwd,
+                "sandbox_mode": sandbox_mode,
+            },
+        )
 
 
 def _bind_execution_directory(command: list[str], cwd: Path) -> list[str]:
-    """Prevent a configured absolute Codex -C from escaping the run workspace."""
+    """Bind every Codex directory option to the disposable RunWorkspace."""
     result = list(command)
+    bound = str(cwd.resolve())
     for index, item in enumerate(result[:-1]):
         if item in {"-C", "--cd"}:
-            result[index + 1] = str(cwd)
-            return result
+            result[index + 1] = bound
+        elif item.startswith("--cd="):
+            result[index] = f"--cd={bound}"
+        elif item.startswith("-C") and item != "-C":
+            result[index] = f"-C{bound}"
     return result
+
+
+def _configured_execution_directory(command: list[str]) -> str | None:
+    """Return an explicit Codex directory binding, if one is present."""
+    for index, item in enumerate(command):
+        if item in {"-C", "--cd"} and index + 1 < len(command):
+            return str(Path(command[index + 1]).resolve())
+        if item.startswith("--cd="):
+            return str(Path(item.split("=", 1)[1]).resolve())
+        if item.startswith("-C") and item != "-C":
+            return str(Path(item[2:]).resolve())
+    return None

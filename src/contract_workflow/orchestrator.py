@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import fnmatch
 import os
 import shutil
 import tempfile
@@ -348,14 +349,16 @@ class Orchestrator:
             state = replace(state, work_items={**state.work_items, state.current_task: replace(item, status=WorkItemStatus.REQUIRES_PATCH.value if stage == Stage.TASK_PATCH.value else WorkItemStatus.RUNNING.value, attempt=state.attempt)})
         self._save(state)
         outcome_path = run_dir / "outcome.json"
-        authority_before = authority_snapshot(self.config, self.store)
+        authority_before = self._agent_authority_snapshot()
         try:
             workspace = RunWorkspace.create(Path(self.config.project_path), self.store.root, run_id)
         except Exception as exc:
             _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "failed", "error": str(exc), "started_at": now_iso()})
             return self._workspace_stop(state, None, f"could not create isolated Agent workspace: {exc}", "WORKSPACE_SETUP_FAILED")
         workspace_metadata = {
+            "authoritative_origin": str(Path(self.config.project_path).resolve()),
             "workspace_path": str(workspace.path),
+            "effective_cwd": str(workspace.path.resolve()),
             "workspace_baseline": workspace.baseline,
             "real_baseline": workspace.real_baseline,
             "excluded_roots": [str(item) for item in workspace.excluded_roots],
@@ -366,23 +369,29 @@ class Orchestrator:
         self.logger.emit("stage_entered", stage=stage, group=state.current_group, task=state.current_task)
         self.logger.emit("agent_run_started", run_id=run_id, stage=stage, attempt=state.attempt, workspace_path=str(workspace.path))
         try:
-            result = self.runner.run(workspace.path, prompt, run_dir, self.config.runner.timeout_seconds, env={"CWO_RUN_ID": run_id, "CWO_OUTCOME_PATH": str(outcome_path)})
+            result = self.runner.run(workspace.path, prompt, run_dir, self.config.runner.timeout_seconds, env={"CWO_RUN_ID": run_id, "CWO_OUTCOME_PATH": str(outcome_path), "CWO_AUTHORITATIVE_ORIGIN": str(Path(self.config.project_path).resolve())})
         except Exception as exc:
             workspace.discard()
             _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "failed", "error": str(exc), "started_at": now_iso(), **workspace_metadata})
             return self._workspace_stop(state, None, f"Agent runner failed before completion: {exc}", "RUNNER_FAILURE")
         changes = workspace.diff()
         workspace.record_diff(run_dir, changes)
-        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "completed", "started_at": result.started_at, "finished_at": result.finished_at, "exit_code": result.exit_code, "timed_out": result.timed_out, "runner_metadata": result.runner_metadata, "workspace_diff_count": len(changes), **workspace_metadata})
+        runner_metadata = dict(result.runner_metadata)
+        runner_metadata.setdefault("effective_cwd", str(workspace.path.resolve()))
+        runner_metadata.setdefault("authoritative_origin", str(Path(self.config.project_path).resolve()))
+        _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "completed", "started_at": result.started_at, "finished_at": result.finished_at, "exit_code": result.exit_code, "timed_out": result.timed_out, "runner_metadata": runner_metadata, "runner_argv": runner_metadata.get("argv", runner_metadata.get("command", "")), "sandbox_mode": runner_metadata.get("sandbox_mode", "unknown"), "workspace_diff_count": len(changes), **workspace_metadata})
         self.logger.emit("agent_run_finished", run_id=run_id, stage=stage, exit_code=result.exit_code, timed_out=result.timed_out, workspace_diff_count=len(changes))
-        if not workspace.real_unchanged():
-            authority_paths = self._authority_relative_paths()
-            before_tree = workspace.real_baseline.get("tree", {})
-            after_tree = workspace.current_real_fingerprint().get("tree", {})
-            changed_real = {path for path in set(before_tree) | set(after_tree) if before_tree.get(path) != after_tree.get(path)}
-            stop_code = "UNAUTHORIZED_AUTHORITY_MUTATION" if changed_real & authority_paths else "REAL_PROJECT_CHANGED_DURING_RUN"
-            return self._workspace_stop(state, workspace, f"{stop_code}: real project changed during Agent invocation", stop_code)
-        if authority_before != authority_snapshot(self.config, self.store):
+        drift = self._classify_real_drift(workspace, state, stage)
+        _write_json(run_dir / "real-drift.json", drift)
+        _write_json(run_dir / "metadata.json", {**_read_json(run_dir / "metadata.json"), "real_drift": drift})
+        blocking_drift = next((item for item in drift if item["classification"] in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
+        if blocking_drift:
+            # Keep the historical stop code for this invocation-time case;
+            # the persisted real_drift evidence carries the more precise
+            # CURRENT_TARGET_DRIFT classification.
+            stop_code = {"AUTHORITY_DRIFT": "UNAUTHORIZED_AUTHORITY_MUTATION", "ACCEPTED_UPSTREAM_DRIFT": "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT": "REAL_PROJECT_CHANGED_DURING_RUN"}[blocking_drift["classification"]]
+            return self._workspace_stop(state, workspace, f"{stop_code}: {blocking_drift['path']}", stop_code)
+        if authority_before != self._agent_authority_snapshot():
             return self._workspace_stop(state, workspace, "UNAUTHORIZED_AUTHORITY_MUTATION: authority changed during Agent invocation", "UNAUTHORIZED_AUTHORITY_MUTATION")
         valid, outcome, errors = validate_outcome(outcome_path, run_id, stage)
         if result.exit_code != 0 or result.timed_out:
@@ -411,8 +420,13 @@ class Orchestrator:
         changes = workspace.diff() if workspace and workspace.path.exists() else []
         if workspace:
             workspace.record_diff(run_dir, changes)
-            if not workspace.real_unchanged():
-                return self._workspace_stop(state, workspace, "REAL_PROJECT_CHANGED_DURING_RUN: real project changed before outcome reconciliation", "REAL_PROJECT_CHANGED_DURING_RUN")
+            drift = self._classify_real_drift(workspace, state, stage)
+            _write_json(run_dir / "real-drift.json", drift)
+            _write_json(run_dir / "metadata.json", {**metadata, "real_drift": drift})
+            blocking_drift = next((item for item in drift if item["classification"] in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
+            if blocking_drift:
+                stop_code = {"AUTHORITY_DRIFT": "UNAUTHORIZED_AUTHORITY_MUTATION", "ACCEPTED_UPSTREAM_DRIFT": "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT": "TARGET_DRIFT"}[blocking_drift["classification"]]
+                return self._workspace_stop(state, workspace, f"{stop_code}: {blocking_drift['path']}", stop_code)
         if stage in STRICT_WORKSPACE_STAGES and changes:
             return self._workspace_stop(state, workspace, f"workspace mutation is forbidden during {stage}", "WORKSPACE_MUTATION_VIOLATION")
         if stage in PROJECT_MUTATING_STAGES and outcome.get("verdict") == Verdict.APPROVED.value and changes:
@@ -456,6 +470,136 @@ class Orchestrator:
                 if path.resolve().is_relative_to(project):
                     paths.add(path.resolve().relative_to(project).as_posix())
         return paths
+
+    def _remote_human_guide_paths(self) -> set[str]:
+        """Return local Human Guide paths that are only draft counterparts of remote authority."""
+        project = Path(self.config.project_path).resolve()
+        remote_state = self.store.load_remote_state() or {}
+        remote_sources = remote_state.get("sources", {}) if isinstance(remote_state, dict) else {}
+        remote_ids: set[str] = set()
+        for sid, entry in (remote_sources or {}).items():
+            if isinstance(entry, dict) and isinstance(entry.get("snapshot_path"), str):
+                remote_ids.add(str(sid))
+        state = self.store.load()
+        if state:
+            for artifact in state.artifacts.values():
+                accepted_source = artifact.metadata.get("accepted_source") if isinstance(artifact.metadata, dict) else None
+                if artifact.kind == "HUMAN_GUIDE" and isinstance(accepted_source, dict) and accepted_source.get("kind") == "GIT_REMOTE":
+                    remote_ids.add(source_id(next((item for item in self.config.authoritative_sources if source_id(item) == "human-guide"), self.config.authoritative_sources[0])))
+        paths: set[str] = set()
+        for source in self.config.authoritative_sources:
+            sid = source_id(source)
+            role = (source.role or "").upper()
+            if sid not in remote_ids or not (role == "HUMAN_GUIDE" or sid == "human-guide" or "human" in source.path.lower() or "架构原理" in source.path):
+                continue
+            path = Path(source.path)
+            path = path if path.is_absolute() else project / path
+            try:
+                if path.resolve().is_relative_to(project):
+                    paths.add(path.resolve().relative_to(project).as_posix())
+            except (OSError, RuntimeError):
+                continue
+        return paths
+
+    def _accepted_upstream_paths(self, state: WorkflowState) -> set[str]:
+        """Return accepted local artifact paths that are pinned inputs, not drafts."""
+        project = Path(self.config.project_path).resolve()
+        _, paths = self._authority_paths_by_role()
+        paths -= self._remote_human_guide_paths()
+        for artifact in state.artifacts.values():
+            if artifact.status != ArtifactStatus.ACCEPTED.value or not artifact.accepted_path:
+                continue
+            path = Path(artifact.accepted_path)
+            path = path if path.is_absolute() else project / path
+            try:
+                if path.resolve().is_relative_to(project):
+                    paths.add(path.resolve().relative_to(project).as_posix())
+            except (OSError, RuntimeError):
+                continue
+        return paths
+
+    def _authority_paths_by_role(self) -> tuple[set[str], set[str]]:
+        """Separate Human Guide authority paths from accepted downstream inputs."""
+        project = Path(self.config.project_path).resolve()
+        authority: set[str] = set()
+        upstream: set[str] = set()
+
+        def add(raw: Any, role: str | None) -> None:
+            if not isinstance(raw, str):
+                return
+            path = Path(raw)
+            path = path if path.is_absolute() else project / path
+            try:
+                if not path.resolve().is_relative_to(project):
+                    return
+                relative = path.resolve().relative_to(project).as_posix()
+            except (OSError, RuntimeError):
+                return
+            if (role or "").upper() == "HUMAN_GUIDE":
+                authority.add(relative)
+            else:
+                upstream.add(relative)
+
+        for source in self.config.authoritative_sources:
+            role = source.role or ("HUMAN_GUIDE" if source_id(source) == "human-guide" else "ACCEPTED_UPSTREAM")
+            add(source.path, role)
+        ledger = self.store.load_authority_ledger() or {}
+        for entry in (ledger.get("sources", {}) or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            role = str(entry.get("role") or "ACCEPTED_UPSTREAM")
+            for key in ("path", "configured_path", "candidate_path"):
+                add(entry.get(key), role)
+        return authority, upstream
+
+    def _current_target_paths(self, state: WorkflowState, stage: str) -> tuple[str, ...]:
+        if stage not in PROJECT_MUTATING_STAGES:
+            return ()
+        task = self.config.task_at(state.current_group, state.current_task)
+        if not task:
+            return ()
+        return tuple(task.allowed_paths) + tuple(task.expected_outputs)
+
+    def _classify_real_drift(self, workspace: RunWorkspace, state: WorkflowState, stage: str) -> list[dict[str, Any]]:
+        """Classify only changes made to the real project after the fixed snapshot."""
+        local_draft = self._remote_human_guide_paths()
+        authority, _ = self._authority_paths_by_role()
+        upstream = self._accepted_upstream_paths(state)
+        targets = self._current_target_paths(state, stage)
+        result: list[dict[str, Any]] = []
+        for change in workspace.real_tree_diff():
+            path = str(change["path"])
+            if path in local_draft:
+                classification = "LOCAL_DRAFT_DRIFT"
+            elif path in authority:
+                classification = "AUTHORITY_DRIFT"
+            elif path in upstream:
+                classification = "ACCEPTED_UPSTREAM_DRIFT"
+            elif any(fnmatch.fnmatch(path, pattern) for pattern in targets):
+                classification = "CURRENT_TARGET_DRIFT"
+            else:
+                classification = "UNRELATED_CONCURRENT_DRIFT"
+            baseline = change.get("baseline") or {}
+            observed = change.get("observed") or {}
+            result.append({
+                "path": path,
+                "classification": classification,
+                "status": change.get("status"),
+                "baseline_sha256": baseline.get("sha256") if isinstance(baseline, dict) else None,
+                "observed_sha256": observed.get("sha256") if isinstance(observed, dict) else None,
+            })
+        return result
+
+    def _agent_authority_snapshot(self) -> dict[str, str]:
+        """Snapshot local authority files except remote Human Guide draft counterparts."""
+        snapshot = authority_snapshot(self.config, self.store)
+        remote_paths = self._remote_human_guide_paths()
+        for source in self.config.authoritative_sources:
+            path = Path(source.path)
+            path = path if path.is_absolute() else Path(self.config.project_path).resolve() / path
+            if ((source.role or "").upper() == "HUMAN_GUIDE" or source_id(source) == "human-guide") and path.resolve().is_relative_to(Path(self.config.project_path).resolve()) and path.resolve().relative_to(Path(self.config.project_path).resolve()).as_posix() in remote_paths:
+                snapshot.pop(source_id(source), None)
+        return snapshot
 
     def _apply_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         stage = state.current_stage
@@ -1201,8 +1345,9 @@ class Orchestrator:
         state = self._load_or_initialize()
         self.logger.emit("recovery_requested", stop_code=state.stop_code, blocked_stage=state.blocked_stage)
         legacy_recovery = (
-            state.recoverable
+            state.current_stage == Stage.HARD_STOP.value
             and state.stop_code == "UNEXPECTED_UNRELATED_CHANGE"
+            and state.run_id is not None
         )
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED"
         workflow_digest_recovery = (
@@ -1265,6 +1410,24 @@ class Orchestrator:
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="runner failure recovery does not match the last completed failed invocation")
                 raise OrchestratorError("runner failure recovery does not match the last completed failed invocation")
 
+        legacy_restored_stage = None
+        if legacy_recovery:
+            metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
+            workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+            if metadata.get("status") != "running" or workspace is None:
+                raise OrchestratorError("RECOVERY_UNCERTAIN: historical Agent metadata is incomplete")
+            if _agent_process_running(workspace.path):
+                raise OrchestratorError("RECOVERY_UNCERTAIN: Agent process is still running")
+            drift = self._classify_real_drift(workspace, state, str(metadata.get("stage") or Stage.AUTHORITY_CHANGE_ANALYSIS.value))
+            _write_json(self.store.run_dir(state.run_id) / "real-drift.json", drift)
+            blocking_drift = next((item for item in drift if item["classification"] in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
+            if blocking_drift:
+                raise OrchestratorError(f"{blocking_drift['classification']}: {blocking_drift['path']}")
+            workspace.discard()
+            metadata.update({"status": "failed", "finished_at": now_iso(), "error": "legacy unrelated drift stop explicitly recovered", "real_drift": drift})
+            _write_json(self.store.run_dir(state.run_id) / "metadata.json", metadata)
+            legacy_restored_stage = str(metadata.get("stage") or "") or None
+
         if interrupted_recovery:
             metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
             workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
@@ -1272,10 +1435,12 @@ class Orchestrator:
                 raise OrchestratorError("RECOVERY_UNCERTAIN: interrupted Agent metadata is incomplete")
             if _agent_process_running(workspace.path):
                 raise OrchestratorError("RECOVERY_UNCERTAIN: Agent process is still running")
-            if not workspace.real_unchanged():
-                raise OrchestratorError("REAL_PROJECT_CHANGED_DURING_RUN: interrupted Agent target drifted")
+            drift = self._classify_real_drift(workspace, state, str(metadata.get("stage") or state.blocked_stage or ""))
+            blocking_drift = next((item for item in drift if item["classification"] in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
+            if blocking_drift:
+                raise OrchestratorError(f"{blocking_drift['classification']}: {blocking_drift['path']}")
             workspace.discard()
-            metadata.update({"status": "failed", "finished_at": now_iso(), "exit_code": -1, "timed_out": False, "error": "interrupted Agent invocation explicitly recovered"})
+            metadata.update({"status": "failed", "finished_at": now_iso(), "exit_code": -1, "timed_out": False, "error": "interrupted Agent invocation explicitly recovered", "real_drift": drift})
             _write_json(self.store.run_dir(state.run_id) / "metadata.json", metadata)
 
         if schema_recovery:
@@ -1336,7 +1501,7 @@ class Orchestrator:
             if schema_recovery:
                 raise OrchestratorError(reason)
             return state
-        restored_stage = state.blocked_stage
+        restored_stage = legacy_restored_stage or state.blocked_stage
         if schema_recovery and restored_stage is None:
             restored_stage = self._latest_completed_stage()
         self.logger.emit("recovery_validation_passed", stop_code=state.stop_code, blocked_stage=restored_stage)

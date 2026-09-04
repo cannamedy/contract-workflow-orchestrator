@@ -161,6 +161,28 @@ class RunWorkspace:
         # through the project-root default for the common case.
         return self.current_real_fingerprint() == self.real_baseline
 
+    def real_tree_diff(self) -> list[dict[str, Any]]:
+        """Return file changes since invocation start, excluding CWO state."""
+        before = self.real_baseline.get("tree", {})
+        after = self.current_real_fingerprint().get("tree", {})
+        changes: list[dict[str, Any]] = []
+        for relative in sorted(set(before) | set(after)):
+            old = before.get(relative)
+            new = after.get(relative)
+            if old != new:
+                changes.append({
+                    "path": relative,
+                    "baseline": old,
+                    "observed": new,
+                    "status": "ADDED" if old is None else ("DELETED" if new is None else "MODIFIED"),
+                })
+        return changes
+
+    def target_unchanged(self, changes: list[dict[str, Any]]) -> bool:
+        """Check only candidate target preconditions, not unrelated files."""
+        current = tree_fingerprint(self.real_project, self.excluded_roots)
+        return all(current.get(str(change.get("path", ""))) == change.get("before") for change in changes)
+
     def diff(self) -> list[dict[str, Any]]:
         current = tree_fingerprint(self.path)
         changes: list[dict[str, Any]] = []
@@ -196,8 +218,8 @@ def apply_validated_diff(
     """Apply an already validated workspace diff with preconditions and rollback."""
     import fnmatch
 
-    if not workspace.real_unchanged():
-        raise TargetDriftError("real project changed before commit-back")
+    if not workspace.target_unchanged(changes):
+        raise TargetDriftError("commit-back target changed before commit-back")
     for change in changes:
         relative = str(change.get("path", ""))
         _safe_relative(relative)
@@ -257,15 +279,10 @@ def apply_validated_diff(
                     os.unlink(temporary)
             os.chmod(destination, stat.S_IMODE(source.stat().st_mode))
 
-        expected = dict(workspace.real_baseline.get("tree", {}))
-        for change in changes:
-            if change["status"] == "DELETED":
-                expected.pop(change["path"], None)
-            else:
-                expected[change["path"]] = change["after"]
         actual = tree_fingerprint(workspace.real_project, workspace.excluded_roots)
-        if actual != expected:
-            raise WorkspaceError("post-commit-back fingerprint mismatch")
+        for change in changes:
+            if actual.get(change["path"]) != change.get("after"):
+                raise WorkspaceError(f"post-commit-back fingerprint mismatch: {change['path']}")
     except Exception:
         for destination, backup in backups.items():
             try:

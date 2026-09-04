@@ -81,7 +81,7 @@ class WorkspaceIsolationTests(unittest.TestCase):
         os.environ.pop("CWO_STATE_DIR", None)
         self.temp.cleanup()
 
-    def config(self, *, authority: bool = False, authority_mutable: bool = False, broad_scope: bool = False):
+    def config(self, *, authority: bool = False, authority_mutable: bool = False, broad_scope: bool = False, upstream: bool = False):
         guide_sha = hashlib.sha256((self.project / "guide.md").read_bytes()).hexdigest()
         allowed_path = '"**"' if broad_scope else "src/a.py"
         lines = [
@@ -92,6 +92,11 @@ class WorkspaceIsolationTests(unittest.TestCase):
             lines.extend(['  - source_id: human-guide', '    role: HUMAN_GUIDE', '    path: guide.md', f'    sha256: {guide_sha}'])
             if authority_mutable:
                 lines.append('    mutable_after_start: true')
+        if upstream:
+            upstream_path = self.project / "contract.md"
+            upstream_path.write_text("accepted contract\n", encoding="utf-8")
+            upstream_sha = hashlib.sha256(upstream_path.read_bytes()).hexdigest()
+            lines.extend(['  - source_id: engineering-contract', '    role: ENGINEERING_SPEC', '    path: contract.md', f'    sha256: {upstream_sha}'])
         lines.extend([
             'skills: {}', 'runner:', '  type: mock', 'policy:',
             '  max_attempts_per_stage: 2', '  max_total_steps: 30', 'groups:',
@@ -175,6 +180,57 @@ class WorkspaceIsolationTests(unittest.TestCase):
         stopped = self.start_task(WorkspaceRunner(mutate, self.project)).step().state
         self.assertEqual(stopped.stop_code, "REAL_PROJECT_CHANGED_DURING_RUN")
         self.assertEqual((self.project / "src" / "a.py").read_text(), "user-change\n")
+
+    def test_unrelated_real_drift_during_agent_run_continues_and_is_preserved(self):
+        unrelated = self.project / "user-notes.txt"
+        def mutate(cwd, real):
+            (real / "user-notes.txt").write_text("concurrent\n", encoding="utf-8")
+        result = self.start_task(WorkspaceRunner(mutate, self.project)).step().state
+        self.assertEqual(result.current_stage, Stage.TASK_INDEPENDENT_REVIEW.value)
+        self.assertEqual(unrelated.read_text(), "concurrent\n")
+
+    def test_remote_human_guide_local_draft_drift_continues(self):
+        config = self.config(authority=True)
+        store = StateStore(self.state)
+        first = Orchestrator(config, store=store)
+        self.assertEqual(first.step().state.current_stage, Stage.TASK_EXECUTION.value)
+        snapshot = self.state / "authority" / "snapshots" / "remote" / "human-guide.md"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("submitted\n", encoding="utf-8")
+        store.save_remote_state({"sources": {"human-guide": {"snapshot_path": str(snapshot)}}})
+        runner = WorkspaceRunner(lambda cwd, real: (real / "guide.md").write_text("next local draft\n", encoding="utf-8"), self.project)
+        result = Orchestrator(config, store=store, runner=runner).step().state
+        self.assertEqual(result.current_stage, Stage.TASK_INDEPENDENT_REVIEW.value)
+        self.assertEqual((self.project / "guide.md").read_text(), "next local draft\n")
+
+    def test_accepted_upstream_drift_stops_current_invocation(self):
+        config = self.config(upstream=True)
+        store = StateStore(self.state)
+        orchestrator = Orchestrator(config, store=store)
+        self.assertEqual(orchestrator.step().state.current_stage, Stage.TASK_EXECUTION.value)
+        runner = WorkspaceRunner(lambda cwd, real: (real / "contract.md").write_text("bypassed\n", encoding="utf-8"), self.project)
+        stopped = Orchestrator(config, store=store, runner=runner).step().state
+        self.assertEqual(stopped.stop_code, "ACCEPTED_UPSTREAM_DRIFT")
+        self.assertEqual((self.project / "contract.md").read_text(), "bypassed\n")
+
+    def test_unrelated_drift_is_not_merged_into_next_workspace_baseline(self):
+        unrelated = self.project / "concurrent.txt"
+        workspace = RunWorkspace.create(self.project, self.state, "first")
+        unrelated.write_text("after first\n", encoding="utf-8")
+        workspace.discard()
+        next_workspace = RunWorkspace.create(self.project, self.state, "second")
+        self.assertEqual((next_workspace.path / "concurrent.txt").read_text(), "after first\n")
+        next_workspace.discard()
+
+    def test_allowed_change_with_unrelated_concurrent_drift_commits_only_target(self):
+        unrelated = self.project / "concurrent.txt"
+        def mutate(cwd, real):
+            (cwd / "src" / "a.py").write_text("patched\n", encoding="utf-8")
+            unrelated.write_text("preserve\n", encoding="utf-8")
+        result = self.start_task(WorkspaceRunner(mutate, self.project)).step().state
+        self.assertEqual(result.current_stage, Stage.TASK_INDEPENDENT_REVIEW.value)
+        self.assertEqual((self.project / "src" / "a.py").read_text(), "patched\n")
+        self.assertEqual(unrelated.read_text(), "preserve\n")
 
     def test_strict_analysis_mutation_is_discarded_and_real_candidate_is_unchanged(self):
         config = self.config(authority=True)
