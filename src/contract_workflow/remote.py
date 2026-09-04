@@ -239,7 +239,7 @@ def _rollover_pending_candidate(
         return None, None
     if state is not None:
         for artifact in state.artifacts.values():
-            if artifact.change_id == change_id and artifact.kind != "HUMAN_GUIDE" and artifact.accepted_hash:
+            if artifact.change_id == change_id and artifact.kind != "HUMAN_GUIDE" and artifact.status == "ACCEPTED" and artifact.accepted_hash:
                 return None, None
 
     revisions = list(change.get("candidate_revisions") or [])
