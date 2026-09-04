@@ -151,6 +151,38 @@ groups:
         self.assertEqual(recovered.workflow_digest, changed_config.digest)
         self.assertEqual(recovered.current_stage, Stage.INITIALIZING.value)
 
+    def test_runner_failure_recovery_retries_without_an_outcome_artifact(self):
+        config = self.workflow("autonomous")
+        store = StateStore(self.state)
+        run_id = "runner-failed"
+        run_dir = store.run_dir(run_id)
+        (run_dir / "metadata.json").write_text(json.dumps({
+            "run_id": run_id,
+            "stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            "status": "completed",
+            "finished_at": "2026-09-04T00:00:00+00:00",
+            "exit_code": 1,
+            "timed_out": False,
+        }), encoding="utf-8")
+        store.save(WorkflowState(
+            project=config.project_name,
+            project_path=config.project_path,
+            workflow_file=config.workflow_file,
+            workflow_digest=config.digest,
+            current_stage=Stage.HARD_STOP.value,
+            blocked_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            stop_code="RETRY_EXHAUSTED",
+            stop_reason="runner process failed with exit code 1",
+            recoverable=True,
+            status="HARD_STOPPED",
+            last_outcome={"verdict": Verdict.INVALID_OUTCOME.value, "summary": "runner process failed with exit code 1"},
+        ))
+
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertEqual(recovered.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
+
     def test_git_audit_classifies_expected_frozen_unrelated_and_conflict(self):
         config = self.workflow()
         expected = self.project / "expected.txt"

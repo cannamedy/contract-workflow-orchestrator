@@ -863,8 +863,9 @@ class Orchestrator:
 
     def _invalid_or_failed(self, state: WorkflowState, errors: list[str]) -> StepResult:
         self.logger.emit("outcome_invalid", run_id=state.run_id, stage=state.current_stage, errors=errors)
+        runner_failure = any(error.startswith("runner process failed") or error == "runner timed out" for error in errors)
         if state.attempt >= self.config.policy.max_attempts_per_stage:
-            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="; ".join(errors), stop_code="RETRY_EXHAUSTED", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
+            new_state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="; ".join(errors), stop_code="RETRY_EXHAUSTED", blocked_stage=state.current_stage, recoverable=runner_failure, updated_at=now_iso())
             self.logger.emit("hard_stop_entered", reason=new_state.stop_reason)
             return StepResult(self._save(new_state), "hard_stop")
         delay = min(self.config.policy.retry_max_delay_seconds, self.config.policy.retry_backoff_seconds * (2 ** max(0, state.attempt - 1)))
@@ -1169,7 +1170,14 @@ class Orchestrator:
             and state.current_stage == Stage.HARD_STOP.value
             and state.run_id is None
         )
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or schema_recovery or workflow_digest_recovery):
+        runner_recovery = (
+            state.recoverable
+            and state.stop_code == "RETRY_EXHAUSTED"
+            and isinstance(state.last_outcome, dict)
+            and str(state.last_outcome.get("summary", "")).startswith(("runner process failed", "runner timed out"))
+        )
+        schema_recovery = state.stop_code == "RETRY_EXHAUSTED" and not runner_recovery
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
@@ -1201,6 +1209,16 @@ class Orchestrator:
             )
             self.logger.emit("hard_stop_recovered", stop_code="WORKFLOW_DIGEST_CHANGED", restored_stage=restored_stage)
             return self._save(recovered)
+
+        if runner_recovery:
+            records = [_read_json(path) for path in self.store.runs_path.glob("*/metadata.json")]
+            if any(record.get("status") == "running" for record in records):
+                self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="RECOVERY_UNCERTAIN: an Agent invocation is still running")
+                raise OrchestratorError("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+            latest = max(records, key=lambda record: (str(record.get("finished_at") or record.get("started_at") or ""), str(record.get("run_id") or "")), default={})
+            if latest.get("stage") != state.blocked_stage or latest.get("status") != "completed" or (latest.get("exit_code", 0) == 0 and latest.get("timed_out") is not True):
+                self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="runner failure recovery does not match the last completed failed invocation")
+                raise OrchestratorError("runner failure recovery does not match the last completed failed invocation")
 
         if schema_recovery:
             late_outcome, late_errors, late_detected = self._late_outcome_check(state)
