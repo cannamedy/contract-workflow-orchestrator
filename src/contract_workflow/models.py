@@ -414,6 +414,7 @@ class HumanDecision:
     source_change: str = ""
     source_stage: str = ""
     source_artifact_id: str = ""
+    source_candidate_hash: str | None = None
     affected_requirements: tuple[str, ...] = ()
     affected_contract_anchors: tuple[str, ...] = ()
     affected_tasks: tuple[str, ...] = ()

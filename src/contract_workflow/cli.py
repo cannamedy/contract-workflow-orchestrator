@@ -13,7 +13,7 @@ from .state_store import StateStore
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.7.0")
+    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.7.1")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)
@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         store = StateStore(state_root(project))
         if args.authority_command == "check":
             result = check_remote_authority(config, store, store.load(), dry_run=args.dry_run)
-            _dump({"status": result.status, "changed": result.changed, "snapshot": result.snapshot.to_dict() if result.snapshot else None, "change": result.new_change, "errors": list(result.errors), "dry_run": args.dry_run})
+            _dump({"status": result.status, "changed": result.changed, "snapshot": result.snapshot.to_dict() if result.snapshot else None, "change": result.new_change, "rollover": result.rollover, "errors": list(result.errors), "dry_run": args.dry_run})
             return 0 if not result.errors else 1
         if args.interval <= 0:
             print("cwo: --interval must be positive", file=sys.stderr)
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             while True:
                 result = check_remote_authority(config, store, store.load(), dry_run=args.dry_run)
-                _dump({"status": result.status, "changed": result.changed, "snapshot": result.snapshot.to_dict() if result.snapshot else None, "change": result.new_change, "errors": list(result.errors), "dry_run": args.dry_run})
+                _dump({"status": result.status, "changed": result.changed, "snapshot": result.snapshot.to_dict() if result.snapshot else None, "change": result.new_change, "rollover": result.rollover, "errors": list(result.errors), "dry_run": args.dry_run})
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             return 0

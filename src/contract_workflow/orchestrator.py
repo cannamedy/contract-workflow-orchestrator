@@ -159,12 +159,26 @@ class Orchestrator:
             and str(change.get("classification", "")) not in {"C0", "C1"}
         )
 
+    @staticmethod
+    def _human_guide_decision_id(change: dict[str, Any]) -> str:
+        """Bind a promotion Decision to the exact candidate revision.
+
+        The original 0.7 identifier remains compatible for first revisions;
+        rolled-over candidates receive a content-derived suffix so historical
+        Decisions can never be mistaken for approval of a later revision.
+        """
+        base = f"ADR-HUMAN-GUIDE-PROMOTION-{change['change_id']}"
+        if int(change.get("candidate_revision_number", 1) or 1) > 1:
+            candidate = str(change.get("candidate_sha256", ""))
+            return f"{base}-{candidate[:12].upper()}"
+        return base
+
     def _human_guide_promotion_request(self, change: dict[str, Any]) -> dict[str, Any]:
         candidate = str(change.get("candidate_sha256", ""))
         commit = str(change.get("candidate_commit", ""))
         blob = str(change.get("candidate_blob_sha", ""))
         return {
-            "decision_id": f"ADR-HUMAN-GUIDE-PROMOTION-{change['change_id']}",
+            "decision_id": self._human_guide_decision_id(change),
             "category": "AUTHORITY_PROMOTION",
             "question": f"Approve Human Guide revision {candidate} as the accepted PAIS Architecture Authority?",
             "context": (
@@ -185,6 +199,7 @@ class Orchestrator:
             "source_change": change["change_id"],
             "source_stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value,
             "source_artifact_id": "human-guide",
+            "source_candidate_hash": candidate,
             "affected_requirements": change.get("affected_requirements", []),
             "affected_contract_anchors": change.get("affected_contract_anchors", []),
             "affected_tasks": change.get("directly_affected_tasks", []),
@@ -217,7 +232,7 @@ class Orchestrator:
         }):
             return state
 
-        decision_id = f"ADR-HUMAN-GUIDE-PROMOTION-{change_id}"
+        decision_id = self._human_guide_decision_id(change)
         decisions = dict(state.decisions)
         old_id = propagation.get("promotion_decision_id") or f"ADR-AUTHORITY-PROMOTION-{change_id}"
         old = decisions.get(str(old_id))
@@ -347,7 +362,7 @@ class Orchestrator:
         gate_required = self._typed_human_gate_required(change)
         decision_id = f"ADR-HUMAN-GUIDE-PROMOTION-{change_id}"
         decisions = dict(state.decisions)
-        if gate_required and decision_id not in decisions:
+        if gate_required and (decision_id not in decisions or decisions[decision_id].status != DecisionStatus.PENDING.value):
             request = self._human_guide_promotion_request(change)
             decision = HumanDecision(**request)
             decisions[decision_id] = decision
@@ -1518,6 +1533,7 @@ class Orchestrator:
                 "source_change": raw.get("source_change", outcome.get("source_change", "")),
                 "source_stage": raw.get("source_stage", outcome.get("source_stage", state.current_stage)),
                 "source_artifact_id": raw.get("source_artifact_id", outcome.get("source_artifact_id", "")),
+                "source_candidate_hash": raw.get("source_candidate_hash", outcome.get("source_candidate_hash")),
                 "affected_requirements": tuple(raw.get("affected_requirements", outcome.get("affected_requirements", ())) or ()),
                 "affected_contract_anchors": tuple(raw.get("affected_contract_anchors", outcome.get("affected_contract_anchors", ())) or ()),
                 "affected_tasks": tuple(raw.get("affected_tasks", outcome.get("affected_tasks", direct)) or ()),

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from contract_workflow.config import load_workflow
-from contract_workflow.models import WorkflowState
+from contract_workflow.models import HumanDecision, WorkflowState
 from contract_workflow.remote import (
     NEWER_REMOTE_REVISION_AVAILABLE,
     REMOTE_AUTHORITY_SOURCE_MISSING,
@@ -98,6 +98,64 @@ class RemoteAuthorityTests(unittest.TestCase):
         newer = check_remote_authority(self.config, self.store, self.state)
         self.assertEqual(newer.status, NEWER_REMOTE_REVISION_AVAILABLE)
         self.assertEqual(len(list(self.store.authority_changes_path.glob("CR-*.json"))), 1)
+
+    def test_unaccepted_candidate_rolls_over_in_same_change_and_preserves_history(self):
+        check_remote_authority(self.config, self.store, self.state)
+        self._remote_commit(guide="R2\n", message="guide R2")
+        first = check_remote_authority(self.config, self.store, self.state)
+        change_id = first.new_change["change_id"]
+        old_hash = first.new_change["candidate_sha256"]
+        old_decision = HumanDecision(
+            decision_id=f"ADR-HUMAN-GUIDE-PROMOTION-{change_id}",
+            category="AUTHORITY_PROMOTION", question=f"Approve revision {old_hash}?",
+            source_change=change_id, source_artifact_id="human-guide", source_candidate_hash=old_hash,
+        )
+        self.state.decisions[old_decision.decision_id] = old_decision
+        self.store.save_decision(old_decision)
+
+        self._remote_commit(guide="R3\n", message="guide R3")
+        rolled = check_remote_authority(self.config, self.store, self.state)
+        self.assertEqual(rolled.status, NEWER_REMOTE_REVISION_AVAILABLE)
+        self.assertEqual(rolled.rollover["change_id"], change_id)
+        change = json.loads((self.store.authority_changes_path / f"{change_id}.json").read_text())
+        revisions = {item["content_sha256"]: item for item in change["candidate_revisions"]}
+        new_hash = rolled.snapshot.content_sha256
+        self.assertEqual(len(revisions), 2)
+        self.assertEqual(revisions[old_hash]["status"], "SUPERSEDED")
+        self.assertEqual(revisions[old_hash]["superseded_reason"], "NEWER_HUMAN_AUTHORITY_SUBMISSION")
+        self.assertEqual(revisions[new_hash]["status"], "ACTIVE")
+        self.assertEqual(change["candidate_sha256"], new_hash)
+        self.assertEqual(change["base_sha256"], self.old_sha)
+        superseded = HumanDecision.from_dict(json.loads((self.store.decisions_path / f"{old_decision.decision_id}.json").read_text()))
+        self.assertEqual(superseded.status, "SUPERSEDED")
+        self.assertIn(new_hash[:12].upper(), superseded.superseded_by)
+        self.assertEqual(superseded.question, old_decision.question)
+
+        repeated = check_remote_authority(self.config, self.store, self.state)
+        self.assertEqual(repeated.status, "CHANGE_PENDING")
+        self.assertIsNone(repeated.rollover)
+        change_again = json.loads((self.store.authority_changes_path / f"{change_id}.json").read_text())
+        self.assertEqual(len(change_again["candidate_revisions"]), 2)
+
+    def test_accepted_candidate_starts_new_change_instead_of_rollover(self):
+        check_remote_authority(self.config, self.store, self.state)
+        self._remote_commit(guide="R2\n", message="guide R2")
+        first = check_remote_authority(self.config, self.store, self.state)
+        ledger = json.loads(self.store.authority_ledger_path.read_text())
+        entry = ledger["sources"]["human-guide"]
+        entry.update({
+            "accepted_remote_commit": entry["candidate_remote_commit"],
+            "accepted_remote_blob": entry["candidate_remote_blob"],
+            "accepted_content_sha256": entry["candidate_content_sha256"],
+            "accepted_sha256": entry["candidate_sha256"],
+            "status": "ACCEPTED",
+        })
+        self.store.save_authority_ledger(ledger)
+        self._remote_commit(guide="R3\n", message="guide R3")
+        result = check_remote_authority(self.config, self.store, self.state)
+        self.assertEqual(result.status, "AUTHORITY_CHANGE_DETECTED")
+        self.assertNotEqual(result.new_change["change_id"], first.new_change["change_id"])
+        self.assertEqual(len(list(self.store.authority_changes_path.glob("CR-*.json"))), 2)
 
     def test_unrelated_commit_during_pending_candidate_does_not_report_new_change(self):
         check_remote_authority(self.config, self.store, self.state)

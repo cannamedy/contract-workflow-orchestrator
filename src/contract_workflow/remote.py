@@ -8,12 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import AuthoritativeSource, WorkflowConfig, WorkflowState
+from .models import AuthoritativeSource, DecisionStatus, HumanDecision, WorkflowConfig, WorkflowState
 
 
 REMOTE_CHECK_FAILED = "REMOTE_CHECK_FAILED"
 REMOTE_AUTHORITY_SOURCE_MISSING = "REMOTE_AUTHORITY_SOURCE_MISSING"
 NEWER_REMOTE_REVISION_AVAILABLE = "NEWER_REMOTE_REVISION_AVAILABLE"
+NEWER_HUMAN_AUTHORITY_SUBMISSION = "NEWER_HUMAN_AUTHORITY_SUBMISSION"
+CANDIDATE_REVISION_SUPERSEDED = "CANDIDATE_REVISION_SUPERSEDED"
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class RemoteCheck:
     snapshot: RemoteAuthoritySnapshot | None
     changed: bool = False
     new_change: dict[str, Any] | None = None
+    rollover: dict[str, Any] | None = None
     errors: tuple[str, ...] = ()
     status: str = "NO_CHANGE"
 
@@ -101,9 +104,210 @@ def _snapshot_file(store: Any, commit: str, source: AuthoritativeSource, content
     return path
 
 
+def _revision_id(commit: str, blob: str | None, content_sha: str | None) -> str:
+    """Return a stable, storage-safe identity for one submitted revision."""
+    value = f"{commit}:{blob or ''}:{content_sha or ''}"
+    return f"REV-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:16].upper()}"
+
+
+def _candidate_revision(snapshot: RemoteAuthoritySnapshot, *, status: str, supersedes: str | None = None) -> dict[str, Any]:
+    return {
+        "revision_id": _revision_id(snapshot.commit_sha, snapshot.git_blob_sha, snapshot.content_sha256),
+        "remote_commit": snapshot.commit_sha,
+        "git_blob_sha": snapshot.git_blob_sha,
+        "content_sha256": snapshot.content_sha256,
+        "snapshot_path": snapshot.snapshot_path,
+        "observed_at": snapshot.observed_at,
+        "status": status,
+        "supersedes": supersedes,
+        "superseded_by": None,
+        "superseded_reason": None,
+    }
+
+
+def _historical_candidate_revision(change: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+    content_sha = change.get("candidate_sha256") or entry.get("candidate_content_sha256") or entry.get("candidate_sha256")
+    commit = change.get("candidate_commit") or entry.get("candidate_remote_commit")
+    blob = change.get("candidate_blob_sha") or entry.get("candidate_remote_blob") or entry.get("candidate_authority_blob")
+    snapshot_path = change.get("candidate_snapshot_path") or entry.get("candidate_snapshot_path")
+    if not all(isinstance(item, str) and item for item in (content_sha, commit, blob, snapshot_path)):
+        return None
+    revision_id = _revision_id(commit, blob, content_sha)
+    analysis_keys = (
+        "classification", "semantic_change", "affected_requirements", "affected_contract_anchors",
+        "directly_affected_tasks", "dependency_affected_tasks", "unaffected_tasks",
+        "machine_resolvable", "human_decision_required", "human_decision_requests",
+        "required_propagation", "affected_artifacts", "directly_affected_artifacts",
+        "dependency_affected_artifacts", "analysis_summary", "analyzed_at",
+    )
+    analysis = {key: change[key] for key in analysis_keys if key in change}
+    revision: dict[str, Any] = {
+        "revision_id": revision_id,
+        "remote_commit": commit,
+        "git_blob_sha": blob,
+        "content_sha256": content_sha,
+        "snapshot_path": snapshot_path,
+        "observed_at": change.get("detected_at"),
+        "status": "ACTIVE",
+        "supersedes": None,
+        "superseded_by": None,
+        "superseded_reason": None,
+    }
+    if analysis:
+        revision["analysis_evidence"] = analysis
+    if change.get("review_evidence") is not None:
+        revision["review_evidence"] = change["review_evidence"]
+    if change.get("review_status") is not None:
+        revision["review_status"] = change["review_status"]
+    return revision
+
+
+def _decision_candidate_hash(decision: HumanDecision) -> str | None:
+    if decision.source_candidate_hash:
+        return decision.source_candidate_hash
+    match = re.search(r"(?:revision|SHA256)\s*[=:]?\s*([0-9a-f]{64})", f"{decision.question} {decision.context}", re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def _supersede_candidate_decisions(store: Any, state: WorkflowState | None, change_id: str, old_hash: str, new_decision_id: str) -> list[str]:
+    """Supersede only pending Decisions bound to the replaced candidate."""
+    decisions: dict[str, HumanDecision] = {}
+    if state is not None:
+        decisions.update(state.decisions)
+    if store.decisions_path.exists():
+        for path in store.decisions_path.glob("*.json"):
+            try:
+                value = __import__("json").loads(path.read_text(encoding="utf-8"))
+                decision = HumanDecision.from_dict(value)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            decisions[decision.decision_id] = decision
+    superseded: list[str] = []
+    for decision_id, decision in decisions.items():
+        if decision.status != DecisionStatus.PENDING.value or decision.source_change != change_id:
+            continue
+        if (_decision_candidate_hash(decision) or "").lower() != old_hash.lower():
+            continue
+        updated = __import__("dataclasses").replace(
+            decision,
+            status=DecisionStatus.SUPERSEDED.value,
+            superseded_by=new_decision_id,
+            superseded_reason=CANDIDATE_REVISION_SUPERSEDED,
+        )
+        store.save_decision(updated)
+        if state is not None:
+            state.decisions[decision_id] = updated
+        superseded.append(decision_id)
+    return sorted(set(superseded))
+
+
+def _load_change(store: Any, change_id: str) -> dict[str, Any] | None:
+    path = store.authority_changes_path / f"{change_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        value = __import__("json").loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _rollover_pending_candidate(
+    config: WorkflowConfig,
+    source: AuthoritativeSource,
+    entry: dict[str, Any],
+    snapshot: RemoteAuthoritySnapshot,
+    store: Any,
+    state: WorkflowState | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Replace an unaccepted remote candidate without replacing its evidence."""
+    change_id = entry.get("change_id")
+    if not isinstance(change_id, str) or not change_id:
+        return None, None
+    change = _load_change(store, change_id)
+    if not change:
+        return None, None
+    old_hash = str(change.get("candidate_sha256") or entry.get("candidate_content_sha256") or entry.get("candidate_sha256") or "")
+    accepted_hash = str(entry.get("accepted_content_sha256") or entry.get("accepted_sha256") or source.sha256)
+    if not old_hash or old_hash.lower() == str(snapshot.content_sha256 or "").lower():
+        return change, None
+    if old_hash.lower() == accepted_hash.lower() or str(entry.get("status")) == "ACCEPTED":
+        # An accepted candidate starts a new AuthorityChange; it is never
+        # rolled over inside the already accepted change.
+        return None, None
+    if str(change.get("source_path")) not in {source.path, str(change.get("configured_source_path"))} and str(change.get("configured_source_path")) != source.path:
+        return None, None
+    if state is not None:
+        for artifact in state.artifacts.values():
+            if artifact.change_id == change_id and artifact.kind != "HUMAN_GUIDE" and artifact.accepted_hash:
+                return None, None
+
+    revisions = list(change.get("candidate_revisions") or [])
+    old_revision = next((item for item in revisions if isinstance(item, dict) and str(item.get("content_sha256")).lower() == old_hash.lower()), None)
+    if old_revision is None:
+        old_revision = _historical_candidate_revision(change, entry)
+    if old_revision is None:
+        return None, None
+    old_revision = {**old_revision, "status": "SUPERSEDED", "superseded_by": _revision_id(snapshot.commit_sha, snapshot.git_blob_sha, snapshot.content_sha256), "superseded_reason": NEWER_HUMAN_AUTHORITY_SUBMISSION}
+    revisions = [item for item in revisions if not (isinstance(item, dict) and str(item.get("content_sha256")).lower() == old_hash.lower())]
+    new_revision = _candidate_revision(snapshot, status="ACTIVE", supersedes=old_revision["revision_id"])
+    revisions.extend([old_revision, new_revision])
+    revision_number = len(revisions)
+    new_decision_id = f"ADR-HUMAN-GUIDE-PROMOTION-{change_id}-{str(snapshot.content_sha256)[:12].upper()}"
+    superseded_decisions = _supersede_candidate_decisions(store, state, change_id, old_hash, new_decision_id)
+    updated = dict(change)
+    updated.update({
+        "candidate_sha256": snapshot.content_sha256,
+        "candidate_commit": snapshot.commit_sha,
+        "candidate_blob_sha": snapshot.git_blob_sha,
+        "candidate_snapshot_path": snapshot.snapshot_path,
+        "candidate_revision_id": new_revision["revision_id"],
+        "candidate_revision_number": revision_number,
+        "candidate_revisions": revisions,
+        "classification": None,
+        "semantic_change": None,
+        "affected_requirements": [],
+        "affected_contract_anchors": [],
+        "directly_affected_tasks": [],
+        "dependency_affected_tasks": [],
+        "unaffected_tasks": [],
+        "machine_resolvable": None,
+        "human_decision_required": None,
+        "human_decision_requests": [],
+        "required_propagation": [],
+        "affected_artifacts": [],
+        "directly_affected_artifacts": [],
+        "dependency_affected_artifacts": [],
+        "analysis_summary": "",
+        "status": "CHANGE_PENDING",
+        "analysis_required": True,
+        "analysis_revision_id": new_revision["revision_id"],
+        "rollover": {
+            "from_revision_id": old_revision["revision_id"],
+            "to_revision_id": new_revision["revision_id"],
+            "reason": NEWER_HUMAN_AUTHORITY_SUBMISSION,
+            "superseded_decision_ids": superseded_decisions,
+            "new_decision_id": new_decision_id,
+            "rolled_over_at": snapshot.observed_at,
+        },
+    })
+    store.save_authority_change(updated)
+    rollover = {
+        "change_id": change_id,
+        "old_candidate_sha256": old_hash,
+        "new_candidate_sha256": snapshot.content_sha256,
+        "old_revision_id": old_revision["revision_id"],
+        "new_revision_id": new_revision["revision_id"],
+        "superseded_decision_ids": superseded_decisions,
+        "new_decision_id": new_decision_id,
+    }
+    return updated, rollover
+
+
 def _new_change(config: WorkflowConfig, source: AuthoritativeSource, entry: dict[str, Any], snapshot: RemoteAuthoritySnapshot, store: Any) -> dict[str, Any]:
     import uuid
     change_id = f"CR-{uuid.uuid4().hex[:8].upper()}"
+    candidate_revision = _candidate_revision(snapshot, status="ACTIVE")
     value = {
         "schema_version": "1.0", "change_id": change_id, "source_id": source.source_id or "human-guide",
         "source_path": source.path, "configured_source_path": source.path, "source_role": source.role or "HUMAN_GUIDE",
@@ -116,6 +320,8 @@ def _new_change(config: WorkflowConfig, source: AuthoritativeSource, entry: dict
         "affected_contract_anchors": [], "directly_affected_tasks": [], "dependency_affected_tasks": [],
         "unaffected_tasks": [], "machine_resolvable": None, "human_decision_required": None,
         "human_decision_requests": [], "required_propagation": [], "analysis_summary": "", "status": "CHANGE_PENDING",
+        "candidate_revision_id": candidate_revision["revision_id"], "candidate_revision_number": 1,
+        "candidate_revisions": [candidate_revision],
     }
     store.save_authority_change(value)
     return value
@@ -196,13 +402,35 @@ def check_remote_authority(config: WorkflowConfig, store: Any, state: WorkflowSt
             store.save_authority_ledger(ledger)
             store.save_remote_state(remote_state)
             return RemoteCheck(snapshot, status="CHANGE_PENDING")
+        rolled_change, rollover = _rollover_pending_candidate(config, source, ledger_entry, snapshot, store, state)
+        if rolled_change is not None and rollover is not None:
+            if state is not None:
+                state.authority_changes[rollover["change_id"]] = rolled_change
+            ledger_entry.update({
+                "candidate_remote_commit": commit,
+                "candidate_remote_blob": blob,
+                "candidate_authority_blob": blob,
+                "candidate_content_sha256": content_sha,
+                "candidate_sha256": content_sha,
+                "candidate_snapshot_path": snapshot_path,
+                "candidate_revision_id": rollover["new_revision_id"],
+                "candidate_revision_number": len(rolled_change.get("candidate_revisions", [])),
+                "candidate_revisions": rolled_change.get("candidate_revisions", []),
+                "status": "CHANGE_PENDING",
+            })
+            remote_sources[sid]["status"] = "CHANGE_PENDING"
+            store.save_authority_ledger(ledger)
+            store.save_remote_state(remote_state)
+            if state is not None and store.state_path.is_file():
+                store.save(state)
+            return RemoteCheck(snapshot, changed=True, rollover=rollover, status=NEWER_REMOTE_REVISION_AVAILABLE)
         ledger_entry.update({"newer_remote_commit": commit, "newer_remote_blob": blob, "newer_remote_content_sha256": content_sha, "status": "NEWER_REMOTE_REVISION_AVAILABLE"})
         remote_sources[sid]["status"] = "NEWER_REMOTE_REVISION_AVAILABLE"
         store.save_authority_ledger(ledger)
         store.save_remote_state(remote_state)
         return RemoteCheck(snapshot, changed=True, status=NEWER_REMOTE_REVISION_AVAILABLE)
     change = _new_change(config, source, ledger_entry, snapshot, store)
-    ledger_entry.update({"path": source.path, "configured_path": source.path, "candidate_path": source.path, "candidate_snapshot_path": snapshot_path, "candidate_remote_commit": commit, "candidate_remote_blob": blob, "candidate_authority_blob": blob, "candidate_content_sha256": content_sha, "candidate_sha256": content_sha, "change_id": change["change_id"], "status": "CHANGE_PENDING", "last_enqueued_authority_blob": blob})
+    ledger_entry.update({"path": source.path, "configured_path": source.path, "candidate_path": source.path, "candidate_snapshot_path": snapshot_path, "candidate_remote_commit": commit, "candidate_remote_blob": blob, "candidate_authority_blob": blob, "candidate_content_sha256": content_sha, "candidate_sha256": content_sha, "candidate_revisions": change.get("candidate_revisions", []), "candidate_revision_id": change.get("candidate_revision_id"), "candidate_revision_number": 1, "change_id": change["change_id"], "status": "CHANGE_PENDING", "last_enqueued_authority_blob": blob})
     remote_sources[sid]["status"] = "CHANGE_PENDING"
     store.save_authority_ledger(ledger)
     store.save_remote_state(remote_state)

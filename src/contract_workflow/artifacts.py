@@ -238,12 +238,27 @@ def hydrate_external_artifacts(config: WorkflowConfig, state: WorkflowState, sto
             continue
         candidate = projected.get(spec.id)
         current = artifacts.get(spec.id)
-        if not candidate or candidate.status != ArtifactStatus.ACCEPTED.value:
+        if not candidate:
             continue
-        if current is None or current.status in {ArtifactStatus.MISSING.value, ArtifactStatus.ACCEPTED.value}:
-            if current is None or current.to_dict() != candidate.to_dict():
-                artifacts[spec.id] = candidate
-                changed = True
+        # An unaccepted remote revision may roll over an existing candidate
+        # under the same Change Record.  Refresh only the external Human Guide
+        # projection; never read the local draft or alter downstream content.
+        candidate_revision = candidate.candidate_hash or candidate.accepted_hash
+        candidate_changed = current is not None and current.candidate_hash != candidate_revision
+        pending_projection = candidate.status == ArtifactStatus.PROMOTION_READY.value
+        eligible = current is None or current.status in {ArtifactStatus.MISSING.value, ArtifactStatus.ACCEPTED.value} or (pending_projection and candidate_changed)
+        if eligible and (current is None or current.to_dict() != candidate.to_dict()):
+            if current is not None and candidate_changed:
+                candidate.metadata = {
+                    **candidate.metadata,
+                    "superseded_candidate": {
+                        "candidate_hash": current.candidate_hash,
+                        "candidate_path": current.candidate_path,
+                        "change_id": current.change_id,
+                    },
+                }
+            artifacts[spec.id] = candidate
+            changed = True
     return state if not changed else replace(state, artifacts=artifacts)
 
 
