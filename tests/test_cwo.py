@@ -16,7 +16,7 @@ from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
 from contract_workflow.runners import CodexCliRunner, MockRunner
-from contract_workflow.runners.codex_cli import _bind_execution_directory
+from contract_workflow.runners.codex_cli import _bind_execution_directory, _ensure_workspace_execution_flags
 from contract_workflow.state_machine import transition_after_outcome
 from contract_workflow.state_store import StateStore, StateStoreError
 from contract_workflow.workspace import RunWorkspace
@@ -387,6 +387,14 @@ groups:
         command = ["codex", "exec", "-C", str(self.project), "-"]
         workspace = self.root / "state" / "workspaces" / "run" / "project"
         self.assertEqual(_bind_execution_directory(command, workspace)[3], str(workspace))
+
+    def test_codex_workspace_flags_are_inserted_before_stdin_prompt(self):
+        command = _ensure_workspace_execution_flags(["codex", "exec", "-C", "/shadow", "-"])
+        self.assertIn("--skip-git-repo-check", command)
+        self.assertEqual(command[-1], "-")
+        self.assertIn("--sandbox", command)
+        self.assertIn("danger-full-access", command)
+        self.assertLess(command.index("--skip-git-repo-check"), command.index("-"))
 
     def test_plan_task_defect_e2e_stops_at_plan_freeze(self):
         outcomes = "    TASK_EXECUTION: {verdict: APPROVED}\n    TASK_INDEPENDENT_REVIEW: {verdict: PLAN_TASK_DEFECT}\n    PLAN_DEFECT_RESOLUTION: {verdict: APPROVED}\n    PLAN_REVISION_REVIEW: {verdict: APPROVED}\n    FINAL_VERIFICATION: {verdict: COMPLETED}\n"

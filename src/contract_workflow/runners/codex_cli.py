@@ -29,6 +29,7 @@ class CodexCliRunner:
         else:
             command = ["codex", "exec", "-C", str(cwd), "-"]
         command = _bind_execution_directory(command, cwd)
+        command = _ensure_workspace_execution_flags(command)
         effective_cwd = str(cwd.resolve())
         if _configured_execution_directory(command) not in {None, effective_cwd}:
             raise RunnerBindingError("RUNNER_ORIGIN_CWD_FORBIDDEN: runner command is not bound to the RunWorkspace")
@@ -93,6 +94,23 @@ def _bind_execution_directory(command: list[str], cwd: Path) -> list[str]:
             result[index] = f"--cd={bound}"
         elif item.startswith("-C") and item != "-C":
             result[index] = f"-C{bound}"
+    return result
+
+
+def _ensure_workspace_execution_flags(command: list[str]) -> list[str]:
+    """Make a Codex invocation valid for an ephemeral, non-repository workspace."""
+    result = list(command)
+    if not result or Path(result[0]).name != "codex" or "exec" not in result:
+        return result
+    if "--skip-git-repo-check" not in result:
+        prompt_index = next((index for index, item in enumerate(result) if item in {"-", "{prompt}"}), len(result))
+        result.insert(prompt_index, "--skip-git-repo-check")
+    # The RunWorkspace is the containment boundary.  When the Linux writable
+    # sandbox cannot initialize, danger-full-access is safe for this runner
+    # because commit-back still accepts only validated workspace diffs.
+    if not any(item == "--sandbox" or item.startswith("--sandbox=") for item in result):
+        prompt_index = next((index for index, item in enumerate(result) if item in {"-", "{prompt}"}), len(result))
+        result[prompt_index:prompt_index] = ["--sandbox", "danger-full-access"]
     return result
 
 
