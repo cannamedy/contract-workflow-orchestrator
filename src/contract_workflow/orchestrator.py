@@ -139,6 +139,17 @@ class Orchestrator:
         return self.store.load() or initial_state(self.config, self.store)
 
     def _authority_gate(self, state: WorkflowState) -> StepResult | None:
+        # A persisted terminal stop is authoritative for this run.  In
+        # particular, do not let a newly observed authority candidate reopen
+        # a WORKFLOW_DIGEST_CHANGED (or other terminal) stop on every loop.
+        # Recovery/approval must explicitly move a recoverable state forward.
+        if state.status in {
+            WorkflowStatus.HARD_STOPPED.value,
+            WorkflowStatus.FAILED.value,
+            WorkflowStatus.STOPPED.value,
+            WorkflowStatus.COMPLETED.value,
+        }:
+            return None
         scan = scan_authority_changes(self.config, self.store, state)
         hydrated = hydrate_external_artifacts(self.config, state, self.store)
         if hydrated.artifacts != state.artifacts:
