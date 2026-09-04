@@ -424,6 +424,8 @@ class HumanDecision:
     decision: Any = None
     decision_rationale: str | None = None
     adr_id: str | None = None
+    superseded_by: str | None = None
+    superseded_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = self.__dict__.copy()

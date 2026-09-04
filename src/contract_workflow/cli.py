@@ -13,7 +13,7 @@ from .state_store import StateStore
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.6.4")
+    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.7.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)

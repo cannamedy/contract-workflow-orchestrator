@@ -251,9 +251,12 @@ class ArtifactPipelineTests(unittest.TestCase):
             "git_blob_sha": "blob-r2", "content_sha256": new_hash, "snapshot_path": str(new_snapshot),
         }}})
         artifact = initialize_artifacts(config, store)["human-guide"]
-        self.assertEqual(artifact.status, ArtifactStatus.ACCEPTED.value)
+        self.assertEqual(artifact.status, ArtifactStatus.PROMOTION_READY.value)
         self.assertEqual(artifact.accepted_hash, old_hash)
-        self.assertEqual(artifact.accepted_path, str(old_snapshot))
+        self.assertEqual(artifact.candidate_hash, new_hash)
+        self.assertIsNone(artifact.accepted_path)
+        self.assertEqual(artifact.candidate_path, str(new_snapshot))
+        self.assertEqual(artifact.metadata["candidate_source"]["commit_sha"], "commit-r2")
 
 
 if __name__ == "__main__":

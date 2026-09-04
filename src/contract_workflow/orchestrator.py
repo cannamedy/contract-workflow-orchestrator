@@ -14,7 +14,7 @@ from typing import Any
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity, working_tree_paths
 from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
-from .artifacts import artifact_impact_closure, dependency_revisions, effective_artifact_specs, hydrate_external_artifacts, missing_skill_roles, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
+from .artifacts import artifact_impact_closure, artifact_specs, dependency_revisions, effective_artifact_specs, hydrate_external_artifacts, hydrate_typed_artifacts, initialize_artifacts, missing_skill_roles, typed_plan_graph_prerequisite_errors, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
 from .plan_graph import reconcile_plan_graph, validate_plan_graph
 from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
 from .logging import EventLogger
@@ -143,9 +143,254 @@ class Orchestrator:
                 self.store.save(state)
                 self.logger.emit("hard_stop_entered", reason=state.stop_reason)
             else:
+                if self.config.artifact_pipeline_explicit:
+                    state = hydrate_typed_artifacts(self.config, state, self.store)
+                    state = self._migrate_legacy_typed_propagation(state)
                 state = recompute(self.config, state)
                 self.store.save(state)
         return state
+
+    def _typed_human_gate_required(self, change: dict[str, Any]) -> bool:
+        """Apply the external Human Guide governance gate before derivation."""
+        return (
+            self.config.artifact_pipeline_explicit
+            and str(change.get("source_role", "")).upper() == "HUMAN_GUIDE"
+            and bool(change.get("semantic_change"))
+            and str(change.get("classification", "")) not in {"C0", "C1"}
+        )
+
+    def _human_guide_promotion_request(self, change: dict[str, Any]) -> dict[str, Any]:
+        candidate = str(change.get("candidate_sha256", ""))
+        commit = str(change.get("candidate_commit", ""))
+        blob = str(change.get("candidate_blob_sha", ""))
+        return {
+            "decision_id": f"ADR-HUMAN-GUIDE-PROMOTION-{change['change_id']}",
+            "category": "AUTHORITY_PROMOTION",
+            "question": f"Approve Human Guide revision {candidate} as the accepted PAIS Architecture Authority?",
+            "context": (
+                f"This decision is limited to the external Human Guide candidate. "
+                f"Remote commit={commit}; remote blob={blob}; content SHA256={candidate}. "
+                f"Classification={change.get('classification')}; affected requirement domains="
+                f"{len(change.get('affected_requirements', []))}; affected Contract anchors="
+                f"{len(change.get('affected_contract_anchors', []))}. "
+                f"Architecture audit summary: {change.get('analysis_summary', '')} "
+                "Downstream Engineering Spec, Machine Contract, Conformance, Design, Plan, "
+                "Plan Graph, and Task Contract artifacts are not approved by this decision; "
+                "they will be generated only after Human Guide promotion."
+            ),
+            "why_human_required": "PAIS Human Guide R2 requires Architecture Audit, Human Review, and an immutable Revision 2 freeze before promotion.",
+            "options": ["promote", "defer"],
+            "recommended_option": "promote",
+            "allow_freeform": False,
+            "source_change": change["change_id"],
+            "source_stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            "source_artifact_id": "human-guide",
+            "affected_requirements": change.get("affected_requirements", []),
+            "affected_contract_anchors": change.get("affected_contract_anchors", []),
+            "affected_tasks": change.get("directly_affected_tasks", []),
+            "affected_work_items": change.get("directly_affected_tasks", []),
+            "directly_blocked_items": change.get("directly_affected_tasks", []),
+        }
+
+    def _migrate_legacy_typed_propagation(self, state: WorkflowState) -> WorkflowState:
+        """Migrate the pre-0.7 legacy derivative path without losing evidence."""
+        if not self.config.artifact_pipeline_explicit:
+            return state
+        change_id = state.current_authority_change_id
+        if not change_id:
+            active = [item for item in state.authority_changes.values() if item.get("status") in {"CHANGE_PENDING", "PROPAGATING"}]
+            change_id = str(active[0].get("change_id")) if active else None
+        if not change_id:
+            return state
+        change = dict(state.authority_changes.get(change_id, {}))
+        propagation = state.propagation.get(change_id)
+        if not change or not isinstance(propagation, dict):
+            return state
+        if propagation.get("mode") == "typed" or propagation.get("typed_pipeline") is True:
+            return state
+        legacy_stages = propagation.get("stages") or []
+        if not any(stage in legacy_stages for stage in {
+            Stage.PLAN_GRAPH_BUILD.value,
+            Stage.TASK_REBASE_ANALYSIS.value,
+            Stage.CONTRACT_REVISION.value,
+            Stage.PLAN_REVISION.value,
+        }):
+            return state
+
+        decision_id = f"ADR-HUMAN-GUIDE-PROMOTION-{change_id}"
+        decisions = dict(state.decisions)
+        old_id = propagation.get("promotion_decision_id") or f"ADR-AUTHORITY-PROMOTION-{change_id}"
+        old = decisions.get(str(old_id))
+        if old and old.status == DecisionStatus.PENDING.value:
+            superseded = replace(
+                old,
+                status=DecisionStatus.SUPERSEDED.value,
+                superseded_by=decision_id,
+                superseded_reason="TYPED_PIPELINE_BYPASS: legacy propagation reached Plan Graph/Task Rebase before typed prerequisites and used an over-broad promotion scope",
+            )
+            decisions[str(old_id)] = superseded
+            self.store.save_decision(superseded)
+
+        if decision_id not in decisions or decisions[decision_id].status != DecisionStatus.PENDING.value:
+            request = self._human_guide_promotion_request(change)
+            decisions[decision_id] = HumanDecision(**request)
+            self.store.save_decision(decisions[decision_id])
+
+        legacy_derivatives = {
+            "status": "SUPERSEDED",
+            "reason": "TYPED_PIPELINE_BYPASS",
+            "stages": legacy_stages,
+            "plan_graph": state.plan_graph,
+            "plan_graph_reconciliation": state.plan_graph_reconciliation,
+            "task_rebase": propagation.get("task_rebase"),
+            "source_plan_sha256": (propagation.get("plan_graph") or {}).get("plan_sha256"),
+        }
+        typed_propagation = {
+            **propagation,
+            "mode": "typed",
+            "typed_pipeline": True,
+            "status": "WAITING_DECISION",
+            "next_stage": None,
+            "stage_index": 0,
+            "stages": [],
+            "candidate_artifacts": [],
+            "promotion_decision_id": decision_id,
+            "legacy_derivatives": legacy_derivatives,
+            "legacy_derivatives_status": "SUPERSEDED",
+            "typed_gate": "HUMAN_GUIDE_ONLY",
+            "typed_artifact_order": [spec.id for spec in self.config.artifact_pipeline if spec.id != "human-guide"],
+        }
+        affected = set(change.get("affected_artifacts", ())) or artifact_impact_closure(self.config, change.get("directly_affected_artifacts", ()))
+        artifacts = dict(state.artifacts)
+        for spec in artifact_specs(self.config):
+            artifact = artifacts.get(spec.id)
+            if artifact is None:
+                continue
+            if spec.kind == "HUMAN_GUIDE" and artifact.candidate_hash:
+                artifacts[spec.id] = replace(artifact, status=ArtifactStatus.PROMOTION_READY.value, change_id=change_id)
+            elif spec.id in affected:
+                artifacts[spec.id] = replace(
+                    artifact,
+                    status=ArtifactStatus.BLOCKED.value,
+                    candidate_hash=None,
+                    candidate_path=None,
+                    affected_requirements=list(change.get("affected_requirements", ())),
+                    affected_contract_anchors=list(change.get("affected_contract_anchors", ())),
+                    change_id=change_id,
+                    metadata={
+                        **{key: value for key, value in artifact.metadata.items() if key not in {"validator", "review", "validator_error"}},
+                        "typed_gate": "WAITING_FOR_HUMAN_GUIDE_PROMOTION",
+                    },
+                )
+            self.store.save_artifact(artifacts[spec.id].to_dict())
+
+        change.update({
+            "status": "CHANGE_PENDING",
+            "propagation_ready": False,
+            "typed_pipeline": True,
+            "typed_pipeline_migration": "TYPED_PIPELINE_BYPASS",
+        })
+        self.store.save_authority_change(change)
+        self.store.save_propagation_json(change_id, "propagation-plan.json", typed_propagation)
+        self.logger.emit("typed_propagation_migrated", change_id=change_id, superseded_decision_id=str(old_id), decision_id=decision_id)
+        return replace(
+            state,
+            artifacts=artifacts,
+            authority_changes={**state.authority_changes, change_id: change},
+            propagation={**state.propagation, change_id: typed_propagation},
+            decisions=decisions,
+            plan_graph=None,
+            plan_graph_reconciliation={},
+            current_authority_change_id=change_id,
+            current_stage=Stage.WAITING_FOR_HUMAN.value,
+            current_group=None,
+            current_task=None,
+            run_id=None,
+            status=WorkflowStatus.WAITING_HUMAN.value,
+            pending_human_gate=None,
+            last_outcome=state.last_outcome,
+            updated_at=now_iso(),
+        )
+
+    def _start_typed_authority_propagation(self, state: WorkflowState, change: dict[str, Any]) -> WorkflowState:
+        """Start the configured artifact DAG; never derive stages from prose."""
+        change_id = str(change["change_id"])
+        affected = set(change.get("affected_artifacts", ())) or artifact_impact_closure(self.config, change.get("directly_affected_artifacts", ()))
+        artifacts = dict(state.artifacts)
+        projected = initialize_artifacts(self.config, self.store)
+        for spec in artifact_specs(self.config):
+            current = artifacts.get(spec.id) or projected.get(spec.id)
+            if current is None:
+                continue
+            if spec.kind == "HUMAN_GUIDE":
+                if current.candidate_hash and self._typed_human_gate_required(change):
+                    current = replace(current, status=ArtifactStatus.PROMOTION_READY.value, change_id=change_id)
+                elif current.status == ArtifactStatus.ACCEPTED.value:
+                    current = replace(current, change_id=None)
+            elif spec.id in affected:
+                current = replace(
+                    current,
+                    status=ArtifactStatus.BLOCKED.value,
+                    candidate_hash=None,
+                    candidate_path=None,
+                    affected_requirements=list(change.get("affected_requirements", ())),
+                    affected_contract_anchors=list(change.get("affected_contract_anchors", ())),
+                    change_id=change_id,
+                    metadata={
+                        **{key: value for key, value in current.metadata.items() if key not in {"validator", "review", "validator_error"}},
+                        "typed_gate": "WAITING_FOR_HUMAN_GUIDE_PROMOTION" if self._typed_human_gate_required(change) else "TYPED_PROPAGATION_PENDING",
+                    },
+                )
+            artifacts[spec.id] = current
+            self.store.save_artifact(current.to_dict())
+
+        gate_required = self._typed_human_gate_required(change)
+        decision_id = f"ADR-HUMAN-GUIDE-PROMOTION-{change_id}"
+        decisions = dict(state.decisions)
+        if gate_required and decision_id not in decisions:
+            request = self._human_guide_promotion_request(change)
+            decision = HumanDecision(**request)
+            decisions[decision_id] = decision
+            self.store.save_decision(decision)
+            self.logger.emit("decision_request_created", decision_id=decision_id, directly_blocked_items=list(request["directly_blocked_items"]))
+
+        propagation = {
+            "schema_version": "1.0",
+            "change_id": change_id,
+            "mode": "typed",
+            "typed_pipeline": True,
+            "status": "WAITING_DECISION" if gate_required else "RUNNING",
+            "stages": [],
+            "stage_index": 0,
+            "next_stage": None,
+            "candidate_artifacts": [],
+            "reviews": {},
+            "artifact_order": [spec.id for spec in self.config.artifact_pipeline if spec.id in affected],
+            "promotion_decision_id": decision_id if gate_required else None,
+            "created_at": now_iso(),
+        }
+        if gate_required:
+            change = {**change, "status": "CHANGE_PENDING", "propagation_ready": False}
+        else:
+            change = {**change, "status": "PROPAGATING", "propagation_ready": False}
+        self.store.save_authority_change(change)
+        self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
+        return replace(
+            state,
+            artifacts=artifacts,
+            decisions=decisions,
+            authority_changes={**state.authority_changes, change_id: change},
+            propagation={**state.propagation, change_id: propagation},
+            current_authority_change_id=change_id,
+            current_stage=Stage.WAITING_FOR_HUMAN.value if gate_required else Stage.READY.value,
+            current_group=None,
+            current_task=None,
+            run_id=None,
+            status=WorkflowStatus.WAITING_HUMAN.value if gate_required else WorkflowStatus.RUNNING.value,
+            pending_human_gate=None,
+            attempt=0,
+            updated_at=now_iso(),
+        )
 
     def _audit_gate(self, scan: AuthorityScan | None = None) -> tuple[GitAudit, list[str], AuthorityScan]:
         scan = scan or scan_authority_changes(self.config, self.store, self._load_or_initialize_state_only())
@@ -658,6 +903,23 @@ class Orchestrator:
         if current is None:
             return self._invalid_or_failed(state, ["current artifact state is missing"])
         if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_PATCH.value}:
+            if current.kind == "PLAN_GRAPH":
+                prerequisite_errors = typed_plan_graph_prerequisite_errors(self.config, state)
+                if prerequisite_errors:
+                    return self._invalid_or_failed(state, prerequisite_errors)
+                graph_content = raw.get("candidate_content")
+                if not isinstance(graph_content, str):
+                    return self._invalid_or_failed(state, ["PLAN_GRAPH candidate_content is required for deterministic graph validation"])
+                try:
+                    graph_value = json.loads(graph_content)
+                except (TypeError, ValueError) as exc:
+                    return self._invalid_or_failed(state, [f"PLAN_GRAPH candidate is not valid JSON: {exc}"])
+                graph, graph_errors = validate_plan_graph(self.config, graph_value, contract_text=contract_text(self.config, state))
+                if graph_errors or graph is None:
+                    return self._invalid_or_failed(state, graph_errors or ["invalid typed PLAN_GRAPH"])
+                plan_artifact = next((item for item in state.artifacts.values() if item.kind == "IMPLEMENTATION_PLAN" and item.status == ArtifactStatus.ACCEPTED.value), None)
+                if plan_artifact and graph.get("plan_sha256", "").lower() != str(plan_artifact.accepted_hash or "").lower():
+                    return self._invalid_or_failed(state, ["PLAN_GRAPH_TYPED_UPSTREAM_INCOMPLETE: plan graph does not pin accepted Implementation Plan"])
             candidate_hash = raw.get("candidate_hash")
             candidate_path = raw.get("candidate_path") or current.candidate_path
             if raw.get("candidate_content") is not None:
@@ -668,7 +930,8 @@ class Orchestrator:
                 "last_outcome": outcome.get("summary", ""),
                 "dependency_revisions": dependency_revisions(self.config, state, next(item for item in self.config.artifact_pipeline if item.id == artifact_id)),
             }
-            updated_artifact = replace(current, status=status if not current.validator_role else ArtifactStatus.CANDIDATE.value, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata=metadata)
+            validation_required = requires_project_validation(current.validator_role)
+            updated_artifact = replace(current, status=ArtifactStatus.CANDIDATE.value if validation_required else status, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata=metadata)
         else:
             verdict = Verdict(outcome["verdict"])
             if verdict == Verdict.REQUIRES_PATCH:
@@ -849,7 +1112,31 @@ class Orchestrator:
         )
         self.store.save_artifact(accepted.to_dict())
         self.logger.emit("artifact_promoted", artifact_id=artifact_id, kind=accepted.kind, accepted_hash=accepted.accepted_hash)
-        return replace(state, artifacts={**state.artifacts, artifact_id: accepted})
+        updated = replace(state, artifacts={**state.artifacts, artifact_id: accepted})
+        if accepted.kind == "PLAN_GRAPH":
+            try:
+                graph_value = json.loads(destination.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise OrchestratorError(f"accepted PLAN_GRAPH is not readable JSON: {exc}") from exc
+            graph, errors = validate_plan_graph(self.config, graph_value, contract_text=contract_text(self.config, updated))
+            if errors or graph is None:
+                raise OrchestratorError("accepted PLAN_GRAPH failed deterministic validation: " + "; ".join(errors))
+            change_id = updated.current_authority_change_id
+            change = dict(updated.authority_changes.get(change_id or "", {}))
+            affected = set(change.get("directly_affected_tasks", ())) | set(dependency_closure(self.config, change.get("directly_affected_tasks", ()), replace(updated, plan_graph=graph)))
+            reconciliation = reconcile_plan_graph(self.config, updated, graph, affected)
+            propagation = dict(updated.propagation.get(change_id or "", {}))
+            propagation["plan_graph"] = graph
+            propagation["graph_reconciliation"] = reconciliation
+            if change_id:
+                self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
+            updated = replace(
+                updated,
+                plan_graph=graph,
+                plan_graph_reconciliation=reconciliation,
+                propagation={**updated.propagation, change_id: propagation} if change_id else updated.propagation,
+            )
+        return updated
 
     def _apply_authority_analysis(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         analysis, errors = validate_analysis(self.config, self.store, state, outcome)
@@ -877,6 +1164,33 @@ class Orchestrator:
             self.logger.emit("authority_change_analyzed", change_id=change_id, classification=analysis["classification"], human_decision_required=analysis["human_decision_required"], required_propagation=analysis["required_propagation"])
         self.store.save_authority_change(record)
         self.store.save_authority_ledger(ledger)
+        if self.config.artifact_pipeline_explicit:
+            # The artifact graph is the sole propagation graph for typed
+            # workflows.  In particular, do not let free-form
+            # required_propagation text select legacy stages.
+            typed_state = hydrate_typed_artifacts(self.config, state, self.store)
+            typed_state = replace(
+                typed_state,
+                authority_changes={**typed_state.authority_changes, change_id: record},
+                current_authority_change_id=change_id,
+                last_outcome=outcome,
+                current_stage=Stage.READY.value,
+                current_group=None,
+                current_task=None,
+                run_id=None,
+                attempt=0,
+                status=WorkflowStatus.RUNNING.value,
+                stop_reason=None,
+                stop_code=None,
+                blocked_stage=None,
+                recoverable=False,
+            )
+            typed_state = self._start_typed_authority_propagation(typed_state, record)
+            if typed_state.current_stage == Stage.WAITING_FOR_HUMAN.value:
+                typed_state = recompute(self.config, typed_state)
+            else:
+                typed_state = schedule(self.config, recompute(self.config, typed_state))
+            return StepResult(self._save(typed_state), "typed_authority_change_analyzed")
         if record["status"] != "ACCEPTED":
             propagation = None if analysis["human_decision_required"] else self._new_propagation(record)
         else:
@@ -940,6 +1254,7 @@ class Orchestrator:
             updated = replace(state, propagation={**state.propagation, change_id: propagation}, current_stage=Stage.READY.value, current_group=None, current_task=None, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value, last_outcome=outcome)
             self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
             return StepResult(self._save(schedule(self.config, updated)), "propagation_patch")
+
         if Verdict(outcome["verdict"]) != Verdict.APPROVED:
             return self._invalid_or_failed(state, [f"unsupported propagation verdict {outcome['verdict']}"])
 
@@ -976,6 +1291,8 @@ class Orchestrator:
                 return self._invalid_or_failed(state, ["plan_review must be an object"])
             propagation.setdefault("reviews", {})["plan"] = {**review, "verdict": outcome["verdict"]}
         elif stage == Stage.PLAN_GRAPH_BUILD.value:
+            if self.config.artifact_pipeline_explicit:
+                return self._invalid_or_failed(state, ["PLAN_GRAPH_TYPED_UPSTREAM_INCOMPLETE: typed workflows must build PLAN_GRAPH through the accepted artifact DAG"])
             graph, errors = validate_plan_graph(self.config, outcome.get("plan_graph"), contract_text=contract_text(self.config, state))
             if errors:
                 return self._invalid_or_failed(state, errors)
@@ -989,10 +1306,20 @@ class Orchestrator:
             change["propagation_ready"] = True
             state = replace(state, plan_graph=graph, plan_graph_reconciliation=reconciliation)
         elif stage == Stage.TASK_REBASE_ANALYSIS.value:
+            if self.config.artifact_pipeline_explicit:
+                prerequisite_errors = typed_plan_graph_prerequisite_errors(self.config, state)
+                if prerequisite_errors or not state.plan_graph:
+                    return self._invalid_or_failed(
+                        state,
+                        prerequisite_errors or [
+                            "PLAN_GRAPH_TYPED_UPSTREAM_INCOMPLETE: typed workflows must reconcile tasks only after the accepted typed Plan Graph"
+                        ],
+                    )
             affected = set(change.get("directly_affected_tasks", ()))
             rebase, errors = validate_rebase(outcome.get("task_rebase"), affected)
             if errors:
                 return self._invalid_or_failed(state, errors)
+            rebase = self._carry_forward_task_review_findings(state, rebase)
             propagation["task_rebase"] = rebase
             propagation["rebase_ready"] = True
         else:
@@ -1027,6 +1354,69 @@ class Orchestrator:
         updated = schedule(self.config, updated)
         self.logger.emit("authority_promotion_request_created", change_id=change_id, decision_id=request["decision_id"])
         return StepResult(self._save(updated), "authority_promotion_request")
+
+    def _prior_task_review_findings(self, state: WorkflowState, task_id: str) -> list[str]:
+        """Collect explicitly persisted unresolved findings for a task.
+
+        Rebase output is not allowed to erase prior review evidence merely
+        because a new Plan projection was produced. Only named finding arrays
+        are imported; free-form summaries are never interpreted.
+        """
+        findings: list[str] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item and item not in findings:
+                        findings.append(item)
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                if value.get("task_id") == task_id:
+                    for key in ("preserved_review_findings", "review_findings", "unresolved_review_findings"):
+                        add(value.get(key))
+                for key in ("tasks", "task_rebase"):
+                    nested = value.get(key)
+                    if isinstance(nested, list):
+                        for item in nested:
+                            visit(item)
+                    elif isinstance(nested, dict):
+                        visit(nested)
+                for key in ("last_outcome", "review_evidence", "legacy_derivatives"):
+                    if key in value:
+                        visit(value[key])
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(state.last_outcome)
+        item = state.work_items.get(task_id)
+        if item:
+            visit(item.to_dict())
+        for propagation in state.propagation.values():
+            visit(propagation)
+        for outcome_path in self.store.runs_path.glob("*/outcome.json"):
+            try:
+                visit(json.loads(outcome_path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                continue
+        return findings
+
+    def _carry_forward_task_review_findings(self, state: WorkflowState, rebase: dict[str, Any]) -> dict[str, Any]:
+        tasks = []
+        for item in rebase.get("tasks", []):
+            task = dict(item)
+            task_id = str(task.get("task_id", ""))
+            existing = task.get("preserved_review_findings", [])
+            if not isinstance(existing, list):
+                existing = []
+            merged: list[str] = []
+            for finding in self._prior_task_review_findings(state, task_id) + existing:
+                if isinstance(finding, str) and finding and finding not in merged:
+                    merged.append(finding)
+            task["preserved_review_findings"] = merged
+            tasks.append(task)
+        return {**rebase, "tasks": tasks}
 
     def _persist_candidate_artifacts(self, change_id: str, artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         stored: list[dict[str, Any]] = []
@@ -1255,7 +1645,11 @@ class Orchestrator:
         change_id = decision.source_change
         change = state.authority_changes.get(change_id)
         propagation = state.propagation.get(change_id)
-        if not change or not propagation or propagation.get("status") != "WAITING_PROMOTION":
+        if not change or not propagation:
+            raise OrchestratorError("authority promotion record is incomplete")
+        if propagation.get("mode") == "typed" or propagation.get("typed_pipeline") is True:
+            return self._promote_typed_human_guide(state, decision, dict(change), dict(propagation))
+        if propagation.get("status") != "WAITING_PROMOTION":
             raise OrchestratorError("authority promotion record is incomplete")
         current_scan = scan_authority_changes(self.config, self.store, state)
         current = next((item for item in current_scan.changes if item.get("change_id") == change_id), None)
@@ -1323,6 +1717,120 @@ class Orchestrator:
         if current_task and graph:
             group = next((item.get("group") for item in graph.get("tasks", []) if item.get("id") == current_task), None)
         return replace(state, authority_changes={**state.authority_changes, change_id: change}, propagation={**state.propagation, change_id: propagation}, current_authority_change_id=None, current_stage=Stage.TASK_PATCH.value if current_task else Stage.READY.value, current_group=group, current_task=current_task, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
+
+    def _promote_typed_human_guide(self, state: WorkflowState, decision: HumanDecision, change: dict[str, Any], propagation: dict[str, Any]) -> WorkflowState:
+        """Accept only the external Human Guide, then release the artifact DAG."""
+        change_id = str(change["change_id"])
+        current_scan = scan_authority_changes(self.config, self.store, state)
+        current = next((item for item in current_scan.changes if item.get("change_id") == change_id), None)
+        if not current or current.get("candidate_sha256") != change.get("candidate_sha256"):
+            raise OrchestratorError("authority candidate changed since typed promotion decision")
+        candidate_source = Path(str(change.get("candidate_snapshot_path", ""))).expanduser().resolve()
+        if not candidate_source.is_file() or hashlib.sha256(candidate_source.read_bytes()).hexdigest() != change.get("candidate_sha256"):
+            raise OrchestratorError("Human Guide immutable candidate snapshot is missing or has drifted")
+
+        ledger = bootstrap_ledger(self.config, self.store)
+        entry = ledger.setdefault("sources", {}).setdefault(str(change.get("source_id")), {})
+        promotion = {
+            "decision_id": decision.decision_id,
+            "scope": "HUMAN_GUIDE_ONLY",
+            "before_accepted_hash": entry.get("accepted_sha256"),
+            "after_accepted_hash": change.get("candidate_sha256"),
+            "candidate_remote_commit": change.get("candidate_commit"),
+            "candidate_remote_blob": change.get("candidate_blob_sha"),
+            "candidate_snapshot_path": str(candidate_source),
+            "project_materialization": "NOT_WRITTEN_LOCAL_DRAFT",
+            "promotion_time": now_iso(),
+        }
+        entry.update({
+            "accepted_sha256": change.get("candidate_sha256"),
+            "candidate_sha256": change.get("candidate_sha256"),
+            "accepted_content_sha256": change.get("candidate_sha256"),
+            "accepted_authority_content_sha256": change.get("candidate_sha256"),
+            "accepted_remote_commit": change.get("candidate_commit"),
+            "accepted_remote_blob": change.get("candidate_blob_sha"),
+            "accepted_authority_blob": change.get("candidate_blob_sha"),
+            "accepted_snapshot_path": str(candidate_source),
+            "status": "ACCEPTED",
+            "change_id": change_id,
+        })
+        self.store.save_authority_ledger(ledger)
+
+        artifacts = dict(state.artifacts)
+        affected = set(change.get("affected_artifacts", ()))
+        for spec in artifact_specs(self.config):
+            artifact = artifacts.get(spec.id)
+            if artifact is None:
+                continue
+            if spec.kind == "HUMAN_GUIDE":
+                artifact = replace(
+                    artifact,
+                    status=ArtifactStatus.ACCEPTED.value,
+                    version_hash=change.get("candidate_sha256"),
+                    accepted_hash=change.get("candidate_sha256"),
+                    candidate_hash=None,
+                    accepted_path=str(candidate_source),
+                    candidate_path=None,
+                    change_id=change_id,
+                    metadata={
+                        **artifact.metadata,
+                        "accepted_source": {
+                            "kind": "GIT_REMOTE",
+                            "remote": change.get("authority_remote") or self.config.authority_remote,
+                            "branch": change.get("authority_branch") or self.config.authority_branch,
+                            "commit_sha": change.get("candidate_commit"),
+                            "git_blob_sha": change.get("candidate_blob_sha"),
+                            "content_sha256": change.get("candidate_sha256"),
+                            "snapshot_path": str(candidate_source),
+                        },
+                        "promotion": promotion,
+                    },
+                )
+            elif spec.id in affected:
+                artifact = replace(
+                    artifact,
+                    status=ArtifactStatus.SUPERSEDED.value if spec.optional and not spec.enabled else ArtifactStatus.PENDING.value,
+                    candidate_hash=None,
+                    candidate_path=None,
+                    change_id=change_id,
+                    metadata={
+                        **{key: value for key, value in artifact.metadata.items() if key not in {"validator", "review", "validator_error", "typed_gate"}},
+                        "dependency_revisions": dependency_revisions(self.config, state, spec),
+                    },
+                )
+            artifacts[spec.id] = artifact
+            self.store.save_artifact(artifact.to_dict())
+
+        change.update({"status": "PROPAGATING", "propagation_ready": False, "typed_pipeline": True, "human_guide_promoted_at": now_iso()})
+        propagation.update({
+            "status": "RUNNING",
+            "next_stage": Stage.ARTIFACT_GENERATION.value,
+            "stage_index": 0,
+            "typed_gate": "PROMOTED",
+            "human_guide_promotion": promotion,
+            "candidate_artifacts": [],
+        })
+        self.store.save_authority_change(change)
+        self.store.save_propagation_json(change_id, "promotion.json", promotion)
+        self.store.save_propagation_json(change_id, "propagation-plan.json", propagation)
+        self.logger.emit("human_guide_promoted", change_id=change_id, decision_id=decision.decision_id, accepted_hash=change.get("candidate_sha256"))
+        return replace(
+            state,
+            artifacts=artifacts,
+            authority_changes={**state.authority_changes, change_id: change},
+            propagation={**state.propagation, change_id: propagation},
+            current_authority_change_id=change_id,
+            current_stage=Stage.READY.value,
+            current_group=None,
+            current_task=None,
+            run_id=None,
+            attempt=0,
+            status=WorkflowStatus.RUNNING.value,
+            pending_human_gate=None,
+            plan_graph=None,
+            plan_graph_reconciliation={},
+            updated_at=now_iso(),
+        )
 
     def status_report(self) -> dict[str, Any]:
         state = recompute(self.config, self._load_or_initialize())

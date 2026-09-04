@@ -360,7 +360,15 @@ def validate_analysis(config: WorkflowConfig, store: Any, state: WorkflowState, 
     if isinstance(anchors, list):
         text = _known_authority_text(config, store, state)
         errors.extend(f"untraceable contract anchor: {item}" for item in anchors if not _anchor_is_traceable(item, text))
-    direct_artifacts = raw.get("directly_affected_artifacts", raw.get("affected_artifacts", []))
+    # Typed workflows accept only the analyzer's direct artifact declaration;
+    # CWO computes the downstream closure from artifact_pipeline.  The old
+    # affected_artifacts spelling remains a legacy-workflow adapter only.
+    direct_artifacts = raw.get(
+        "directly_affected_artifacts",
+        [] if config.artifact_pipeline_explicit else raw.get("affected_artifacts", []),
+    )
+    if config.artifact_pipeline_explicit and "directly_affected_artifacts" not in raw:
+        errors.append("typed authority analysis must declare directly_affected_artifacts")
     dependency_artifacts = raw.get("dependency_affected_artifacts", [])
     if not isinstance(direct_artifacts, list) or not all(isinstance(item, str) for item in direct_artifacts):
         errors.append("directly_affected_artifacts must be a list of strings")
