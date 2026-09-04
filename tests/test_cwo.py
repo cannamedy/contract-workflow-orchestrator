@@ -133,6 +133,23 @@ groups:
         self.assertEqual(stopped.stop_code, "WORKFLOW_DIGEST_CHANGED")
         self.assertEqual(stopped.total_steps, 0)
 
+    def test_explicit_recovery_accepts_workflow_digest_change_between_runs(self):
+        config = self.workflow("autonomous")
+        original = Orchestrator(config, store=StateStore(self.state), runner=MockRunner())
+        original._load_or_initialize()
+
+        workflow_path = self.project / ".contract-workflow" / "workflow.yaml"
+        workflow_path.write_text(workflow_path.read_text(encoding="utf-8") + "\n# changed between bounded runs\n", encoding="utf-8")
+        changed_config = load_workflow(workflow_path, self.project)
+        restarted = Orchestrator(changed_config, store=StateStore(self.state), runner=MockRunner())
+        self.assertEqual(restarted.run().stop_code, "WORKFLOW_DIGEST_CHANGED")
+
+        recovered = restarted.recover()
+
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertEqual(recovered.workflow_digest, changed_config.digest)
+        self.assertEqual(recovered.current_stage, Stage.INITIALIZING.value)
+
     def test_git_audit_classifies_expected_frozen_unrelated_and_conflict(self):
         config = self.workflow()
         expected = self.project / "expected.txt"

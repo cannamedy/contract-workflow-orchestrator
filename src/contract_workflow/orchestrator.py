@@ -115,7 +115,7 @@ class Orchestrator:
         else:
             self.logger.emit("state_recovered", stage=state.current_stage, run_id=state.run_id)
             if state.workflow_digest != self.config.digest:
-                state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="workflow digest changed; hot reload is not supported", stop_code="WORKFLOW_DIGEST_CHANGED", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
+                state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason="workflow digest changed; hot reload is not supported", stop_code="WORKFLOW_DIGEST_CHANGED", blocked_stage=state.blocked_stage or state.current_stage, recoverable=False, updated_at=now_iso())
                 self.store.save(state)
                 self.logger.emit("hard_stop_entered", reason=state.stop_reason)
             else:
@@ -1154,9 +1154,43 @@ class Orchestrator:
             and state.stop_code == "UNEXPECTED_UNRELATED_CHANGE"
         )
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED"
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or schema_recovery):
+        workflow_digest_recovery = (
+            state.stop_code == "WORKFLOW_DIGEST_CHANGED"
+            and state.current_stage == Stage.HARD_STOP.value
+            and state.run_id is None
+        )
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
+
+        if workflow_digest_recovery:
+            audit, integrity, _ = self._audit_gate()
+            if integrity or audit.blocking or not audit.is_repository or audit.error:
+                reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
+                reason = reason or audit.error or "Git audit blocked"
+                self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+                raise OrchestratorError(reason)
+            if any(_read_json(path).get("status") == "running" for path in self.store.runs_path.glob("*/metadata.json")):
+                self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="RECOVERY_UNCERTAIN: an Agent invocation is still running")
+                raise OrchestratorError("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+            restored_stage = state.blocked_stage or Stage.AUTHORITY_CHANGE_ANALYSIS.value
+            self.logger.emit("workflow_digest_recovery_validated", old_digest=state.workflow_digest, new_digest=self.config.digest, restored_stage=restored_stage)
+            recovered = replace(
+                state,
+                workflow_digest=self.config.digest,
+                current_stage=restored_stage,
+                status=WorkflowStatus.RUNNING.value,
+                pending_human_gate=None,
+                run_id=None,
+                attempt=0,
+                stop_reason=None,
+                stop_code=None,
+                blocked_stage=None,
+                recoverable=False,
+                updated_at=now_iso(),
+            )
+            self.logger.emit("hard_stop_recovered", stop_code="WORKFLOW_DIGEST_CHANGED", restored_stage=restored_stage)
+            return self._save(recovered)
 
         if schema_recovery:
             late_outcome, late_errors, late_detected = self._late_outcome_check(state)
