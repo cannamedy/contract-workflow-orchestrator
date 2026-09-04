@@ -130,7 +130,17 @@ class Orchestrator:
         audit_state = self._load_or_initialize_state_only()
         plan_expected = tuple(path for raw in (audit_state.plan_graph or {}).get("tasks", []) if isinstance(raw, dict) for path in tuple(raw.get("expected_outputs", ()) or ()) + tuple(raw.get("allowed_paths", ()) or ()))
         active_invocation = bool(audit_state.run_id and audit_state.current_stage in AGENT_STAGE_NAMES)
-        baseline_paths = () if active_invocation or audit_state.current_stage == Stage.HARD_STOP.value else working_tree_paths(Path(self.config.project_path))
+        # A digest stop before the first step has no Agent mutation to audit;
+        # the current dirty tree is the invocation baseline being explicitly
+        # recovered.  Once an invocation has started, a hard stop must not
+        # reclassify its dirty paths as preserved user work.
+        pre_invocation_digest_stop = (
+            audit_state.current_stage == Stage.HARD_STOP.value
+            and audit_state.stop_code == "WORKFLOW_DIGEST_CHANGED"
+            and audit_state.total_steps == 0
+            and audit_state.run_id is None
+        )
+        baseline_paths = () if active_invocation or (audit_state.current_stage == Stage.HARD_STOP.value and not pre_invocation_digest_stop) else working_tree_paths(Path(self.config.project_path))
         audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected, baseline_paths=baseline_paths)
         self.logger.emit("doctor_check", git_blocking=audit.blocking, integrity_errors=len(integrity), classifications=[item.value for item in audit.classifications])
         return audit, integrity, scan

@@ -143,6 +143,7 @@ groups:
         changed_config = load_workflow(workflow_path, self.project)
         restarted = Orchestrator(changed_config, store=StateStore(self.state), runner=MockRunner())
         self.assertEqual(restarted.run().stop_code, "WORKFLOW_DIGEST_CHANGED")
+        (self.project / "preexisting-user-change.txt").write_text("preserve\n", encoding="utf-8")
 
         recovered = restarted.recover()
 
