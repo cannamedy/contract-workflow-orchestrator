@@ -806,8 +806,6 @@ class Orchestrator:
             has_remote_set = isinstance(set_state, dict) and bool(set_state.get("last_seen_authority_set_hash"))
             if has_remote_set:
                 for member in self.config.authority_members:
-                    if member.role != "ARCHITECTURE_GUIDE":
-                        continue
                     path = project / member.path
                     try:
                         if path.resolve().is_relative_to(project):

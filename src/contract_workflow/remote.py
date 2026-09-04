@@ -382,15 +382,60 @@ def _authority_set_accepted_members(config: WorkflowConfig, ledger: dict[str, An
     entry = (ledger.get("sources", {}) or {}).get("human-guide", {})
     if guide is None or not isinstance(entry, dict):
         return []
-    content_sha = entry.get("accepted_content_sha256") or entry.get("accepted_sha256") or guide.sha256
+    # The legacy source entry may contain candidate metadata in
+    # ``accepted_content_sha256`` after a pre-0.8 rollover.  The canonical
+    # accepted hash is the ledger's accepted_sha256; candidate fields never
+    # establish an accepted Authority Set member.
+    content_sha = entry.get("accepted_sha256") or guide.sha256
+    snapshot_path = entry.get("accepted_snapshot_path")
+    if isinstance(snapshot_path, str):
+        snapshot = Path(snapshot_path).expanduser().resolve()
+        if not snapshot.is_file() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != str(content_sha):
+            snapshot_path = None
     return [{
         "member_id": next((item.id for item in config.authority_members if item.role == "ARCHITECTURE_GUIDE"), "architecture-guide"),
         "role": "ARCHITECTURE_GUIDE", "path": guide.path,
         "git_blob_sha": entry.get("accepted_remote_blob") or entry.get("accepted_authority_blob"),
         "content_sha256": content_sha,
-        "snapshot_path": entry.get("accepted_snapshot_path"),
+        "snapshot_path": snapshot_path,
         "source_revision": entry.get("accepted_remote_commit"),
     }]
+
+
+def _repair_legacy_set_projection(ledger: dict[str, Any], entry: dict[str, Any], aggregate: str) -> bool:
+    """Undo a pre-0.8 first-observation projection that promoted a pending guide.
+
+    A legacy source can legitimately contain both accepted and candidate fields.
+    If a newly created set projection copied the candidate into ``accepted_hash``,
+    preserve that forensic record but restore the accepted single-guide base so
+    the normal same-CR set rollover can establish the real candidate lineage.
+    """
+    aset = ledger.get("authority_set")
+    accepted_hash = str(entry.get("accepted_sha256") or "")
+    candidate_hash = str(entry.get("candidate_sha256") or entry.get("candidate_content_sha256") or "")
+    if not isinstance(aset, dict) or str(aset.get("accepted_hash") or "").lower() != aggregate.lower():
+        return False
+    if not accepted_hash or not candidate_hash or accepted_hash.lower() == candidate_hash.lower() or not entry.get("change_id"):
+        return False
+    legacy_projection = {key: value for key, value in aset.items()}
+    accepted_members = [{
+        "member_id": "architecture-guide", "role": "ARCHITECTURE_GUIDE",
+        "path": str(entry.get("path") or entry.get("configured_path") or ""),
+        "content_sha256": accepted_hash,
+        "git_blob_sha": None, "snapshot_path": None,
+    }]
+    ledger["authority_set"] = {
+        "accepted_hash": aggregate_authority_set_hash(accepted_members),
+        "accepted_members": accepted_members,
+        "candidate_hash": "",
+        "candidate_members": [],
+        "status": "CHANGE_PENDING",
+        "change_id": entry.get("change_id"),
+        "legacy_projection_repaired": legacy_projection,
+        "legacy_projection_repair_reason": "LEGACY_SET_FIRST_OBSERVATION_COPIED_PENDING_GUIDE_CANDIDATE",
+    }
+    entry["status"] = "CHANGE_PENDING"
+    return True
 
 
 def _set_candidate_revision(snapshot: RemoteAuthoritySetSnapshot, *, status: str, supersedes: str | None = None) -> dict[str, Any]:
@@ -578,11 +623,22 @@ def _check_remote_authority_set(config: WorkflowConfig, store: Any, state: Workf
     if not dry_run:
         from .authority import bootstrap_ledger
         ledger = bootstrap_ledger(config, store)
+    entry = (ledger.get("sources", {}) or {}).get("human-guide", {})
+    if not isinstance(entry, dict):
+        entry = {}
     accepted_members = _authority_set_accepted_members(config, ledger)
+    if _repair_legacy_set_projection(ledger, entry, aggregate):
+        store.save_authority_ledger(ledger)
+        accepted_members = _authority_set_accepted_members(config, ledger)
     accepted_hash = str((ledger.get("authority_set", {}) or {}).get("accepted_hash") or aggregate_authority_set_hash(accepted_members))
     candidate_hash = str((ledger.get("authority_set", {}) or {}).get("candidate_hash") or "")
-    entry = (ledger.get("sources", {}) or {}).get("human-guide", {})
-    first_set_observation = not (ledger.get("authority_set") or {}).get("accepted_hash") and not entry.get("accepted_remote_blob")
+    pending_source_candidate = bool(entry.get("change_id")) and bool(
+        str(entry.get("candidate_sha256") or entry.get("candidate_content_sha256") or "")
+        and str(entry.get("accepted_sha256") or "")
+        and str(entry.get("candidate_sha256") or entry.get("candidate_content_sha256") or "").lower()
+        != str(entry.get("accepted_sha256") or "").lower()
+    )
+    first_set_observation = not (ledger.get("authority_set") or {}).get("accepted_hash") and not entry.get("accepted_remote_blob") and not pending_source_candidate
     pending = str((ledger.get("authority_set", {}) or {}).get("status") or entry.get("status", "ACCEPTED")) in {"CHANGE_PENDING", "PROPAGATING", "WAITING_DECISION", "NEWER_REMOTE_REVISION_AVAILABLE"} and bool((ledger.get("authority_set", {}) or {}).get("change_id") or entry.get("change_id"))
     remote_state["authority_set"] = {**prior_set, **set_snapshot.to_dict(), "last_seen_remote_commit": commit, "last_seen_authority_set_hash": aggregate, "status": "NO_CHANGE" if aggregate == accepted_hash else ("CHANGE_PENDING" if aggregate == candidate_hash else "OBSERVED")}
     if dry_run:
@@ -620,6 +676,18 @@ def _check_remote_authority_set(config: WorkflowConfig, store: Any, state: Workf
                 store.save_remote_state(remote_state)
                 if state is not None and store.state_path.is_file():
                     state.authority_changes[change_id] = rolled_change
+                    propagation = state.propagation.get(change_id)
+                    if isinstance(propagation, dict):
+                        state.propagation[change_id] = {
+                            **propagation,
+                            "status": "WAITING_DECISION",
+                            "promotion_decision_id": rollover["new_decision_id"],
+                            "typed_gate": "HUMAN_AUTHORITY_SET_ONLY",
+                            "candidate_authority_set_hash": snapshot.aggregate_hash,
+                            "candidate_artifacts": [],
+                            "stages": [],
+                            "next_stage": None,
+                        }
                     store.save(state)
                 return RemoteCheck(primary_snapshot, changed=True, rollover=rollover, status=NEWER_REMOTE_REVISION_AVAILABLE, authority_set=set_snapshot)
         aset = ledger.setdefault("authority_set", {})
