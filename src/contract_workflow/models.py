@@ -110,6 +110,10 @@ ARTIFACT_KINDS = frozenset({
 })
 
 PROMOTION_POLICIES = frozenset({"AUTO", "HUMAN_GATE", "EXTERNAL"})
+AUTHORITY_MEMBER_ROLES = frozenset({
+    "ARCHITECTURE_GUIDE", "ENGINEERING_DIRECTIVE", "PROJECT_DECISION", "REFERENCE_POLICY",
+})
+REFERENCE_POLICY_ROLES = frozenset({"MUST_ALIGN", "PREFERRED_PATTERN", "INFORMATIVE_REFERENCE", "NEGATIVE_REFERENCE"})
 
 REVIEW_FINDING_STATUSES = frozenset({"UNRESOLVED", "RESOLVED", "NOT_APPLICABLE"})
 REVIEW_FINDING_PROVENANCES = frozenset({
@@ -132,6 +136,16 @@ class AuthoritativeSource:
     mutable_after_start: bool = False
     source_id: str | None = None
     role: str | None = None
+
+
+@dataclass(frozen=True)
+class AuthorityMemberSpec:
+    id: str
+    role: str
+    path: str
+    source: str = "remote"
+    required: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -325,6 +339,8 @@ class WorkflowConfig:
     hard_stops: tuple[str, ...] = ()
     authority_remote: str = "origin"
     authority_branch: str = "main"
+    authority_members: tuple[AuthorityMemberSpec, ...] = ()
+    authority_members_explicit: bool = False
     project_validators: ProjectValidatorConfig | None = None
     artifact_pipeline: tuple[ArtifactSpec, ...] = ()
     artifact_pipeline_explicit: bool = False

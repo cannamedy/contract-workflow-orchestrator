@@ -10,7 +10,7 @@ from typing import Any
 import yaml
 
 from .artifacts import validate_artifact_graph
-from .models import ARTIFACT_KINDS, PROMOTION_POLICIES, ArtifactSpec, AuthoritativeSource, GroupSpec, Policy, ProjectValidatorConfig, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
+from .models import AUTHORITY_MEMBER_ROLES, REFERENCE_POLICY_ROLES, ARTIFACT_KINDS, PROMOTION_POLICIES, ArtifactSpec, AuthorityMemberSpec, AuthoritativeSource, GroupSpec, Policy, ProjectValidatorConfig, RunnerConfig, SkillSpec, TaskSpec, WorkflowConfig
 
 
 class WorkflowConfigError(ValueError):
@@ -129,6 +129,40 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
         if not isinstance(source.get("path"), str) or not isinstance(source.get("sha256"), str):
             raise WorkflowConfigError("authoritative source requires path and sha256")
         sources.append(AuthoritativeSource(path=source["path"], sha256=source["sha256"], git_commit=source.get("git_commit"), git_tag=source.get("git_tag"), mutable_after_start=bool(source.get("mutable_after_start", False)), source_id=source.get("source_id"), role=source.get("role")))
+    authority_members_raw = authority_raw.get("members")
+    authority_members_explicit = authority_members_raw is not None
+    authority_members: list[AuthorityMemberSpec] = []
+    if authority_members_raw is not None:
+        if not isinstance(authority_members_raw, list):
+            raise WorkflowConfigError("authority.members must be an array")
+        seen_member_ids: set[str] = set()
+        for index, item in enumerate(authority_members_raw):
+            member = _mapping(item, f"authority.members[{index}]")
+            member_id = member.get("id")
+            role = member.get("role")
+            path = member.get("path")
+            if not isinstance(member_id, str) or not member_id:
+                raise WorkflowConfigError(f"authority.members[{index}].id is required")
+            if member_id in seen_member_ids:
+                raise WorkflowConfigError(f"authority member ids must be unique: {member_id}")
+            if not isinstance(role, str) or role not in AUTHORITY_MEMBER_ROLES:
+                raise WorkflowConfigError(f"authority.members[{index}].role must be one of {sorted(AUTHORITY_MEMBER_ROLES)}")
+            if not isinstance(path, str) or not path or Path(path).is_absolute() or ".." in Path(path).parts:
+                raise WorkflowConfigError(f"authority.members[{index}].path must be a safe relative path")
+            source = member.get("source", "remote")
+            if not isinstance(source, str) or not source:
+                raise WorkflowConfigError(f"authority.members[{index}].source must be a non-empty string")
+            metadata = member.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise WorkflowConfigError(f"authority.members[{index}].metadata must be a mapping")
+            if role == "REFERENCE_POLICY" and metadata.get("reference_role") is not None and metadata.get("reference_role") not in REFERENCE_POLICY_ROLES:
+                raise WorkflowConfigError(f"authority.members[{index}].metadata.reference_role must be one of {sorted(REFERENCE_POLICY_ROLES)}")
+            seen_member_ids.add(member_id)
+            authority_members.append(AuthorityMemberSpec(member_id, role, path, source, bool(member.get("required", True)), dict(metadata)))
+    else:
+        guide = next((item for item in sources if (item.role or "").upper() == "HUMAN_GUIDE" or item.source_id == "human-guide" or "human" in item.path.lower() or "架构原理" in item.path), None)
+        if guide is not None:
+            authority_members.append(AuthorityMemberSpec(guide.source_id or "architecture-guide", "ARCHITECTURE_GUIDE", guide.path))
     skill_raw = _mapping(raw.get("skills"), "skills")
     skills: dict[str, SkillSpec] = {}
     for role, item in skill_raw.items():
@@ -188,7 +222,7 @@ def load_workflow(path: str | Path, project_override: str | Path | None = None) 
         graph_errors = validate_artifact_graph(artifact_specs)
         if graph_errors:
             raise WorkflowConfigError("; ".join(graph_errors))
-    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), authority_remote=authority_remote, authority_branch=authority_branch, project_validators=project_validators, artifact_pipeline=tuple(artifact_specs), artifact_pipeline_explicit=artifact_explicit, workflow_file=str(workflow_path), digest=digest_file(workflow_path))
+    return WorkflowConfig(version=str(raw.get("version", "1")), project_name=project_name, project_path=str(project_path), mode=mode, authoritative_sources=tuple(sources), skills=skills, runner=runner, policy=policy, groups=tuple(groups), hard_stops=tuple(raw.get("hard_stops", ()) or ()), authority_remote=authority_remote, authority_branch=authority_branch, authority_members=tuple(authority_members), authority_members_explicit=authority_members_explicit, project_validators=project_validators, artifact_pipeline=tuple(artifact_specs), artifact_pipeline_explicit=artifact_explicit, workflow_file=str(workflow_path), digest=digest_file(workflow_path))
 
 
 def default_workflow(project: Path) -> str:

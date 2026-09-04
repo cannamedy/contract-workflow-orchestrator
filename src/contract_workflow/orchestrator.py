@@ -14,6 +14,7 @@ from typing import Any
 from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity, working_tree_paths
 from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
+from .authority_set import aggregate_authority_set_hash, canonical_member_records
 from .artifacts import artifact_impact_closure, artifact_specs, dependency_revisions, effective_artifact_specs, hydrate_external_artifacts, hydrate_typed_artifacts, initialize_artifacts, missing_skill_roles, typed_plan_graph_prerequisite_errors, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
 from .plan_graph import reconcile_plan_graph, validate_plan_graph
 from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
@@ -153,10 +154,10 @@ class Orchestrator:
         return state
 
     def _typed_human_gate_required(self, change: dict[str, Any]) -> bool:
-        """Apply the external Human Guide governance gate before derivation."""
+        """Apply the external Human Authority governance gate before derivation."""
         return (
             self.config.artifact_pipeline_explicit
-            and str(change.get("source_role", "")).upper() == "HUMAN_GUIDE"
+            and (str(change.get("source_role", "")).upper() in {"HUMAN_GUIDE", "HUMAN_AUTHORITY_SET"} or bool(change.get("candidate_authority_set_hash")))
             and bool(change.get("semantic_change"))
             and str(change.get("classification", "")) not in {"C0", "C1"}
         )
@@ -169,6 +170,8 @@ class Orchestrator:
         rolled-over candidates receive a content-derived suffix so historical
         Decisions can never be mistaken for approval of a later revision.
         """
+        if change.get("candidate_authority_set_hash"):
+            return f"ADR-AUTHORITY-SET-PROMOTION-{change['change_id']}-{str(change['candidate_authority_set_hash'])[:12].upper()}"
         base = f"ADR-HUMAN-GUIDE-PROMOTION-{change['change_id']}"
         if int(change.get("candidate_revision_number", 1) or 1) > 1:
             candidate = str(change.get("candidate_sha256", ""))
@@ -179,11 +182,27 @@ class Orchestrator:
         candidate = str(change.get("candidate_sha256", ""))
         commit = str(change.get("candidate_commit", ""))
         blob = str(change.get("candidate_blob_sha", ""))
-        return {
-            "decision_id": self._human_guide_decision_id(change),
-            "category": "AUTHORITY_PROMOTION",
-            "question": f"Approve Human Guide revision {candidate} as the accepted PAIS Architecture Authority?",
-            "context": (
+        set_hash = str(change.get("candidate_authority_set_hash", ""))
+        if set_hash:
+            members = change.get("authority_set_members", [])
+            member_summary = "; ".join(
+                f"{item.get('member_id')} [{item.get('role')}]={item.get('content_sha256')}"
+                for item in members if isinstance(item, dict)
+            )
+            question = f"Approve Human Authority Set revision {set_hash} as the accepted Human Authority baseline?"
+            context = (
+                f"This decision is limited to the Human Authority Set. Remote commit={commit}; "
+                f"Architecture Guide content SHA256={candidate}; aggregate authority-set hash={set_hash}. "
+                f"Members: {member_summary}. Classification={change.get('classification')}; affected requirement domains="
+                f"{len(change.get('affected_requirements', []))}; affected Contract anchors={len(change.get('affected_contract_anchors', []))}. "
+                f"Authority-set readiness summary: {change.get('analysis_summary', '')} "
+                "Engineering Specification, Machine Contract, Conformance, Design, Plan, Plan Graph, "
+                "Task Contract, and code are not approved by this decision; they will be generated only after promotion."
+            )
+            source_artifact = "human-authority-set"
+        else:
+            question = f"Approve Human Guide revision {candidate} as the accepted PAIS Architecture Authority?"
+            context = (
                 f"This decision is limited to the external Human Guide candidate. "
                 f"Remote commit={commit}; remote blob={blob}; content SHA256={candidate}. "
                 f"Classification={change.get('classification')}; affected requirement domains="
@@ -193,15 +212,21 @@ class Orchestrator:
                 "Downstream Engineering Spec, Machine Contract, Conformance, Design, Plan, "
                 "Plan Graph, and Task Contract artifacts are not approved by this decision; "
                 "they will be generated only after Human Guide promotion."
-            ),
-            "why_human_required": "PAIS Human Guide R2 requires Architecture Audit, Human Review, and an immutable Revision 2 freeze before promotion.",
+            )
+            source_artifact = "human-guide"
+        return {
+            "decision_id": self._human_guide_decision_id(change),
+            "category": "AUTHORITY_PROMOTION",
+            "question": question,
+            "context": context,
+            "why_human_required": "This Human Authority candidate requires the configured architecture/governance review and an immutable revision freeze before promotion.",
             "options": ["promote", "defer"],
             "recommended_option": "promote",
             "allow_freeform": False,
             "source_change": change["change_id"],
             "source_stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value,
-            "source_artifact_id": "human-guide",
-            "source_candidate_hash": candidate,
+            "source_artifact_id": source_artifact,
+            "source_candidate_hash": set_hash or candidate,
             "affected_requirements": change.get("affected_requirements", []),
             "affected_contract_anchors": change.get("affected_contract_anchors", []),
             "affected_tasks": change.get("directly_affected_tasks", []),
@@ -274,7 +299,7 @@ class Orchestrator:
             "promotion_decision_id": decision_id,
             "legacy_derivatives": legacy_derivatives,
             "legacy_derivatives_status": "SUPERSEDED",
-            "typed_gate": "HUMAN_GUIDE_ONLY",
+            "typed_gate": "HUMAN_AUTHORITY_SET_ONLY" if change.get("candidate_authority_set_hash") else "HUMAN_GUIDE_ONLY",
             "typed_artifact_order": [spec.id for spec in self.config.artifact_pipeline if spec.id != "human-guide"],
         }
         affected = set(change.get("affected_artifacts", ())) or artifact_impact_closure(self.config, change.get("directly_affected_artifacts", ()))
@@ -362,7 +387,7 @@ class Orchestrator:
             self.store.save_artifact(current.to_dict())
 
         gate_required = self._typed_human_gate_required(change)
-        decision_id = f"ADR-HUMAN-GUIDE-PROMOTION-{change_id}"
+        decision_id = self._human_guide_decision_id(change)
         decisions = dict(state.decisions)
         if gate_required and (decision_id not in decisions or decisions[decision_id].status != DecisionStatus.PENDING.value):
             request = self._human_guide_promotion_request(change)
@@ -719,6 +744,16 @@ class Orchestrator:
     def _authority_relative_paths(self) -> set[str]:
         project = Path(self.config.project_path).resolve()
         paths: set[str] = set()
+        if self.config.authority_members_explicit:
+            set_state = self.store.load_remote_state() or {}
+            if isinstance(set_state.get("authority_set"), dict):
+                for member in self.config.authority_members:
+                    if member.role != "ARCHITECTURE_GUIDE":
+                        continue
+                    path = Path(member.path)
+                    path = path if path.is_absolute() else project / path
+                    if path.resolve().is_relative_to(project):
+                        paths.add(path.resolve().relative_to(project).as_posix())
         for source in self.config.authoritative_sources:
             path = Path(source.path)
             path = path if path.is_absolute() else project / path
@@ -766,6 +801,19 @@ class Orchestrator:
                     paths.add(path.resolve().relative_to(project).as_posix())
             except (OSError, RuntimeError):
                 continue
+        if self.config.authority_members_explicit:
+            set_state = remote_state.get("authority_set", {}) if isinstance(remote_state, dict) else {}
+            has_remote_set = isinstance(set_state, dict) and bool(set_state.get("last_seen_authority_set_hash"))
+            if has_remote_set:
+                for member in self.config.authority_members:
+                    if member.role != "ARCHITECTURE_GUIDE":
+                        continue
+                    path = project / member.path
+                    try:
+                        if path.resolve().is_relative_to(project):
+                            paths.add(path.resolve().relative_to(project).as_posix())
+                    except (OSError, RuntimeError):
+                        continue
         return paths
 
     def _accepted_upstream_paths(self, state: WorkflowState) -> set[str]:
@@ -810,6 +858,8 @@ class Orchestrator:
         for source in self.config.authoritative_sources:
             role = source.role or ("HUMAN_GUIDE" if source_id(source) == "human-guide" else "ACCEPTED_UPSTREAM")
             add(source.path, role)
+        for member in self.config.authority_members:
+            add(member.path, "HUMAN_GUIDE" if member.role == "ARCHITECTURE_GUIDE" else "AUTHORITY_MEMBER")
         ledger = self.store.load_authority_ledger() or {}
         for entry in (ledger.get("sources", {}) or {}).values():
             if not isinstance(entry, dict):
@@ -1746,7 +1796,7 @@ class Orchestrator:
         return replace(state, authority_changes={**state.authority_changes, change_id: change}, propagation={**state.propagation, change_id: propagation}, current_authority_change_id=None, current_stage=Stage.TASK_PATCH.value if current_task else Stage.READY.value, current_group=group, current_task=current_task, run_id=None, attempt=0, status=WorkflowStatus.RUNNING.value)
 
     def _promote_typed_human_guide(self, state: WorkflowState, decision: HumanDecision, change: dict[str, Any], propagation: dict[str, Any]) -> WorkflowState:
-        """Accept only the external Human Guide, then release the artifact DAG."""
+        """Accept the external Human Guide or Authority Set, then release the artifact DAG."""
         change_id = str(change["change_id"])
         current_scan = scan_authority_changes(self.config, self.store, state)
         current = next((item for item in current_scan.changes if item.get("change_id") == change_id), None)
@@ -1757,15 +1807,38 @@ class Orchestrator:
             raise OrchestratorError("Human Guide immutable candidate snapshot is missing or has drifted")
 
         ledger = bootstrap_ledger(self.config, self.store)
+        authority_set_hash = str(change.get("candidate_authority_set_hash", ""))
+        authority_set_manifest = Path(str(change.get("candidate_authority_set_snapshot_path", ""))).expanduser().resolve() if authority_set_hash else None
+        authority_set_members: list[dict[str, Any]] = []
+        if authority_set_hash:
+            if authority_set_manifest is None or not authority_set_manifest.is_file():
+                raise OrchestratorError("Human Authority Set manifest is missing")
+            try:
+                manifest = json.loads(authority_set_manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError) as exc:
+                raise OrchestratorError("Human Authority Set manifest is invalid") from exc
+            authority_set_members = canonical_member_records(manifest.get("members", [])) if isinstance(manifest, dict) else []
+            manifest_hash = str(manifest.get("aggregate_hash", "")) if isinstance(manifest, dict) else ""
+            if not authority_set_members or manifest_hash.lower() != authority_set_hash.lower() or aggregate_authority_set_hash(authority_set_members).lower() != authority_set_hash.lower():
+                raise OrchestratorError("Human Authority Set aggregate hash mismatch")
+            for member in authority_set_members:
+                snapshot = Path(str(member.get("snapshot_path", ""))).expanduser().resolve()
+                expected = str(member.get("content_sha256", ""))
+                if not snapshot.is_file() or not expected or hashlib.sha256(snapshot.read_bytes()).hexdigest() != expected:
+                    raise OrchestratorError(f"Human Authority Set member snapshot is missing or drifted: {member.get('member_id')}")
         entry = ledger.setdefault("sources", {}).setdefault(str(change.get("source_id")), {})
         promotion = {
             "decision_id": decision.decision_id,
-            "scope": "HUMAN_GUIDE_ONLY",
+            "scope": "HUMAN_AUTHORITY_SET_ONLY" if authority_set_hash else "HUMAN_GUIDE_ONLY",
             "before_accepted_hash": entry.get("accepted_sha256"),
             "after_accepted_hash": change.get("candidate_sha256"),
+            "before_accepted_authority_set_hash": (ledger.get("authority_set", {}) or {}).get("accepted_hash") if authority_set_hash else None,
+            "after_accepted_authority_set_hash": authority_set_hash or None,
             "candidate_remote_commit": change.get("candidate_commit"),
             "candidate_remote_blob": change.get("candidate_blob_sha"),
             "candidate_snapshot_path": str(candidate_source),
+            "candidate_authority_set_snapshot_path": str(authority_set_manifest) if authority_set_manifest else None,
+            "authority_set_members": authority_set_members,
             "project_materialization": "NOT_WRITTEN_LOCAL_DRAFT",
             "promotion_time": now_iso(),
         }
@@ -1781,6 +1854,19 @@ class Orchestrator:
             "status": "ACCEPTED",
             "change_id": change_id,
         })
+        if authority_set_hash:
+            ledger["authority_set"] = {
+                **(ledger.get("authority_set", {}) if isinstance(ledger.get("authority_set"), dict) else {}),
+                "accepted_hash": authority_set_hash,
+                "accepted_members": authority_set_members,
+                "candidate_hash": authority_set_hash,
+                "candidate_members": authority_set_members,
+                "accepted_commit": change.get("candidate_commit"),
+                "accepted_revision_id": change.get("candidate_revision_id"),
+                "candidate_revision_id": change.get("candidate_revision_id"),
+                "status": "ACCEPTED",
+                "change_id": change_id,
+            }
         self.store.save_authority_ledger(ledger)
 
         artifacts = dict(state.artifacts)

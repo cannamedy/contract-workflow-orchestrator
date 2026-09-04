@@ -252,6 +252,13 @@ def authority_snapshot(config: WorkflowConfig, store: Any) -> dict[str, str]:
         candidate = _candidate_path(root, configured, entry if isinstance(entry, dict) else {})
         if candidate and candidate.is_file():
             snapshot[source_id(source)] = _hash(candidate)
+    for member in config.authority_members:
+        if member.role == "ARCHITECTURE_GUIDE":
+            continue
+        path = Path(member.path)
+        path = path if path.is_absolute() else root / path
+        if path.is_file():
+            snapshot[f"authority-member:{member.id}"] = _hash(path)
     return snapshot
 
 

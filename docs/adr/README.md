@@ -13,6 +13,7 @@
 | [ADR-004](ADR-004-validation-review-and-promotion.md) | Deterministic Validation、Independent Review 与 Promotion | Implemented |
 | [ADR-005](ADR-005-legacy-compatibility-and-typed-boundary.md) | Legacy compatibility 与 typed workflow 边界 | Implemented |
 | [ADR-006](ADR-006-candidate-revision-rollover.md) | 未接受 Authority Candidate 的 revision rollover | Implemented |
+| [ADR-007](ADR-007-human-authority-set.md) | Human Authority Set、多成员权威与 Reference Policy 边界 | Implemented |
 
 “Implemented”表示该决定已体现在当前 CWO 代码、配置模型或测试中；不表示所有未来扩展都
 已完成，也不追溯虚构历史会议或批准人。PAIS-specific Decision、Requirement 和 review

@@ -35,7 +35,7 @@
     },
     "hard_stops": {"type": "array", "items": {"type": "string"}},
     "project_validators": {"type": "object", "required": ["entrypoint", "invocation"], "properties": {"entrypoint": {"type": "string", "minLength": 1}, "invocation": {"type": "string", "minLength": 1}, "roles": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}}}, "additionalProperties": false},
-    "authority": {"type": "object", "properties": {"remote": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}}},
+    "authority": {"type": "object", "properties": {"remote": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}, "members": {"type": "array", "items": {"type": "object", "required": ["id", "role", "path"], "properties": {"id": {"type": "string", "minLength": 1}, "role": {"enum": ["ARCHITECTURE_GUIDE", "ENGINEERING_DIRECTIVE", "PROJECT_DECISION", "REFERENCE_POLICY"]}, "path": {"type": "string", "minLength": 1}, "source": {"type": "string"}, "required": {"type": "boolean"}, "metadata": {"type": "object"}}, "additionalProperties": false}}}},
     "authority_remote": {"type": "string", "minLength": 1},
     "authority_branch": {"type": "string", "minLength": 1}
     ,"artifact_pipeline": {

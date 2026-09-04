@@ -136,22 +136,28 @@ Validator 失败、普通测试失败、可修复的文档缺陷、依赖重算�
 ## 6. Authority 不是固定文档类型
 
 当前 PAIS 案例把 Human Guide 作为最高层 Architecture Authority，但通用 CWO 不应把某种
-文档风格当成永恒前提。Human Authority 可以是一个集合：
+文档风格当成永恒前提。Human Authority 是一个可配置集合；在 CWO 0.8.0 中，集合成员
+可以使用四个稳定角色：
 
 ```text
 Human Authority Set
-├─ Architecture / Vision Guide
-├─ System Requirements
-├─ Engineering Requirements
-├─ Existing Normative Standard
-├─ Compatibility Requirements
-├─ Policy / Constraints
-└─ Human ADRs
+├─ ARCHITECTURE_GUIDE
+├─ ENGINEERING_DIRECTIVE
+├─ PROJECT_DECISION
+└─ REFERENCE_POLICY
 ```
 
-未来的 Authority classifier 需要知道输入处于哪一个 authority level、哪些内容是规范、哪些
-是参考和证据，以及不同权威之间的 precedence。该能力是目标架构，不应在没有明确规则时
-被当前 CWO 隐式硬编码。
+`ARCHITECTURE_GUIDE` 负责系统目标、心智模型和边界；`ENGINEERING_DIRECTIVE` 负责 Human
+要求采用的高层工程方向；`PROJECT_DECISION` 是项目级明确取舍或例外；`REFERENCE_POLICY`
+规定外部资料如何被参考。被引用的外部项目不是 Authority。不同成员发生真实冲突时，CWO
+不得用固定优先级静默覆盖，而应保留冲突并进入明确的 HumanDecision/治理边界。
+
+没有 `authority.members` 的旧项目仍被解释为一个 `ARCHITECTURE_GUIDE` 单成员集合。集合
+身份由成员 id、role、path、content hash 的规范化排序确定；远端提交和成员 snapshots 与
+既有 Authority ledger 共用，candidate rollover 不会删除旧成员或旧 Decision 证据。
+
+通用 Authority classifier、Authority precedence engine、自动发现和选择 Reference 仍是
+目标架构，不由 0.8.0 假装实现。
 
 ### 6.1 Authority level 作为分析模型
 
@@ -300,6 +306,11 @@ Authority Change Analyzer 只声明直接影响的 artifact、需求和锚点；
 DAG 计算下游闭包和执行顺序。自然语言的 `required_propagation` 不能在 typed workflow 中
 取代依赖图。
 
+对于多成员集合，远端提交首先产生集合级 immutable candidate。成员变更被明确分类为
+`UNCHANGED`、`ADDED`、`MODIFIED` 或 `REMOVED`；hash 相同且 role 相同的成员可以复用其
+member-level review evidence，但集合变化仍必须重新完成 cross-authority consistency 和
+handoff readiness review。Human promotion gate 只批准集合基线，不批准下游工程产物。
+
 ## 9. RunWorkspace 与并行人类工作
 
 Agent 不以真实项目目录作为执行工作区。每次 bounded invocation 按如下路径运行：
@@ -386,6 +397,11 @@ Existing Implementation Evidence
 该顺序是 CWO 的治理方向，具体项目仍需定义冲突处理规则。Reference Suitability 应至少
 检查问题域、抽象层、系统边界、runtime 假设、状态模型、安全假设、生命周期、扩展模型、
 成熟度以及与 Human Authority 的冲突。
+
+`REFERENCE_POLICY` 属于 Human Authority；`PREFERRED_PATTERN`、`MUST_ALIGN`、
+`INFORMATIVE_REFERENCE` 和 `NEGATIVE_REFERENCE` 是用途角色，不是把外部项目提升为项目
+规范的机制。Engineering Specification 可以记录 `derived from` Human Authority 与
+`informed by` Reference 的区别，但 Reference 本身不能直接生成 normative Requirement。
 
 经审计的 Reference Pack 应保存 reference id、repository/standard、commit/tag/version、角
 色、用途、非用途、提取的模式和已知不匹配。PAIS 中对 MCP 的使用可以作为 informative example，

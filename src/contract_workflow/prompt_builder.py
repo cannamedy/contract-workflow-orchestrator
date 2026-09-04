@@ -111,6 +111,9 @@ class PromptBuilder:
             snapshot = change.get("candidate_snapshot_path") if isinstance(change, dict) else None
             if snapshot:
                 authority_context += f" Read the immutable remote candidate snapshot at `{snapshot}`; do not use the local Human Draft Workspace copy as the candidate."
+            set_snapshot = change.get("candidate_authority_set_snapshot_path") if isinstance(change, dict) else None
+            if set_snapshot:
+                authority_context += f" This is an immutable Human Authority Set manifest at `{set_snapshot}`. Read each listed member snapshot and perform set-level consistency review; do not infer authority from local files."
         elif pending and state.current_task and any(state.current_task in change.get("unaffected_tasks", []) for change in pending):
             authority_context = "There is a registered pending authority change " + ", ".join(str(change.get("change_id")) for change in pending) + ". This task has been deterministically classified as unaffected. Do not modify affected authority artifacts. Operate only within this task's allowed scope."
         if stage in {Stage.CHANGE_PROPAGATION_PLANNING.value, Stage.CONTRACT_REVISION.value, Stage.CONTRACT_REVISION_REVIEW.value, Stage.PLAN_REVISION.value, Stage.PLAN_REVISION_REVIEW.value, Stage.PLAN_GRAPH_BUILD.value, Stage.TASK_REBASE_ANALYSIS.value}:
@@ -134,7 +137,10 @@ class PromptBuilder:
             body = template.format(**values)
         except (KeyError, ValueError):
             body = template
-        context = f"PROJECT ID: {config.project_name}\nEXECUTION WORKSPACE: {execution_path}\nAUTHORITATIVE ORIGIN: {config.project_path}\nCURRENT STAGE: {stage}\nCURRENT ARTIFACT: {state.current_artifact_id or ''}\nARTIFACT CONTEXT: {artifact_context}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {values['run_id']}"
+        authority_set = "none"
+        if config.authority_members:
+            authority_set = "; ".join(f"{item.id} [{item.role}] -> {item.path}" for item in config.authority_members)
+        context = f"PROJECT ID: {config.project_name}\nEXECUTION WORKSPACE: {execution_path}\nAUTHORITATIVE ORIGIN: {config.project_path}\nDECLARED HUMAN AUTHORITY SET: {authority_set}\nCURRENT STAGE: {stage}\nCURRENT ARTIFACT: {state.current_artifact_id or ''}\nARTIFACT CONTEXT: {artifact_context}\nCURRENT GROUP: {state.current_group or ''}\nCURRENT TASK: {state.current_task or ''}\nRUN ID: {values['run_id']}"
         return context + "\n\n" + body.rstrip() + "\n\n" + self._contract(values)
 
     @staticmethod

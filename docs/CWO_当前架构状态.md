@@ -7,11 +7,11 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.7.2
+Documented version: 0.8.0
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
-Repository snapshot observed when the previous state baseline was written:
-  3902849022da3898c1139e2b4c56fb4481806438
+Repository snapshot observed for this state update:
+  0134490c21903bccd574c461ef94919e1b1e9768
 ```
 
 这些是可追溯的历史基线，不是对未来 repository `HEAD` 的永久声明；本页随实现状态更新时
@@ -49,6 +49,13 @@ Repository snapshot observed when the previous state baseline was written:
 - canonical review evidence registry 位于 `WorkflowState` / 外部 runtime `state.json`；支持
   historical review evidence migration、稳定 finding identity、幂等登记、结构化 provenance、
   unresolved carry-forward 和正常 resolve 生命周期。
+- `HumanAuthoritySet` v0.1：声明四种 Authority Member role、为 legacy 单一 Human Guide 合成
+  单成员集合、按成员内容 hash 形成顺序无关的 aggregate identity，并把远端成员冻结为同一
+  Authority snapshot 体系中的 manifest/member snapshots。
+- Authority Set 的成员级 added/removed/modified/unchanged 检测、未接受 candidate 的同 CR
+  rollover、旧 revision/Decision 保留和新的 Set-level HumanDecision 请求。
+- Engineering Specification 的 Authority Set 输入边界；Reference Policy 角色（包括
+  `PREFERRED_PATTERN`）与外部 Reference 本身的 Authority 区分。
 
 ### PARTIAL
 
@@ -59,7 +66,8 @@ Repository snapshot observed when the previous state baseline was written:
   cwd、origin baseline、scope validation 和 commit-back 防护；内核 namespace 无法阻止 Agent
   通过 absolute path 访问真实项目。
 - Plan Graph 可以从 Plan 构建并驱动任务，但通用 Target Understanding、Authority Set
-  precedence 和输入层级自动分类尚未成为运行时阶段。
+  precedence 和输入层级自动分类尚未成为运行时阶段；Authority Set 本身已实现，但其多成员
+  冲突只进入明确的 readiness/decision 边界，不由固定优先级静默解决。
 - Human Authority promotion、下游 artifact promotion、项目 Git publishing 是不同边界；
   CWO 不自动 commit/push/tag/release PAIS。
 
@@ -135,6 +143,13 @@ Artifact promotion 的当前原则是：
 `EXTERNAL` artifact 只能等待外部权威源接受。Human Guide 属于此类时，GitHub main 是提交
 入口；CWO 不因本地 Draft 变化而重建本轮 authority。
 
+配置 `authority.members` 时，GitHub main 上声明的 Authority Set 是提交源。集合 fingerprint
+由成员 id、role、path 和 content hash 的规范化排序计算；成员顺序不改变 identity。集合级
+candidate 与单成员 remote snapshot 共用既有 immutable snapshot/ledger 体系。未接受集合的
+新提交沿用同一 CR rollover；已接受集合之后的成员变化才创建新的 AuthorityChange。集合
+promotion 只接受 Human Authority Set，不替代下游 Engineering Specification、Machine
+Contract、Conformance、Design 或 Plan 的独立验证、审查和 promotion。
+
 ## 6. 当前 safety / recovery 事实
 
 每个 Agent invocation 都有 external RunWorkspace。只读 stage 的 workspace mutation 被丢弃；
@@ -173,6 +188,11 @@ Skill 负责内容方法，CWO 只负责 identity、依赖、生命周期、rout
 Project validator 负责确定性结构与 traceability，独立 Reviewer 负责语义挑战；二者不能互相
 替代。
 
+Authority Set 的 `ENGINEERING_DIRECTIVE`、`PROJECT_DECISION` 和 `REFERENCE_POLICY` 不被
+强行绑定为新的 PAIS-specific Skill。当前通用 Engineering Specification Skill 消费完整
+Authority Set；Reference Policy 可说明外部模式如何被参考，但外部仓库不会因此成为项目
+Authority，也不会自动生成 normative Requirement。
+
 ## 8. 当前明确限制与活动缺口
 
 - PAIS TASK-002 的历史 review finding “capabilities / frames scalar values were incorrectly
@@ -196,6 +216,10 @@ snapshot 保留和 candidate-specific HumanDecision。当前最新 candidate 的
 
 PAIS 当前本地 Human Guide 是 Draft，不应被本页或 CWO 视为已提交 authority。PAIS 的具体 CR、
 requirements、schema 和代码实现属于 PAIS 自己的项目记录。
+
+Authority Set v0.8.0 的 PAIS 集成仍需在项目侧安全发布 HED-001 与 REF-MCP-001 后完成远端
+reconcile；这些是 PAIS 的 project metadata/content，不是 CWO 的通用业务规则。若该发布尚未
+完成，本页只把它记录为 pending integration，而不是已实现的 CWO capability claim。
 
 ## 10. 证据来源与维护规则
 
