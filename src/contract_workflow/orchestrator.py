@@ -1215,7 +1215,7 @@ class Orchestrator:
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="RECOVERY_UNCERTAIN: an Agent invocation is still running")
                 raise OrchestratorError("RECOVERY_UNCERTAIN: an Agent invocation is still running")
             latest = max(records, key=lambda record: (str(record.get("finished_at") or record.get("started_at") or ""), str(record.get("run_id") or "")), default={})
-            if latest.get("stage") != state.blocked_stage or latest.get("status") != "completed" or (latest.get("exit_code", 0) == 0 and latest.get("timed_out") is not True):
+            if latest.get("stage") != state.blocked_stage or latest.get("status") != "completed" or (latest.get("exit_code", 0) == 0 and latest.get("timed_out") is not True) or (state.run_id is not None and latest.get("run_id") != state.run_id):
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="runner failure recovery does not match the last completed failed invocation")
                 raise OrchestratorError("runner failure recovery does not match the last completed failed invocation")
 
@@ -1265,7 +1265,7 @@ class Orchestrator:
                 reason = "; ".join(safety_errors)
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                 raise OrchestratorError(reason)
-        elif not state.blocked_stage or state.run_id is not None:
+        elif (not state.blocked_stage or state.run_id is not None) and not runner_recovery:
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
 
