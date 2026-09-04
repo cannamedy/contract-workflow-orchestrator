@@ -153,6 +153,14 @@ class Orchestrator:
         audit_state = self._load_or_initialize_state_only()
         plan_expected = tuple(path for raw in (audit_state.plan_graph or {}).get("tasks", []) if isinstance(raw, dict) for path in tuple(raw.get("expected_outputs", ()) or ()) + tuple(raw.get("allowed_paths", ()) or ()))
         active_invocation = bool(audit_state.run_id and audit_state.current_stage in AGENT_STAGE_NAMES)
+        if active_invocation and audit_state.run_id:
+            metadata = _read_json(self.store.run_dir(audit_state.run_id) / "metadata.json")
+            if metadata.get("status") == "running":
+                try:
+                    workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+                    active_invocation = bool(workspace and _agent_process_running(workspace.path))
+                except WorkspaceError:
+                    active_invocation = True
         # A digest stop before the first step has no Agent mutation to audit;
         # the current dirty tree is the invocation baseline being explicitly
         # recovered.  Once an invocation has started, a hard stop must not
