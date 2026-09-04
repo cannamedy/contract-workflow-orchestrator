@@ -19,6 +19,7 @@ from contract_workflow.runners import CodexCliRunner, MockRunner
 from contract_workflow.runners.codex_cli import _bind_execution_directory
 from contract_workflow.state_machine import transition_after_outcome
 from contract_workflow.state_store import StateStore, StateStoreError
+from contract_workflow.workspace import RunWorkspace
 
 
 class CwoTests(unittest.TestCase):
@@ -182,6 +183,41 @@ groups:
 
         self.assertEqual(recovered.status, "RUNNING")
         self.assertEqual(recovered.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
+
+    def test_interrupted_agent_recovery_requires_no_live_process_and_unchanged_target(self):
+        config = self.workflow("autonomous")
+        store = StateStore(self.state)
+        run_id = "interrupted-run"
+        workspace = RunWorkspace.create(self.project, self.state, run_id)
+        run_dir = store.run_dir(run_id)
+        metadata = {
+            "run_id": run_id,
+            "stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            "status": "running",
+            "workspace_path": str(workspace),
+            "workspace_baseline": workspace.baseline,
+            "real_baseline": workspace.real_baseline,
+            "excluded_roots": [str(item) for item in workspace.excluded_roots],
+        }
+        (run_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        store.save(WorkflowState(
+            project=config.project_name,
+            project_path=config.project_path,
+            workflow_file=config.workflow_file,
+            workflow_digest=config.digest,
+            current_stage=Stage.HARD_STOP.value,
+            blocked_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            run_id=run_id,
+            stop_code="RECOVERY_UNCERTAIN",
+            stop_reason="prior Agent invocation has no completed artifact",
+            status="HARD_STOPPED",
+        ))
+
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertEqual(recovered.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
+        self.assertEqual(json.loads((run_dir / "metadata.json").read_text())["status"], "failed")
 
     def test_git_audit_classifies_expected_frozen_unrelated_and_conflict(self):
         config = self.workflow()

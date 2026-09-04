@@ -81,6 +81,29 @@ def state_root(project: Path) -> Path:
     return Path.home() / ".local" / "share" / "contract-workflow" / key
 
 
+def _agent_process_running(workspace_path: Path) -> bool:
+    """Best-effort liveness check for an interrupted local Agent invocation."""
+    target = workspace_path.resolve()
+    proc_root = Path("/proc")
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return True
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cwd = (entry / "cwd").resolve()
+            if cwd != target and not cwd.is_relative_to(target):
+                continue
+            command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace")
+            if "codex" in command.lower():
+                return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
+
+
 class Orchestrator:
     def __init__(self, config: WorkflowConfig, store: StateStore | None = None, runner: AgentRunner | None = None, prompt_builder: PromptBuilder | None = None):
         self.config = config
@@ -141,7 +164,7 @@ class Orchestrator:
             and audit_state.run_id is None
         )
         runner_failure_baseline = False
-        if audit_state.stop_code == "RETRY_EXHAUSTED" and audit_state.run_id:
+        if audit_state.stop_code in {"RETRY_EXHAUSTED", "RECOVERY_UNCERTAIN"} and audit_state.run_id:
             failed_run = _read_json(self.store.run_dir(audit_state.run_id) / "metadata.json")
             try:
                 failed_workspace = RunWorkspace.from_metadata(failed_run, Path(self.config.project_path))
@@ -1184,8 +1207,14 @@ class Orchestrator:
             and isinstance(state.last_outcome, dict)
             and str(state.last_outcome.get("summary", "")).startswith(("runner process failed", "runner timed out"))
         )
+        interrupted_recovery = (
+            state.stop_code == "RECOVERY_UNCERTAIN"
+            and state.current_stage == Stage.HARD_STOP.value
+            and state.blocked_stage in AGENT_STAGE_NAMES
+            and state.run_id is not None
+        )
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED" and not runner_recovery
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or schema_recovery or workflow_digest_recovery):
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
@@ -1227,6 +1256,19 @@ class Orchestrator:
             if latest.get("stage") != state.blocked_stage or latest.get("status") != "completed" or (latest.get("exit_code", 0) == 0 and latest.get("timed_out") is not True) or (state.run_id is not None and latest.get("run_id") != state.run_id):
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="runner failure recovery does not match the last completed failed invocation")
                 raise OrchestratorError("runner failure recovery does not match the last completed failed invocation")
+
+        if interrupted_recovery:
+            metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
+            workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+            if metadata.get("status") != "running" or workspace is None:
+                raise OrchestratorError("RECOVERY_UNCERTAIN: interrupted Agent metadata is incomplete")
+            if _agent_process_running(workspace.path):
+                raise OrchestratorError("RECOVERY_UNCERTAIN: Agent process is still running")
+            if not workspace.real_unchanged():
+                raise OrchestratorError("REAL_PROJECT_CHANGED_DURING_RUN: interrupted Agent target drifted")
+            workspace.discard()
+            metadata.update({"status": "failed", "finished_at": now_iso(), "exit_code": -1, "timed_out": False, "error": "interrupted Agent invocation explicitly recovered"})
+            _write_json(self.store.run_dir(state.run_id) / "metadata.json", metadata)
 
         if schema_recovery:
             late_outcome, late_errors, late_detected = self._late_outcome_check(state)
@@ -1274,7 +1316,7 @@ class Orchestrator:
                 reason = "; ".join(safety_errors)
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                 raise OrchestratorError(reason)
-        elif (not state.blocked_stage or state.run_id is not None) and not runner_recovery:
+        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
 
