@@ -165,8 +165,12 @@ def source_integrity(project: Path, sources: tuple[AuthoritativeSource, ...], ov
                 errors.append(f"git commit not found: {source.git_commit}")
             else:
                 head = _git(project, "rev-parse", "HEAD")
-                if head.returncode == 0 and head.stdout.strip() != check.stdout.strip():
-                    errors.append(f"FROZEN_SOURCE_MISMATCH: HEAD is not configured commit {source.git_commit}")
+                configured_commit = check.stdout.strip()
+                if head.returncode == 0 and head.stdout.strip() != configured_commit:
+                    descendant = _git(project, "merge-base", "--is-ancestor", configured_commit, "HEAD")
+                    unchanged = _git(project, "diff", "--quiet", configured_commit, "HEAD", "--", source.path)
+                    if descendant.returncode != 0 or unchanged.returncode != 0:
+                        errors.append(f"FROZEN_SOURCE_MISMATCH: frozen source changed after configured commit {source.git_commit}")
         if source.git_tag and not override:
             check = _git(project, "rev-parse", "refs/tags/" + source.git_tag)
             if check.returncode != 0:

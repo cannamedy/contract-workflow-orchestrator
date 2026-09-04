@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 
 from contract_workflow.config import load_workflow
-from contract_workflow.git_audit import GitClassification, audit_git, working_tree_paths
-from contract_workflow.models import DecisionStatus, Stage, Verdict, WorkItemStatus, WorkflowState
+from contract_workflow.git_audit import GitClassification, audit_git, source_integrity, working_tree_paths
+from contract_workflow.models import AuthoritativeSource, DecisionStatus, Stage, Verdict, WorkItemStatus, WorkflowState
 from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
@@ -160,6 +160,24 @@ groups:
         classes = {item.classification for item in audit.changes}
         self.assertIn(GitClassification.EXPECTED_TARGET_ARTIFACT, classes)
         self.assertIn(GitClassification.UNEXPECTED_UNRELATED_CHANGE, classes)
+
+    def test_frozen_source_allows_descendant_commit_without_source_change(self):
+        subprocess.run(["git", "-C", str(self.project), "config", "user.name", "CWO"], check=True)
+        subprocess.run(["git", "-C", str(self.project), "config", "user.email", "cwo@example.invalid"], check=True)
+        source = self.project / "spec.md"
+        source.write_text("accepted\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.project), "add", "spec.md"], check=True)
+        subprocess.run(["git", "-C", str(self.project), "commit", "-qm", "freeze spec"], check=True)
+        frozen_commit = subprocess.check_output(["git", "-C", str(self.project), "rev-parse", "HEAD"], text=True).strip()
+        (self.project / "unrelated.txt").write_text("infrastructure\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.project), "add", "unrelated.txt"], check=True)
+        subprocess.run(["git", "-C", str(self.project), "commit", "-qm", "unrelated infrastructure"], check=True)
+        frozen = AuthoritativeSource("spec.md", hashlib.sha256(source.read_bytes()).hexdigest(), git_commit=frozen_commit)
+
+        self.assertEqual(source_integrity(self.project, (frozen,)), [])
+
+        source.write_text("changed\n", encoding="utf-8")
+        self.assertTrue(source_integrity(self.project, (frozen,)))
 
     def test_git_audit_classifies_merge_conflict(self):
         subprocess.run(["git", "-C", str(self.project), "config", "user.name", "CWO"], check=True)
