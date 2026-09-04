@@ -11,7 +11,7 @@ Documented version: 0.8.0
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
-  0134490c21903bccd574c461ef94919e1b1e9768
+  da261159979a8cda24d2f88d5db13d831041e80b
 ```
 
 这些是可追溯的历史基线，不是对未来 repository `HEAD` 的永久声明；本页随实现状态更新时
@@ -217,9 +217,14 @@ snapshot 保留和 candidate-specific HumanDecision。当前最新 candidate 的
 PAIS 当前本地 Human Guide 是 Draft，不应被本页或 CWO 视为已提交 authority。PAIS 的具体 CR、
 requirements、schema 和代码实现属于 PAIS 自己的项目记录。
 
-Authority Set v0.8.0 的 PAIS 集成仍需在项目侧安全发布 HED-001 与 REF-MCP-001 后完成远端
-reconcile；这些是 PAIS 的 project metadata/content，不是 CWO 的通用业务规则。若该发布尚未
-完成，本页只把它记录为 pending integration，而不是已实现的 CWO capability claim。
+PAIS 已完成一次真实的 Authority Set v0.8.0 项目集成：远端 `origin/main` 的 authority-only
+commit `dbf59495808613a85024609e0d9a3d461974d742` 发布了 HED-001 与 REF-MCP-001，Human
+Guide 成员保持 `654244de1372a7cd3f39bbbbaa47f08684aa907d9d0b81d1bb1e3095981281e5` 不变。
+CWO 已在同一 `CR-D0FA737B` 下创建并冻结 Authority Set candidate（aggregate hash
+`f7b86791d8dbca9b697cc1f042657ba448da606c79a8e1cdc0a16e40abccd344`），完成 set-level analysis，
+并停在新的 Authority Set HumanDecision `ADR-AUTHORITY-SET-PROMOTION-CR-D0FA737B-F7B86791D8DB`
+的 `PENDING` 状态。下游 typed artifacts 尚未生成；本记录不表示 PAIS 已完成 downstream
+propagation。PAIS 的 project metadata/content 不是 CWO 的通用业务规则。
 
 ## 10. 证据来源与维护规则
 
