@@ -1413,20 +1413,26 @@ class Orchestrator:
         legacy_restored_stage = None
         if legacy_recovery:
             metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
-            workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
-            if metadata.get("status") != "running" or workspace is None:
-                raise OrchestratorError("RECOVERY_UNCERTAIN: historical Agent metadata is incomplete")
-            if _agent_process_running(workspace.path):
-                raise OrchestratorError("RECOVERY_UNCERTAIN: Agent process is still running")
-            drift = self._classify_real_drift(workspace, state, str(metadata.get("stage") or Stage.AUTHORITY_CHANGE_ANALYSIS.value))
-            _write_json(self.store.run_dir(state.run_id) / "real-drift.json", drift)
+            stage = str(metadata.get("stage") or Stage.AUTHORITY_CHANGE_ANALYSIS.value)
+            if metadata.get("status") == "failed" and metadata.get("error") == "legacy unrelated drift stop explicitly recovered" and isinstance(metadata.get("real_drift"), list):
+                drift = list(metadata["real_drift"])
+                workspace = None
+            else:
+                workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+                if metadata.get("status") != "running" or workspace is None:
+                    raise OrchestratorError("RECOVERY_UNCERTAIN: historical Agent metadata is incomplete")
+                if _agent_process_running(workspace.path):
+                    raise OrchestratorError("RECOVERY_UNCERTAIN: Agent process is still running")
+                drift = self._classify_real_drift(workspace, state, stage)
+                _write_json(self.store.run_dir(state.run_id) / "real-drift.json", drift)
             blocking_drift = next((item for item in drift if item["classification"] in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
             if blocking_drift:
                 raise OrchestratorError(f"{blocking_drift['classification']}: {blocking_drift['path']}")
-            workspace.discard()
-            metadata.update({"status": "failed", "finished_at": now_iso(), "error": "legacy unrelated drift stop explicitly recovered", "real_drift": drift})
+            if workspace:
+                workspace.discard()
+            metadata.update({"status": "failed", "finished_at": metadata.get("finished_at") or now_iso(), "error": "legacy unrelated drift stop explicitly recovered", "real_drift": drift})
             _write_json(self.store.run_dir(state.run_id) / "metadata.json", metadata)
-            legacy_restored_stage = str(metadata.get("stage") or "") or None
+            legacy_restored_stage = stage
 
         if interrupted_recovery:
             metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
