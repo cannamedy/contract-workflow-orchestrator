@@ -1171,8 +1171,7 @@ class Orchestrator:
             and state.run_id is None
         )
         runner_recovery = (
-            state.recoverable
-            and state.stop_code == "RETRY_EXHAUSTED"
+            state.stop_code == "RETRY_EXHAUSTED"
             and isinstance(state.last_outcome, dict)
             and str(state.last_outcome.get("summary", "")).startswith(("runner process failed", "runner timed out"))
         )
