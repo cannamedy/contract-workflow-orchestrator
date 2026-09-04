@@ -438,6 +438,10 @@ class Orchestrator:
         scan = scan or scan_authority_changes(self.config, self.store, self._load_or_initialize_state_only())
         integrity = source_integrity(Path(self.config.project_path), self.config.authoritative_sources, scan.integrity_overrides or {})
         configured_authority_paths = tuple(str((Path(source.path) if Path(source.path).is_absolute() else Path(self.config.project_path) / source.path).resolve()) for source in self.config.authoritative_sources if not source.mutable_after_start)
+        configured_authority_paths += tuple(
+            str((Path(member.path) if Path(member.path).is_absolute() else Path(self.config.project_path) / member.path).resolve())
+            for member in self.config.authority_members
+        )
         audit_state = self._load_or_initialize_state_only()
         plan_expected = tuple(path for raw in (audit_state.plan_graph or {}).get("tasks", []) if isinstance(raw, dict) for path in tuple(raw.get("expected_outputs", ()) or ()) + tuple(raw.get("allowed_paths", ()) or ()))
         active_invocation = bool(audit_state.run_id and audit_state.current_stage in AGENT_STAGE_NAMES)
@@ -456,8 +460,8 @@ class Orchestrator:
         pre_invocation_digest_stop = (
             audit_state.current_stage == Stage.HARD_STOP.value
             and audit_state.stop_code == "WORKFLOW_DIGEST_CHANGED"
-            and audit_state.total_steps == 0
             and audit_state.run_id is None
+            and audit_state.blocked_stage not in PROJECT_MUTATING_STAGES
         )
         legacy_drift_recovery = (
             audit_state.current_stage == Stage.HARD_STOP.value
