@@ -99,6 +99,20 @@ class RemoteAuthorityTests(unittest.TestCase):
         self.assertEqual(newer.status, NEWER_REMOTE_REVISION_AVAILABLE)
         self.assertEqual(len(list(self.store.authority_changes_path.glob("CR-*.json"))), 1)
 
+    def test_unrelated_commit_during_pending_candidate_does_not_report_new_change(self):
+        check_remote_authority(self.config, self.store, self.state)
+        self._remote_commit(guide="R2\n", message="guide R2")
+        first = check_remote_authority(self.config, self.store, self.state)
+        self._remote_commit(unrelated="three\n", message="validator infrastructure")
+        result = check_remote_authority(self.config, self.store, self.state)
+        dry = check_remote_authority(self.config, self.store, self.state, dry_run=True)
+        self.assertEqual(first.status, "AUTHORITY_CHANGE_DETECTED")
+        self.assertEqual(result.status, "CHANGE_PENDING")
+        self.assertFalse(result.changed)
+        self.assertEqual(dry.status, "CHANGE_PENDING")
+        self.assertFalse(dry.changed)
+        self.assertEqual(len(list(self.store.authority_changes_path.glob("CR-*.json"))), 1)
+
     def test_local_draft_is_ignored_when_remote_is_unchanged(self):
         check_remote_authority(self.config, self.store, self.state)
         self.guide.write_text("local R3 draft\n", encoding="utf-8")

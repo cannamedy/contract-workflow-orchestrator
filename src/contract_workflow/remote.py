@@ -176,7 +176,11 @@ def check_remote_authority(config: WorkflowConfig, store: Any, state: WorkflowSt
         snapshot_path = str(_snapshot_file(store, commit, source, content))
     snapshot = RemoteAuthoritySnapshot(url, config.authority_branch, commit, source.path, blob, content_sha, snapshot_path, observed)
     if dry_run:
-        return RemoteCheck(snapshot, changed=not same_accepted, status="WOULD_CHANGE" if not same_accepted else "NO_CHANGE")
+        if same_accepted:
+            return RemoteCheck(snapshot, status="NO_CHANGE")
+        if same_candidate:
+            return RemoteCheck(snapshot, status="CHANGE_PENDING")
+        return RemoteCheck(snapshot, changed=True, status="WOULD_CHANGE")
     if first_observation_matches_declared:
         ledger_entry.update({"accepted_remote_commit": commit, "accepted_remote_blob": blob, "accepted_content_sha256": content_sha, "accepted_authority_blob": blob, "accepted_authority_content_sha256": content_sha, "accepted_snapshot_path": snapshot_path, "candidate_remote_commit": commit, "candidate_remote_blob": blob, "candidate_authority_blob": blob, "candidate_content_sha256": content_sha, "candidate_sha256": content_sha, "last_enqueued_authority_blob": blob, "status": "ACCEPTED"})
     remote_sources[sid] = {**prior, **snapshot.to_dict(), "last_seen_remote_commit": commit, "last_seen_remote_blob": blob, "last_seen_remote_content_sha256": content_sha}
@@ -191,7 +195,7 @@ def check_remote_authority(config: WorkflowConfig, store: Any, state: WorkflowSt
         if same_candidate:
             store.save_authority_ledger(ledger)
             store.save_remote_state(remote_state)
-            return RemoteCheck(snapshot, changed=True, status="CHANGE_PENDING")
+            return RemoteCheck(snapshot, status="CHANGE_PENDING")
         ledger_entry.update({"newer_remote_commit": commit, "newer_remote_blob": blob, "newer_remote_content_sha256": content_sha, "status": "NEWER_REMOTE_REVISION_AVAILABLE"})
         remote_sources[sid]["status"] = "NEWER_REMOTE_REVISION_AVAILABLE"
         store.save_authority_ledger(ledger)
