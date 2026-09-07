@@ -366,7 +366,12 @@ attempt 保留可审计的进程状态、stdout/stderr、workspace evidence 与�
 
 失败 invocation 的恢复同样必须服从固定的 RunWorkspace/real-project snapshot。CWO 可以把
 local draft 或 unrelated concurrent drift 作为审计证据保留并继续恢复，但不得因此放宽 authority、
-accepted upstream 或 current target 的漂移保护；失败 workspace 也不得被重新采用。
+ accepted upstream 或 current target 的漂移保护；失败 workspace 也不得被重新采用。
+
+Candidate artifact 的成功完成还必须有确定的内容来源：Agent 返回结构化 candidate content，或
+唯一允许的 workspace candidate 文件在本次 invocation 中发生变化。只有 CWO 外部 candidate
+store 中已存在且 hash 完全匹配的内容，才允许用于恢复路径；candidate path、hash 声明、partial
+output 或文件存在本身都不能被当作语义成功。
 
 ## 10. Scheduling、Gate 与 Recovery
 

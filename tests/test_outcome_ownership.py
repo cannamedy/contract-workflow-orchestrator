@@ -46,6 +46,17 @@ class OutcomeRunner:
                 },
             )
             (run_dir / "outcome.json").write_text(json.dumps(outcome), encoding="utf-8")
+        if self.mode == "claim_only":
+            content = '{"candidate": true}\n'
+            outcome = make_outcome(
+                env["CWO_RUN_ID"], Stage.ARTIFACT_GENERATION.value, cwd.name, Verdict.APPROVED.value,
+                artifact={
+                    "id": "contract", "kind": "MACHINE_CONTRACT",
+                    "candidate_path": "contract.json",
+                    "candidate_hash": hashlib.sha256(content.encode()).hexdigest(),
+                },
+            )
+            (run_dir / "outcome.json").write_text(json.dumps(outcome), encoding="utf-8")
         return RunnerResult(
             0 if self.mode not in {"timeout", "host_lost"} else (-1 if self.mode == "host_lost" else 0),
             stdout, stderr, started, finished,
@@ -173,6 +184,35 @@ groups:
         self.assertIsNone(state.artifacts["contract"].candidate_hash)
         self.assertFalse((self.project / "contract.json").exists())
         self.assertFalse((self.project / "unrelated.txt").exists())
+
+    def test_candidate_claim_without_content_or_workspace_change_is_failure(self):
+        _, state, store = self.invoke("claim_only", max_attempts=1)
+        run_id = state.run_id
+        outcome = json.loads((store.run_dir(run_id) / "outcome.json").read_text())
+        self.assertEqual(state.stop_code, "AGENT_RESULT_MISSING")
+        self.assertEqual(outcome["execution_failure"]["classification"], "AGENT_RESULT_MISSING")
+        self.assertIsNone(state.artifacts["contract"].candidate_hash)
+
+    def test_external_candidate_path_is_recovered_only_from_matching_store_content(self):
+        config = self.config(max_attempts=1)
+        store = StateStore(self.state_root)
+        content = '{"candidate": true}\n'
+        candidate = store.save_artifact_candidate("contract", content)
+        candidate_hash = hashlib.sha256(content.encode()).hexdigest()
+        artifacts = initialize_artifacts(config)
+        artifacts["contract"] = EngineeringArtifact(
+            "contract", "MACHINE_CONTRACT", ArtifactStatus.CANDIDATE.value,
+            candidate_hash=candidate_hash, candidate_path="contract.json",
+            accepted_path="contract.json",
+        )
+        store.save(WorkflowState(
+            project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file,
+            workflow_digest=config.digest, current_stage=Stage.ARTIFACT_VALIDATION.value,
+            current_artifact_id="contract", artifacts=artifacts,
+        ))
+        loaded = Orchestrator(config, store=store).status()
+        self.assertEqual(loaded.artifacts["contract"].candidate_path, str(candidate))
+        self.assertEqual(hashlib.sha256(Path(loaded.artifacts["contract"].candidate_path).read_bytes()).hexdigest(), candidate_hash)
 
     def test_historical_missing_outcome_recovery_is_safe_and_idempotent(self):
         config = self.config()

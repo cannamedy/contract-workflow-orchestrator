@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.14
+Documented version: 0.8.15
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -95,6 +95,9 @@ Repository snapshot observed for this state update:
   分类；local draft 与 unrelated concurrent drift 被记录并保留，authority、accepted upstream
   与 current target drift 仍然阻塞。恢复不会复活或采用失败 workspace，也不会把并发修改导入旧
   invocation view。
+- Artifact candidate 的成功完成必须有可信内容来源：结构化结果含 candidate content，或本次
+  workspace 产生了唯一允许的 candidate 文件变化；只有 CWO 外部 candidate store 中存在且 hash
+  完全匹配的内容才可用于确定性路径修复，不能由 candidate 文件声明或 partial output 推断成功。
 
 ### PARTIAL
 

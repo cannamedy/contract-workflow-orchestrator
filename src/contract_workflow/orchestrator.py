@@ -510,12 +510,14 @@ class Orchestrator:
             and audit_state.blocked_stage in AGENT_STAGE_NAMES
             and bool(self._typed_accepted_source_overrides(audit_state))
         )
+        candidate_validation_recovery = self._candidate_validation_recovery(audit_state)[0]
         pre_invocation_recovery = (
             pre_invocation_digest_stop
             or legacy_drift_recovery
             or runner_failure_baseline
             or interrupted_invocation_recovery
             or typed_promotion_recovery
+            or candidate_validation_recovery
         )
         baseline_paths = () if active_invocation or (audit_state.current_stage == Stage.HARD_STOP.value and not pre_invocation_recovery) else working_tree_paths(Path(self.config.project_path))
         audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected, baseline_paths=baseline_paths)
@@ -975,6 +977,26 @@ class Orchestrator:
                         "WORKSPACE_MUTATION_VIOLATION",
                     )
                 outcome = {**outcome, "artifact": {**artifact, "candidate_content": candidate_content}}
+        elif stage in CANDIDATE_ARTIFACT_STAGES:
+            # A project-relative candidate_path without candidate_content is
+            # only meaningful when the Agent changed the scoped candidate file
+            # in this workspace.  With no workspace diff there is no
+            # trustworthy source for the claimed hash, so do not allow a
+            # later validator to discover a false/missing candidate after the
+            # workspace is discarded.
+            artifact = outcome.get("artifact")
+            if isinstance(artifact, dict) and artifact.get("candidate_content") is None:
+                self._persist_execution_failure(
+                    state, run_dir, _read_json(run_dir / "metadata.json"),
+                    "AGENT_RESULT_MISSING", "artifact candidate content is missing and the workspace has no scoped candidate change",
+                    changes=changes,
+                )
+                return self._workspace_stop(
+                    state,
+                    workspace,
+                    "artifact candidate content is missing and the workspace has no scoped candidate change",
+                    "AGENT_RESULT_MISSING",
+                )
         if stage in PROJECT_MUTATING_STAGES and outcome.get("verdict") == Verdict.APPROVED.value and changes:
             task = self.config.task_at(state.current_group, state.current_task)
             if not task:
@@ -2424,6 +2446,19 @@ class Orchestrator:
         if state.status == WorkflowStatus.RUNNING.value and state.current_stage in AGENT_STAGES and state.run_id is None:
             self.logger.emit("recovery_noop", stage=state.current_stage, reason="logical stage is already ready for a fresh invocation")
             return state
+        candidate_validation_recovery, candidate_validation_errors = self._candidate_validation_recovery(state)
+        if (
+            state.status == WorkflowStatus.RUNNING.value
+            and state.current_stage == Stage.ARTIFACT_VALIDATION.value
+            and state.run_id is None
+            and state.current_artifact_id
+            and self._stored_candidate_matches(state.current_artifact_id, state.artifacts.get(state.current_artifact_id))
+        ):
+            self.logger.emit("recovery_noop", stage=state.current_stage, reason="stored candidate is already ready for validation")
+            return state
+        if candidate_validation_errors:
+            self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="; ".join(candidate_validation_errors))
+            raise OrchestratorError("; ".join(candidate_validation_errors))
         self.logger.emit("recovery_requested", stop_code=state.stop_code, blocked_stage=state.blocked_stage)
         # A process-level interruption can occur before ``_agent_step`` gets
         # a chance to persist RECOVERY_UNCERTAIN.  Treat an unambiguously
@@ -2490,6 +2525,7 @@ class Orchestrator:
             and state.blocked_stage in AGENT_STAGE_NAMES
             and bool(self._typed_accepted_source_overrides(state))
         )
+        candidate_validation_recovery, candidate_validation_errors = self._candidate_validation_recovery(state)
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED" and not runner_recovery
         historical_missing_outcome_recovery, historical_recovery_errors = self._historical_missing_outcome_recovery(state)
         if historical_recovery_errors:
@@ -2500,7 +2536,7 @@ class Orchestrator:
                 reason="; ".join(historical_recovery_errors),
             )
             raise OrchestratorError("; ".join(historical_recovery_errors))
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or schema_recovery or workflow_digest_recovery):
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or candidate_validation_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
@@ -2531,6 +2567,50 @@ class Orchestrator:
                 updated_at=now_iso(),
             )
             self.logger.emit("hard_stop_recovered", stop_code="WORKFLOW_DIGEST_CHANGED", restored_stage=restored_stage)
+            return self._save(recovered)
+
+        if candidate_validation_recovery:
+            audit, integrity, _ = self._audit_gate()
+            if integrity or audit.blocking or not audit.is_repository or audit.error:
+                reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
+                reason = reason or audit.error or "Git audit blocked"
+                self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+                raise OrchestratorError(reason)
+            if any(_read_json(path).get("status") == "running" for path in self.store.runs_path.glob("*/metadata.json")):
+                self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="RECOVERY_UNCERTAIN: an Agent invocation is still running")
+                raise OrchestratorError("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+            artifact_id = state.current_artifact_id or ""
+            artifact = state.artifacts[artifact_id]
+            recovery_evidence = {
+                "type": "CANDIDATE_VALIDATION_RECOVERY",
+                "owner": "CWO_RUNTIME",
+                "reason": "validator previously resolved a project-relative path after workspace disposal; matching external candidate store content was preserved",
+                "artifact_id": artifact_id,
+                "candidate_hash": artifact.candidate_hash,
+                "candidate_path": artifact.candidate_path,
+                "candidate_reconstructed": False,
+                "candidate_adopted": False,
+                "observed_at": now_iso(),
+            }
+            events = self.store.root / "recovery-events"
+            events.mkdir(parents=True, exist_ok=True)
+            _write_json(events / f"candidate-validation-{artifact_id}-{str(artifact.candidate_hash)[:16]}.json", recovery_evidence)
+            recovered = replace(
+                state,
+                current_stage=Stage.ARTIFACT_VALIDATION.value,
+                status=WorkflowStatus.RUNNING.value,
+                current_artifact_id=artifact_id,
+                current_group=None,
+                current_task=None,
+                run_id=None,
+                attempt=0,
+                stop_reason=None,
+                stop_code=None,
+                blocked_stage=None,
+                recoverable=False,
+                updated_at=now_iso(),
+            )
+            self.logger.emit("candidate_validation_recovered", artifact_id=artifact_id, candidate_hash=artifact.candidate_hash)
             return self._save(recovered)
 
         if runner_recovery:
@@ -2719,6 +2799,66 @@ class Orchestrator:
         new_state = replace(state, current_stage=restored_stage, status=WorkflowStatus.RUNNING.value, pending_human_gate=None, run_id=None, attempt=0, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False, updated_at=now_iso())
         self.logger.emit("hard_stop_recovered", stop_code=state.stop_code, restored_stage=restored_stage)
         return self._save(new_state)
+
+    def _stored_candidate_matches(self, artifact_id: str, artifact: Any) -> bool:
+        """Return whether the durable CWO candidate is the exact recorded candidate."""
+        if artifact is None or not isinstance(getattr(artifact, "candidate_hash", None), str):
+            return False
+        candidate = self.store.artifacts_path / artifact_id / "candidate"
+        if not candidate.is_file() or candidate.is_symlink():
+            return False
+        return hashlib.sha256(candidate.read_bytes()).hexdigest().lower() == artifact.candidate_hash.lower()
+
+    def _candidate_validation_recovery(self, state: WorkflowState) -> tuple[bool, list[str]]:
+        """Validate the narrow stop caused by losing a persisted candidate path.
+
+        The candidate is eligible only when it already exists in the CWO-owned
+        artifact store and its hash matches state.  This path never rebuilds
+        content or promotes the candidate; it merely reopens validation.
+        """
+        exact_stop = (
+            state.current_stage == Stage.HARD_STOP.value
+            and state.stop_code == "PROJECT_VALIDATOR_EXECUTION_FAILED"
+            and state.blocked_stage == Stage.ARTIFACT_VALIDATION.value
+            and state.run_id is None
+            and isinstance(state.stop_reason, str)
+            and "candidate artifact is missing" in state.stop_reason
+            and bool(state.current_artifact_id)
+        )
+        if not exact_stop:
+            return False, []
+        errors: list[str] = []
+        artifact_id = state.current_artifact_id or ""
+        artifact = state.artifacts.get(artifact_id)
+        if artifact is None or artifact.status != ArtifactStatus.CANDIDATE.value:
+            errors.append("candidate validation recovery requires a CANDIDATE artifact")
+        elif not self._stored_candidate_matches(artifact_id, artifact):
+            errors.append("candidate validation recovery requires matching CWO candidate store content")
+        spec = next((item for item in self.config.artifact_pipeline if item.id == artifact_id), None)
+        if spec is None:
+            errors.append("candidate validation recovery requires a configured current artifact")
+        else:
+            target = Path(spec.candidate_path or spec.accepted_path or "")
+            if target and not target.is_absolute():
+                target = Path(self.config.project_path) / target
+            if target and target.is_file():
+                if artifact is None or not artifact.accepted_hash or hashlib.sha256(target.read_bytes()).hexdigest().lower() != artifact.accepted_hash.lower():
+                    errors.append(f"CURRENT_TARGET_DRIFT: {target}")
+        if artifact is not None:
+            dependency_revisions = artifact.metadata.get("dependency_revisions", []) if isinstance(artifact.metadata, dict) else []
+            for dependency in dependency_revisions if isinstance(dependency_revisions, list) else []:
+                if not isinstance(dependency, dict):
+                    errors.append("candidate validation recovery found an invalid dependency revision record")
+                    continue
+                dependency_artifact = state.artifacts.get(str(dependency.get("artifact_id", "")))
+                if dependency_artifact is None or dependency_artifact.status != ArtifactStatus.ACCEPTED.value:
+                    errors.append(f"accepted dependency is not available: {dependency.get('artifact_id', '')}")
+                elif dependency_artifact.accepted_hash != dependency.get("hash"):
+                    errors.append(f"accepted dependency hash drifted: {dependency.get('artifact_id', '')}")
+            descendants = set(artifact_impact_closure(self.config, (artifact_id,))) - {artifact_id}
+            if any(state.artifacts.get(item) and state.artifacts[item].status == ArtifactStatus.ACCEPTED.value for item in descendants):
+                errors.append("candidate validation recovery cannot run after downstream typed promotion")
+        return not errors, errors
 
     def _late_outcome_check(self, state: WorkflowState) -> tuple[dict[str, Any] | None, list[str], bool]:
         if not state.run_id or not state.blocked_stage:

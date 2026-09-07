@@ -290,6 +290,22 @@ def hydrate_typed_artifacts(config: WorkflowConfig, state: WorkflowState, store:
         if current is None and candidate is not None:
             artifacts[spec.id] = candidate
             changed = True
+        elif current is not None and current.candidate_hash:
+            # Candidate content is persisted in the external CWO artifact
+            # store before a validation/review step.  Older records could
+            # retain the project-relative output path even after the
+            # workspace was discarded, making the validator look in the real
+            # project and report a false missing candidate.  Repair only when
+            # the external candidate is present and exactly matches the
+            # persisted candidate hash; this never invents or reconstructs
+            # candidate content.
+            external = store.artifacts_path / spec.id / "candidate"
+            if external.is_file() and not external.is_symlink():
+                external_hash = hashlib.sha256(external.read_bytes()).hexdigest()
+                configured = _resolve_artifact_path(config, current.candidate_path)
+                if external_hash == current.candidate_hash and (configured is None or not configured.is_file() or hashlib.sha256(configured.read_bytes()).hexdigest() != current.candidate_hash):
+                    artifacts[spec.id] = replace(current, candidate_path=str(external))
+                    changed = True
     return state if not changed else replace(state, artifacts=artifacts)
 
 
