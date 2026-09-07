@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.4
+Documented version: 0.8.5
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -67,6 +67,9 @@ Repository snapshot observed for this state update:
   rollover、旧 revision/Decision 保留和新的 Set-level HumanDecision 请求。
 - Engineering Specification 的 Authority Set 输入边界；Reference Policy 角色（包括
   `PREFERRED_PATTERN`）与外部 Reference 本身的 Authority 区分。
+- Artifact semantic-review 的 blocking findings 会以结构化 `patch_context` 保留在当前
+  artifact runtime record，并在后续 `ARTIFACT_PATCH` prompt 中重新提供；patch 后仍必须
+  重新 deterministic validate 和 independent review。
 
 ### PARTIAL
 

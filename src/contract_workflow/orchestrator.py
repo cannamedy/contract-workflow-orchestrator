@@ -1065,7 +1065,17 @@ class Orchestrator:
         else:
             verdict = Verdict(outcome["verdict"])
             if verdict == Verdict.REQUIRES_PATCH:
-                updated_artifact = replace(current, status=ArtifactStatus.REQUIRES_PATCH.value, metadata={**current.metadata, "review": raw.get("review", {})})
+                patch_context = {
+                    "run_id": outcome.get("run_id"),
+                    "summary": outcome.get("summary", ""),
+                    "review": raw.get("review", {}),
+                    "issues": outcome.get("issues", []),
+                }
+                updated_artifact = replace(
+                    current,
+                    status=ArtifactStatus.REQUIRES_PATCH.value,
+                    metadata={**current.metadata, "review": raw.get("review", {}), "patch_context": patch_context},
+                )
             elif verdict == Verdict.APPROVED:
                 review = raw.get("review") or {}
                 metadata = {**current.metadata, "review": {"verdict": verdict.value, **review}}

@@ -13,6 +13,7 @@ from contract_workflow.config import WorkflowConfigError, load_workflow
 from contract_workflow.models import ArtifactSpec, ArtifactStatus, EngineeringArtifact, Stage, WorkflowState
 from contract_workflow.orchestrator import Orchestrator
 from contract_workflow.outcome import make_outcome
+from contract_workflow.prompt_builder import PromptBuilder
 from contract_workflow.runners.base import RunnerResult, run_times
 from contract_workflow.state_store import StateStore
 
@@ -89,6 +90,36 @@ class ArtifactPipelineTests(unittest.TestCase):
         self.assertTrue(list((self.state_root / "artifacts" / "spec").glob("candidate")))
         self.assertTrue((self.state_root / "artifacts" / "spec" / "accepted").is_file())
         self.assertTrue((self.state_root / "artifacts" / "spec" / "promotion.json").is_file())
+
+    def test_artifact_review_findings_are_carried_into_patch_prompt(self):
+        config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n")
+        store = StateStore(self.state_root)
+        content = "candidate\n"
+        candidate = store.save_artifact_candidate("spec", content)
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        artifact = EngineeringArtifact(
+            "spec", "ENGINEERING_SPEC", ArtifactStatus.REVIEW_REQUIRED.value,
+            candidate_hash=digest, candidate_path=str(candidate), review_required=True,
+        )
+        state = WorkflowState(
+            project_path=str(self.project), artifacts={"spec": artifact},
+            current_artifact_id="spec", current_stage=Stage.ARTIFACT_REVIEW.value,
+        )
+        issue = {"type": "FROZEN_SOURCE_MISMATCH", "message": "refresh frozen authority provenance"}
+        outcome = {
+            "run_id": "review-run", "verdict": "REQUIRES_PATCH", "summary": "repair provenance",
+            "issues": [issue],
+            "artifact": {"id": "spec", "kind": "ENGINEERING_SPEC", "review": {"verdict": "REQUIRES_PATCH"}},
+        }
+        orchestrator = Orchestrator(config, store=store)
+        patched = orchestrator._apply_artifact_outcome(state, outcome).state
+        self.assertEqual(patched.current_stage, Stage.ARTIFACT_PATCH.value)
+        self.assertEqual(patched.artifacts["spec"].metadata["patch_context"]["issues"], [issue])
+        prompt = PromptBuilder().build(
+            config, patched, self.state_root / "runs" / "patch" / "outcome.json",
+            execution_workspace=self.project,
+        )
+        self.assertIn("refresh frozen authority provenance", prompt)
 
     def test_optional_artifact_can_be_skipped_and_missing_skill_is_diagnostic(self):
         config = self.config("    - id: optional\n      kind: MACHINE_CONTRACT\n      optional: true\n      enabled: false\n      skill_role: machine_contract\n")

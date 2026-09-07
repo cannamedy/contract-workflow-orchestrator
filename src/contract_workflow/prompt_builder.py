@@ -145,6 +145,8 @@ class PromptBuilder:
         else:
             allowed += "\n- no task-specific mutable paths declared"
         previous_issues = _previous_issues(state)
+        if stage == Stage.ARTIFACT_PATCH.value:
+            previous_issues = _artifact_patch_issues(state)
         if stage == "TASK_INDEPENDENT_REVIEW":
             previous_issues = "not provided to preserve review independence; inspect the current repository and frozen authority directly"
         pending = [change for change in state.authority_changes.values() if change.get("status") in {"CHANGE_PENDING", "PROPAGATING"}]
@@ -263,3 +265,24 @@ def _previous_issues(state: WorkflowState) -> str:
         return "none"
     issues = state.last_outcome.get("issues", [])
     return "; ".join(str(item.get("message", "")) for item in issues if isinstance(item, dict)) or str(state.last_outcome.get("summary", "none"))
+
+
+def _artifact_patch_issues(state: WorkflowState) -> str:
+    """Render the latest semantic review request for an artifact patch.
+
+    A patch outcome intentionally replaces ``last_outcome`` with the patch
+    result.  Keep the preceding review request in artifact metadata so a
+    subsequent patch invocation receives the actual defects rather than only
+    the patch agent's summary.  This is scoped to artifact patches; ordinary
+    independent reviews remain independent of prior findings.
+    """
+    artifact = state.artifacts.get(state.current_artifact_id or "")
+    context = artifact.metadata.get("patch_context") if artifact else None
+    if isinstance(context, dict):
+        issues = context.get("issues", [])
+        messages = [str(item.get("message", "")) for item in issues if isinstance(item, dict) and item.get("message")]
+        if messages:
+            return "; ".join(messages)
+        if context.get("summary"):
+            return str(context["summary"])
+    return _previous_issues(state)
