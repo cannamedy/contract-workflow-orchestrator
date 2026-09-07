@@ -448,6 +448,30 @@ artifact_pipeline:
         self.assertIn(f"guide.md sha256={accepted_hash} commit=remote-r2", prompt)
         self.assertNotIn(f"guide.md sha256={old_hash}", prompt)
 
+    def test_prompt_uses_accepted_typed_source_instead_of_bootstrap_hash(self):
+        old_hash = hashlib.sha256(b"bootstrap\n").hexdigest()
+        accepted_hash = hashlib.sha256(b"typed accepted\n").hexdigest()
+        (self.project / "contract.md").write_bytes(b"typed accepted\n")
+        config = self.workflow("autonomous")
+        config = config.__class__(**{
+            **config.__dict__,
+            "authoritative_sources": (AuthoritativeSource("contract.md", old_hash, source_id="contract", role="ENGINEERING_SPEC"),),
+            "artifact_pipeline": (ArtifactSpec("spec", "ENGINEERING_SPEC", review_required=False, accepted_path="contract.md"),),
+            "artifact_pipeline_explicit": True,
+        })
+        state = WorkflowState(
+            project=config.project_name, project_path=config.project_path,
+            workflow_file=config.workflow_file, workflow_digest=config.digest,
+            current_stage=Stage.ARTIFACT_GENERATION.value, current_artifact_id="spec",
+            artifacts={"spec": EngineeringArtifact(
+                id="spec", kind="ENGINEERING_SPEC", status=ArtifactStatus.ACCEPTED.value,
+                accepted_hash=accepted_hash, accepted_path=str(self.project / "contract.md"),
+            )},
+        )
+        prompt = PromptBuilder().build(config, state, self.root / "run" / "outcome.json")
+        self.assertIn(f"contract.md sha256={accepted_hash}", prompt)
+        self.assertNotIn(f"contract.md sha256={old_hash}", prompt)
+
     def test_review_prompt_contains_complete_nested_issue_schema(self):
         config = self.workflow()
         run_id = "exact-review-run"

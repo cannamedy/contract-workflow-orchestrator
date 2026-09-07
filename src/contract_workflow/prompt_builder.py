@@ -48,6 +48,23 @@ def _frozen_authority_lines(config: WorkflowConfig, state: WorkflowState) -> str
                         item["commit"] = str(accepted_source.get("commit_sha") or item["commit"])
                     break
 
+    # A typed artifact promoted by CWO may advance a legacy configured source
+    # path.  Render that accepted artifact hash in the execution contract so
+    # the Agent sees the same frozen source that audit and workspace
+    # materialization use.  Human Guide remains governed by the external
+    # authority snapshot branch above.
+    project = Path(config.project_path).resolve()
+    for artifact in state.artifacts.values():
+        if artifact.kind == "HUMAN_GUIDE" or artifact.status != "ACCEPTED" or not artifact.accepted_hash or not artifact.accepted_path:
+            continue
+        accepted_path = Path(artifact.accepted_path).expanduser().resolve()
+        for item in by_path.values():
+            configured_path = Path(item["path"])
+            configured_path = configured_path if configured_path.is_absolute() else project / configured_path
+            if configured_path.resolve() == accepted_path:
+                item["sha256"] = artifact.accepted_hash
+                break
+
     return "\n".join(f"- {item['path']} sha256={item['sha256']} commit={item['commit']} tag={item['tag']}" for item in by_path.values()) or "- none declared"
 
 
