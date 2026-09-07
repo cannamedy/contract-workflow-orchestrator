@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.2
+Documented version: 0.8.3
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -49,6 +49,9 @@ Repository snapshot observed for this state update:
 - Typed Agent prompt 的冻结 authority 视图会以当前 accepted external snapshot/set-member
   hash 为准，而不会继续暴露已过期的静态配置 hash；这与 workspace materialization 使用同一
   个 accepted authority revision。
+- `RECOVERY_UNCERTAIN` 的已中止 invocation 在其 workspace drift 已完成 scoped 检查后，恢复阶段
+  会把恢复时可见的工作树作为审计基线；无关并发变化继续保留，不会重新被误报为 Agent 未授权
+  变化，而 authority、accepted upstream 和当前 target 仍由恢复前的严格分类阻断。
 - recovery 对已完成 outcome、运行中 Agent、失败 runner、workflow digest 和遗留 drift 状态
   的受限处理。
 - canonical review evidence registry 位于 `WorkflowState` / 外部 runtime `state.json`；支持

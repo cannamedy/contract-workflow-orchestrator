@@ -219,6 +219,38 @@ groups:
         self.assertEqual(recovered.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
         self.assertEqual(json.loads((run_dir / "metadata.json").read_text())["status"], "failed")
 
+    def test_interrupted_recovery_preserves_unrelated_drift_observed_after_invocation(self):
+        config = self.workflow("autonomous")
+        store = StateStore(self.state)
+        run_id = "interrupted-with-concurrent-drift"
+        workspace = RunWorkspace.create(self.project, self.state, run_id)
+        run_dir = store.run_dir(run_id)
+        (run_dir / "metadata.json").write_text(json.dumps({
+            "run_id": run_id,
+            "stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            "status": "running",
+            "workspace_path": str(workspace.path),
+            "workspace_baseline": workspace.baseline,
+            "real_baseline": workspace.real_baseline,
+            "excluded_roots": [str(item) for item in workspace.excluded_roots],
+        }), encoding="utf-8")
+        store.save(WorkflowState(
+            project=config.project_name, project_path=config.project_path,
+            workflow_file=config.workflow_file, workflow_digest=config.digest,
+            current_stage=Stage.HARD_STOP.value,
+            blocked_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            run_id=run_id, stop_code="RECOVERY_UNCERTAIN",
+            stop_reason="prior Agent invocation has no completed artifact",
+            status="HARD_STOPPED",
+        ))
+        (self.project / "human-concurrent-note.txt").write_text("preserve\n", encoding="utf-8")
+
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertEqual(recovered.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
+        self.assertTrue((self.project / "human-concurrent-note.txt").is_file())
+
     def test_git_audit_classifies_expected_frozen_unrelated_and_conflict(self):
         config = self.workflow()
         expected = self.project / "expected.txt"

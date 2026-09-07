@@ -476,7 +476,11 @@ class Orchestrator:
                 runner_failure_baseline = bool(failed_workspace and failed_workspace.real_unchanged())
             except WorkspaceError:
                 runner_failure_baseline = False
-        pre_invocation_recovery = pre_invocation_digest_stop or legacy_drift_recovery or runner_failure_baseline
+        interrupted_invocation_recovery = False
+        if audit_state.stop_code == "RECOVERY_UNCERTAIN" and audit_state.run_id:
+            interrupted_run = _read_json(self.store.run_dir(audit_state.run_id) / "metadata.json")
+            interrupted_invocation_recovery = bool(interrupted_run.get("real_baseline"))
+        pre_invocation_recovery = pre_invocation_digest_stop or legacy_drift_recovery or runner_failure_baseline or interrupted_invocation_recovery
         baseline_paths = () if active_invocation or (audit_state.current_stage == Stage.HARD_STOP.value and not pre_invocation_recovery) else working_tree_paths(Path(self.config.project_path))
         audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected, baseline_paths=baseline_paths)
         self.logger.emit("doctor_check", git_blocking=audit.blocking, integrity_errors=len(integrity), classifications=[item.value for item in audit.classifications])
