@@ -736,10 +736,16 @@ class Orchestrator:
         try:
             result = self.runner.run(workspace.path, prompt, run_dir, self.config.runner.timeout_seconds, env={"CWO_RUN_ID": run_id, "CWO_OUTCOME_PATH": str(outcome_path), "CWO_AUTHORITATIVE_ORIGIN": str(Path(self.config.project_path).resolve())})
         except Exception as exc:
+            changes = workspace.diff()
+            workspace.record_diff(run_dir, changes)
+            self._persist_execution_failure(
+                state, run_dir, _read_json(run_dir / "metadata.json"),
+                "AGENT_PROCESS_FAILED", f"Agent runner failed before completion: {exc}",
+                changes=changes,
+            )
             if workspace:
                 workspace.discard()
-            _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "failed", "error": str(exc), "started_at": now_iso(), **workspace_metadata})
-            return self._workspace_stop(state, None, f"Agent runner failed before completion: {exc}", "RUNNER_FAILURE")
+            return self._invalid_or_failed(state, [f"runner process failed before completion: {exc}"])
         changes = workspace.diff()
         workspace.record_diff(run_dir, changes)
         runner_metadata = dict(result.runner_metadata)
@@ -756,17 +762,33 @@ class Orchestrator:
             # the persisted real_drift evidence carries the more precise
             # CURRENT_TARGET_DRIFT classification.
             stop_code = {"AUTHORITY_DRIFT": "UNAUTHORIZED_AUTHORITY_MUTATION", "ACCEPTED_UPSTREAM_DRIFT": "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT": "REAL_PROJECT_CHANGED_DURING_RUN"}[blocking_drift["classification"]]
+            self._persist_execution_failure(
+                state, run_dir, _read_json(run_dir / "metadata.json"),
+                blocking_drift["classification"], f"{stop_code}: {blocking_drift['path']}",
+                changes=changes, result=result,
+            )
             return self._workspace_stop(state, workspace, f"{stop_code}: {blocking_drift['path']}", stop_code)
         if authority_before != self._agent_authority_snapshot():
+            self._persist_execution_failure(
+                state, run_dir, _read_json(run_dir / "metadata.json"),
+                "AUTHORITY_DRIFT", "UNAUTHORIZED_AUTHORITY_MUTATION: authority changed during Agent invocation",
+                changes=changes, result=result,
+            )
             return self._workspace_stop(state, workspace, "UNAUTHORIZED_AUTHORITY_MUTATION: authority changed during Agent invocation", "UNAUTHORIZED_AUTHORITY_MUTATION")
         valid, outcome, errors = validate_outcome(outcome_path, run_id, stage)
         if result.exit_code != 0 or result.timed_out:
+            classification = self._runner_failure_class(result)
+            reason = "Agent invocation timed out" if result.timed_out else f"Agent process failed with exit code {result.exit_code}"
+            self._persist_execution_failure(state, run_dir, _read_json(run_dir / "metadata.json"), classification, reason, changes=changes, result=result, validation_errors=errors)
             workspace.discard()
             errors = ["runner timed out" if result.timed_out else f"runner process failed with exit code {result.exit_code}"]
             return self._invalid_or_failed(state, errors)
         if not valid or not outcome:
+            classification = "AGENT_RESULT_MISSING" if not outcome_path.is_file() else "AGENT_RESULT_MALFORMED"
+            reason = "Agent did not produce outcome.json" if classification == "AGENT_RESULT_MISSING" else "Agent produced malformed outcome.json"
+            self._persist_execution_failure(state, run_dir, _read_json(run_dir / "metadata.json"), classification, reason, changes=changes, result=result, validation_errors=errors)
             workspace.discard()
-            return self._invalid_or_failed(state, errors)
+            return self._invalid_or_failed(state, errors or ["invalid outcome"])
         self.logger.emit("outcome_validated", run_id=run_id, stage=stage, verdict=outcome["verdict"])
         return self._finalize_agent_outcome(state, outcome, run_dir, _read_json(run_dir / "metadata.json"))
 
@@ -776,6 +798,94 @@ class Orchestrator:
         stopped = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code=stop_code, blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
         self.logger.emit("hard_stop_entered", reason=reason, stop_code=stop_code)
         return StepResult(self._save(stopped), "hard_stop")
+
+    @staticmethod
+    def _runner_failure_class(result: RunnerResult) -> str:
+        metadata = result.runner_metadata or {}
+        if str(metadata.get("host_lost", "")).lower() in {"1", "true", "yes"}:
+            return "AGENT_HOST_LOST"
+        if result.timed_out:
+            return "AGENT_TIMEOUT"
+        return "AGENT_PROCESS_FAILED"
+
+    def _persist_execution_failure(
+        self,
+        state: WorkflowState,
+        run_dir: Path,
+        metadata: dict[str, Any],
+        classification: str,
+        reason: str,
+        *,
+        changes: list[dict[str, Any]] | None = None,
+        result: RunnerResult | None = None,
+        validation_errors: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a CWO-owned failure outcome for an unsuccessful attempt.
+
+        Agent output is evidence only until it passes the normal outcome
+        schema. A failure outcome may be synthesized from executor evidence,
+        but this helper never synthesizes semantic success. Invalid Agent
+        output is retained beside the canonical outcome for auditability.
+        """
+        run_id = state.run_id or str(metadata.get("run_id") or run_dir.name)
+        outcome_path = run_dir / "outcome.json"
+        if outcome_path.is_file():
+            raw_path = run_dir / "agent-outcome.raw.json"
+            if not raw_path.exists():
+                try:
+                    shutil.copy2(outcome_path, raw_path)
+                except OSError:
+                    pass
+        changes = list(changes or [])
+        execution_failure = {
+            "classification": classification,
+            "owner": "CWO_RUNTIME",
+            "reason": reason,
+            "validation_errors": list(validation_errors or []),
+            "exit_code": result.exit_code if result is not None else None,
+            "timed_out": result.timed_out if result is not None else False,
+            "stdout_path": str(result.stdout_path) if result is not None else str(run_dir / "stdout.log"),
+            "stderr_path": str(result.stderr_path) if result is not None else str(run_dir / "stderr.log"),
+            "workspace_diff_count": len(changes),
+            "workspace_diff": changes,
+        }
+        failure = make_outcome(
+            run_id,
+            state.current_stage,
+            self.config.project_name,
+            Verdict.INVALID_OUTCOME.value,
+            blocking=True,
+            summary=reason,
+            next_action="retry",
+            changed_files=[str(item.get("path", "")) for item in changes],
+            issues=[{
+                "type": "RUNTIME_EXECUTION_FAILURE",
+                "severity": "high",
+                "requirement_ids": [],
+                "message": reason,
+                "blocking": True,
+                "recommended_stage": state.current_stage,
+            }],
+            execution_failure=execution_failure,
+        )
+        _write_json(outcome_path, failure)
+        _write_json(run_dir / "metadata.json", {
+            **metadata,
+            # Once the runner has returned control (including by raising an
+            # exception), the bounded invocation attempt is complete from
+            # CWO's perspective.  Preserve a completed attempt record so
+            # normal bounded runner recovery can identify it; the canonical
+            # outcome still carries the failure classification.
+            "status": "completed",
+            "finished_at": metadata.get("finished_at") or now_iso(),
+            "exit_code": metadata.get("exit_code", -1) if result is None else result.exit_code,
+            "timed_out": metadata.get("timed_out", False) if result is None else result.timed_out,
+            "canonical_outcome_owner": "CWO_RUNTIME",
+            "canonical_outcome_status": "FAILURE",
+            "execution_failure": execution_failure,
+        })
+        self.logger.emit("canonical_execution_failure_persisted", run_id=run_id, stage=state.current_stage, classification=classification)
+        return failure
 
     def _finalize_agent_outcome(self, state: WorkflowState, outcome: dict[str, Any], run_dir: Path, metadata: dict[str, Any]) -> StepResult:
         stage = state.current_stage
@@ -792,8 +902,18 @@ class Orchestrator:
             blocking_drift = next((item for item in drift if item["classification"] in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
             if blocking_drift:
                 stop_code = {"AUTHORITY_DRIFT": "UNAUTHORIZED_AUTHORITY_MUTATION", "ACCEPTED_UPSTREAM_DRIFT": "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT": "TARGET_DRIFT"}[blocking_drift["classification"]]
+                self._persist_execution_failure(
+                    state, run_dir, _read_json(run_dir / "metadata.json"),
+                    blocking_drift["classification"], f"{stop_code}: {blocking_drift['path']}",
+                    changes=changes,
+                )
                 return self._workspace_stop(state, workspace, f"{stop_code}: {blocking_drift['path']}", stop_code)
         if stage in STRICT_WORKSPACE_STAGES and changes:
+            self._persist_execution_failure(
+                state, run_dir, _read_json(run_dir / "metadata.json"),
+                "WORKSPACE_MUTATION_VIOLATION", f"workspace mutation is forbidden during {stage}",
+                changes=changes,
+            )
             return self._workspace_stop(state, workspace, f"workspace mutation is forbidden during {stage}", "WORKSPACE_MUTATION_VIOLATION")
         if stage in CANDIDATE_ARTIFACT_STAGES and changes:
             allowed_candidate_path = self._artifact_workspace_path(state)
@@ -803,6 +923,11 @@ class Orchestrator:
                 if str(change.get("path", "")) != allowed_candidate_path
             ]
             if unexpected:
+                self._persist_execution_failure(
+                    state, run_dir, _read_json(run_dir / "metadata.json"),
+                    "WORKSPACE_MUTATION_VIOLATION", f"workspace mutation is outside the current artifact candidate scope: {unexpected[0]}",
+                    changes=changes,
+                )
                 return self._workspace_stop(
                     state,
                     workspace,
@@ -813,6 +938,11 @@ class Orchestrator:
             if isinstance(artifact, dict) and artifact.get("candidate_content") is None:
                 source = workspace.path / allowed_candidate_path if workspace and allowed_candidate_path else None
                 if source is None or not source.is_file() or source.is_symlink():
+                    self._persist_execution_failure(
+                        state, run_dir, _read_json(run_dir / "metadata.json"),
+                        "WORKSPACE_MUTATION_VIOLATION", "artifact candidate workspace output is missing or not a regular file",
+                        changes=changes,
+                    )
                     return self._workspace_stop(
                         state,
                         workspace,
@@ -822,6 +952,11 @@ class Orchestrator:
                 try:
                     candidate_content = source.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError) as exc:
+                    self._persist_execution_failure(
+                        state, run_dir, _read_json(run_dir / "metadata.json"),
+                        "WORKSPACE_MUTATION_VIOLATION", f"artifact candidate workspace output is not UTF-8 text: {exc}",
+                        changes=changes,
+                    )
                     return self._workspace_stop(
                         state,
                         workspace,
@@ -836,14 +971,21 @@ class Orchestrator:
             allowed = tuple(task.allowed_paths) + tuple(task.expected_outputs)
             protected = self._authority_relative_paths()
             if any(str(change.get("path", "")) in protected for change in changes):
+                self._persist_execution_failure(
+                    state, run_dir, _read_json(run_dir / "metadata.json"),
+                    "UNAUTHORIZED_AUTHORITY_MUTATION", "Agent attempted to mutate an authority artifact",
+                    changes=changes,
+                )
                 return self._workspace_stop(state, workspace, "Agent attempted to mutate an authority artifact", "UNAUTHORIZED_AUTHORITY_MUTATION")
             try:
                 if workspace is None:
                     raise WorkspaceError("project-mutating outcome has no isolated workspace")
                 apply_validated_diff(workspace, changes, allowed)
             except TargetDriftError as exc:
+                self._persist_execution_failure(state, run_dir, _read_json(run_dir / "metadata.json"), "TARGET_DRIFT", str(exc), changes=changes)
                 return self._workspace_stop(state, workspace, str(exc), "TARGET_DRIFT")
             except WorkspaceError as exc:
+                self._persist_execution_failure(state, run_dir, _read_json(run_dir / "metadata.json"), "UNAUTHORIZED_WORKSPACE_MUTATION", str(exc), changes=changes)
                 return self._workspace_stop(state, workspace, str(exc), "UNAUTHORIZED_WORKSPACE_MUTATION")
         if workspace:
             workspace.discard()
@@ -2268,6 +2410,9 @@ class Orchestrator:
 
     def recover(self) -> WorkflowState:
         state = self._load_or_initialize()
+        if state.status == WorkflowStatus.RUNNING.value and state.current_stage in AGENT_STAGES and state.run_id is None:
+            self.logger.emit("recovery_noop", stage=state.current_stage, reason="logical stage is already ready for a fresh invocation")
+            return state
         self.logger.emit("recovery_requested", stop_code=state.stop_code, blocked_stage=state.blocked_stage)
         # A process-level interruption can occur before ``_agent_step`` gets
         # a chance to persist RECOVERY_UNCERTAIN.  Treat an unambiguously
@@ -2335,6 +2480,15 @@ class Orchestrator:
             and bool(self._typed_accepted_source_overrides(state))
         )
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED" and not runner_recovery
+        historical_missing_outcome_recovery, historical_recovery_errors = self._historical_missing_outcome_recovery(state)
+        if historical_recovery_errors:
+            self.logger.emit(
+                "recovery_validation_failed",
+                stop_code=state.stop_code,
+                blocked_stage=state.blocked_stage,
+                reason="; ".join(historical_recovery_errors),
+            )
+            raise OrchestratorError("; ".join(historical_recovery_errors))
         if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
@@ -2423,7 +2577,34 @@ class Orchestrator:
             metadata.update({"status": "failed", "finished_at": now_iso(), "exit_code": -1, "timed_out": False, "error": "interrupted Agent invocation explicitly recovered", "real_drift": drift})
             _write_json(self.store.run_dir(state.run_id) / "metadata.json", metadata)
 
-        if schema_recovery:
+        if historical_missing_outcome_recovery:
+            metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
+            workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+            drift = workspace.real_tree_diff() if workspace is not None else []
+            classified_drift = self._classify_real_drift(workspace, state, str(metadata.get("stage") or state.blocked_stage or "")) if workspace is not None else []
+            if workspace is not None and workspace.path.exists():
+                workspace.discard()
+            recovery_evidence = {
+                "type": "HISTORICAL_RUNTIME_RECOVERY",
+                "owner": "CWO_RUNTIME",
+                "reason": "prior Agent attempt completed without an Agent-authored outcome; no outcome is reconstructed",
+                "run_id": state.run_id,
+                "stage": state.blocked_stage,
+                "candidate_adopted": False,
+                "workspace_discarded": True,
+                "real_drift": classified_drift,
+                "observed_at": now_iso(),
+            }
+            run_dir = self.store.run_dir(state.run_id)
+            _write_json(run_dir / "recovery.json", recovery_evidence)
+            _write_json(run_dir / "metadata.json", {
+                **metadata,
+                "recovery_evidence": recovery_evidence,
+                "status": "failed",
+                "error": "historical missing-outcome runtime stop explicitly recovered",
+            })
+            self.logger.emit("historical_missing_outcome_recovered", run_id=state.run_id, stage=state.blocked_stage, real_drift_count=len(drift))
+        elif schema_recovery:
             late_outcome, late_errors, late_detected = self._late_outcome_check(state)
             if late_detected:
                 self.logger.emit(
@@ -2438,6 +2619,36 @@ class Orchestrator:
                     self.logger.emit("late_outcome_validated", run_id=state.run_id, blocked_stage=state.blocked_stage, verdict=late_outcome.get("verdict") if late_outcome else None, resulting_stage=None, valid=False, reason=reason)
                     self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                     raise OrchestratorError(reason)
+                execution_failure = late_outcome.get("execution_failure") if isinstance(late_outcome, dict) else None
+                if isinstance(execution_failure, dict) and execution_failure.get("owner") == "CWO_RUNTIME":
+                    audit, integrity, _ = self._audit_gate()
+                    if integrity or audit.blocking or not audit.is_repository or audit.error:
+                        reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
+                        reason = reason or audit.error or "Git audit blocked"
+                        self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+                        raise OrchestratorError(reason)
+                    metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
+                    workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+                    if workspace is not None:
+                        if _agent_process_running(workspace.path):
+                            raise OrchestratorError("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+                        if workspace.path.exists():
+                            workspace.discard()
+                    recovered = replace(
+                        state,
+                        current_stage=state.blocked_stage,
+                        status=WorkflowStatus.RUNNING.value,
+                        pending_human_gate=None,
+                        run_id=None,
+                        attempt=0,
+                        stop_reason=None,
+                        stop_code=None,
+                        blocked_stage=None,
+                        recoverable=False,
+                        last_outcome=late_outcome,
+                    )
+                    self.logger.emit("canonical_failure_recovered", run_id=state.run_id, stage=state.blocked_stage, classification=execution_failure.get("classification"))
+                    return self._save(recovered)
                 audit, integrity, _ = self._audit_gate()
                 if integrity or audit.blocking or not audit.is_repository or audit.error:
                     reason = "; ".join(integrity) or "; ".join(item.classification.value for item in audit.changes if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"})
@@ -2524,7 +2735,15 @@ class Orchestrator:
         if metadata.get("status") == "running":
             errors.append("RECOVERY_UNCERTAIN: the late outcome Agent invocation is still running")
         elif metadata and (metadata.get("status") != "completed" or metadata.get("exit_code") != 0 or metadata.get("timed_out") is not False):
-            errors.append("late outcome run did not complete successfully")
+            execution_failure = outcome.get("execution_failure") if isinstance(outcome, dict) else None
+            canonical_failure = (
+                isinstance(execution_failure, dict)
+                and execution_failure.get("owner") == "CWO_RUNTIME"
+                and metadata.get("canonical_outcome_owner") == "CWO_RUNTIME"
+                and metadata.get("canonical_outcome_status") == "FAILURE"
+            )
+            if not canonical_failure:
+                errors.append("late outcome run did not complete successfully")
 
         for metadata_path in self.store.runs_path.glob("*/metadata.json"):
             record = _read_json(metadata_path)
@@ -2550,6 +2769,87 @@ class Orchestrator:
         )
         stage = latest.get("stage")
         return stage if isinstance(stage, str) else None
+
+    def _historical_missing_outcome_recovery(self, state: WorkflowState) -> tuple[bool, list[str]]:
+        """Validate the narrow pre-0.8.13 missing-outcome recovery case.
+
+        This path is intentionally limited to a completed candidate-artifact
+        invocation whose workspace produced no scoped diff and whose durable
+        upstream/authority evidence is still intact. It reopens the logical
+        stage for a fresh invocation; it never treats the abandoned attempt as
+        successful and never imports an abandoned workspace.
+        """
+        if not (
+            state.current_stage == Stage.HARD_STOP.value
+            and state.stop_code == "RETRY_EXHAUSTED"
+            and state.blocked_stage in CANDIDATE_ARTIFACT_STAGES
+            and state.run_id
+            and state.current_artifact_id
+            and state.stop_reason == "outcome.json is missing"
+        ):
+            return False, []
+        errors: list[str] = []
+        artifact = state.artifacts.get(state.current_artifact_id)
+        if artifact is None or artifact.status != ArtifactStatus.REQUIRES_PATCH.value:
+            errors.append("historical recovery requires the current artifact to remain REQUIRES_PATCH")
+        metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
+        if metadata.get("run_id") != state.run_id or metadata.get("stage") != state.blocked_stage:
+            errors.append("historical recovery run metadata does not match the persisted blocked stage")
+        if metadata.get("status") != "completed" or metadata.get("exit_code") != 0 or metadata.get("timed_out") is not False:
+            errors.append("historical recovery requires a completed non-timeout invocation")
+        outcome_path = self.store.run_dir(state.run_id) / "outcome.json"
+        if outcome_path.exists():
+            errors.append("historical recovery is only valid when the prior outcome is absent")
+        if metadata.get("workspace_diff_count", 0) != 0:
+            errors.append("historical recovery refuses an invocation that produced workspace mutations")
+        try:
+            historical_workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+        except WorkspaceError as exc:
+            historical_workspace = None
+            errors.append(f"historical recovery workspace metadata is invalid: {exc}")
+        if historical_workspace is not None:
+            current_drift = self._classify_real_drift(historical_workspace, state, str(metadata.get("stage") or state.blocked_stage or ""))
+            blocking = [item for item in current_drift if item.get("classification") in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}]
+            if blocking:
+                errors.append(f"historical recovery is blocked by real project drift at {blocking[0].get('path', '')}")
+
+        # The accepted Engineering Specification remains an immutable state
+        # dependency, independent of any dirty local project counterpart.
+        dependency_revisions = artifact.metadata.get("dependency_revisions", []) if isinstance(artifact.metadata, dict) else []
+        for dependency in dependency_revisions if isinstance(dependency_revisions, list) else []:
+            if not isinstance(dependency, dict):
+                errors.append("historical recovery found an invalid dependency revision record")
+                continue
+            dependency_artifact = state.artifacts.get(str(dependency.get("artifact_id", "")))
+            if dependency_artifact is None or dependency_artifact.status != ArtifactStatus.ACCEPTED.value:
+                errors.append(f"accepted dependency is not available: {dependency.get('artifact_id', '')}")
+            elif dependency_artifact.accepted_hash != dependency.get("hash"):
+                errors.append(f"accepted dependency hash drifted: {dependency.get('artifact_id', '')}")
+
+        # Each materialized accepted authority member is pinned by its
+        # snapshot hash. This avoids treating the local Human Draft as input.
+        materializations = metadata.get("authority_materializations", [])
+        if not isinstance(materializations, list) or not materializations:
+            errors.append("historical recovery lacks accepted authority materialization evidence")
+        else:
+            for record in materializations:
+                if not isinstance(record, dict):
+                    errors.append("historical recovery found invalid authority materialization evidence")
+                    continue
+                snapshot = Path(str(record.get("snapshot_path", ""))).expanduser()
+                expected = str(record.get("sha256", ""))
+                if not snapshot.is_file() or snapshot.is_symlink() or not expected or hashlib.sha256(snapshot.read_bytes()).hexdigest() != expected:
+                    errors.append(f"accepted authority snapshot is missing or drifted: {record.get('path', '')}")
+
+        # If the failed workspace still exists, it may be discarded only after
+        # confirming no Agent is alive. The recovery never resurrects it.
+        workspace_raw = metadata.get("workspace_path")
+        if isinstance(workspace_raw, str) and workspace_raw:
+            workspace_path = Path(workspace_raw).expanduser().resolve()
+            if _agent_process_running(workspace_path):
+                errors.append("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+
+        return not errors, errors
 
     def _schema_recovery_errors(self, state: WorkflowState) -> list[str]:
         errors: list[str] = []

@@ -353,6 +353,17 @@ workspace、baseline、diff 和 commit-back 前置条件共同实现。当前 Li
 命名空间隔离，absolute path 访问风险仍存在，因此 origin monitoring 与 transactional
 commit-back 仍是必要防线。
 
+### 9.1 Invocation outcome 的责任归属
+
+Agent 可以在 RunWorkspace 中完成有界工作并返回结构化结果，但 `outcome.json` 的 canonical
+持久化责任属于 CWO Runner/Executor，而不是 child Agent。CWO 必须为每次结束的 invocation
+attempt 保留可审计的进程状态、stdout/stderr、workspace evidence 与结果分类；结果缺失、格式
+错误、进程失败、超时或 host 丢失时，可以由 CWO 根据确定性运行时证据生成失败 outcome。
+
+这条规则不允许 CWO 从候选文件存在、workspace mutation、进程消失或部分输出推断语义成功。
+只有合法的结构化完成结果，加上既有 scope、authority、deterministic validation 和 independent
+review 条件，才能使 Artifact 继续传播。
+
 ## 10. Scheduling、Gate 与 Recovery
 
 CWO 使用依赖感知 scheduler 维护 work item 状态。直接受影响的 work 可进入

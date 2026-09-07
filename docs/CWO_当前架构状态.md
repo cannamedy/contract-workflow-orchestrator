@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.12
+Documented version: 0.8.13
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -86,6 +86,11 @@ Repository snapshot observed for this state update:
 - 复合 typed artifact（例如 Machine Contract）的 JSON object/array candidate 会按稳定的
   UTF-8 canonical JSON 序列化后再计算 hash、落盘和交给项目 validator；字符串 artifact
   保持原始内容语义，避免 structured candidate 在通用生命周期中被错误当作 Python repr。
+- Agent invocation 的 canonical `outcome.json` 由 CWO Runner/Executor 负责持久化。Agent 返回的
+  结构化结果只是待校验输入；进程失败、超时、主机丢失、结果缺失或结果 malformed 时，CWO
+  可以根据运行时证据生成明确的失败 outcome，但绝不因候选文件存在或 workspace 有变化而合成
+  语义成功。失败尝试、stdout/stderr、workspace diff 和 failure classification 会保留在 run
+  evidence 中，供有界重试与恢复使用。
 
 ### PARTIAL
 
