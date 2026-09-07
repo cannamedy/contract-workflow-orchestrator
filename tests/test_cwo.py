@@ -750,6 +750,7 @@ artifact_pipeline:
         old = b"bootstrap contract\n"
         current = b"promoted typed contract\n"
         (self.project / "contract.md").write_bytes(current)
+        (self.project / "preexisting-notes.txt").write_text("user baseline\n", encoding="utf-8")
         config = self.workflow("autonomous")
         config = config.__class__(**{
             **config.__dict__,
