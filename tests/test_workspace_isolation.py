@@ -260,6 +260,16 @@ class WorkspaceIsolationTests(unittest.TestCase):
         self.assertEqual(accepted.read_text(), "accepted contract\n")
         workspace.discard()
 
+    def test_accepted_external_authority_snapshot_is_materialized_only_in_workspace(self):
+        snapshot = self.state / "authority" / "snapshots" / "remote" / "guide.md"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("submitted authority\n", encoding="utf-8")
+        workspace = RunWorkspace.create(self.project, self.state, "authority-materialized", {"guide.md": snapshot})
+        self.assertEqual((workspace.path / "guide.md").read_text(encoding="utf-8"), "submitted authority\n")
+        self.assertEqual((self.project / "guide.md").read_text(encoding="utf-8"), "accepted\n")
+        self.assertEqual(workspace.diff(), [])
+        workspace.discard()
+
     def test_unfinished_workspace_recovery_never_commits(self):
         config = self.config()
         store = StateStore(self.state)

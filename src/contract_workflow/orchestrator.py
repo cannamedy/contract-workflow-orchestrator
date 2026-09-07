@@ -647,10 +647,17 @@ class Orchestrator:
         outcome_path = run_dir / "outcome.json"
         authority_before = self._agent_authority_snapshot()
         try:
-            workspace = RunWorkspace.create(Path(self.config.project_path), self.store.root, run_id)
+            authority_materializations = self._accepted_authority_materializations(state)
+            workspace = RunWorkspace.create(
+                Path(self.config.project_path),
+                self.store.root,
+                run_id,
+                materialized_files=authority_materializations,
+            )
         except Exception as exc:
             _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "failed", "error": str(exc), "started_at": now_iso()})
-            return self._workspace_stop(state, None, f"could not create isolated Agent workspace: {exc}", "WORKSPACE_SETUP_FAILED")
+            stop_code = "FROZEN_SOURCE_MISMATCH" if "FROZEN_SOURCE_MISMATCH" in str(exc) else "WORKSPACE_SETUP_FAILED"
+            return self._workspace_stop(state, None, f"could not create isolated Agent workspace: {exc}", stop_code)
         workspace_metadata = {
             "authoritative_origin": str(Path(self.config.project_path).resolve()),
             "workspace_path": str(workspace.path),
@@ -658,6 +665,14 @@ class Orchestrator:
             "workspace_baseline": workspace.baseline,
             "real_baseline": workspace.real_baseline,
             "excluded_roots": [str(item) for item in workspace.excluded_roots],
+            "authority_materializations": [
+                {
+                    "path": relative,
+                    "snapshot_path": str(source),
+                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                }
+                for relative, source in sorted(authority_materializations.items())
+            ],
         }
         prompt = self.prompt_builder.build(self.config, state, outcome_path, execution_workspace=workspace.path)
         (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
@@ -919,6 +934,47 @@ class Orchestrator:
             if ((source.role or "").upper() == "HUMAN_GUIDE" or source_id(source) == "human-guide") and path.resolve().is_relative_to(Path(self.config.project_path).resolve()) and path.resolve().relative_to(Path(self.config.project_path).resolve()).as_posix() in remote_paths:
                 snapshot.pop(source_id(source), None)
         return snapshot
+
+    def _accepted_authority_materializations(self, state: WorkflowState) -> dict[str, Path]:
+        """Return immutable accepted remote authority members for the run view.
+
+        The real project remains a Human Draft Workspace.  An Agent must see
+        the accepted external authority revision at the configured project
+        path, otherwise a local draft can incorrectly appear to be the frozen
+        upstream.  This projection is workspace-only and is never committed
+        back to the real project.
+        """
+        ledger = self.store.load_authority_ledger() or {}
+        authority_set = ledger.get("authority_set") if isinstance(ledger, dict) else None
+        records = authority_set.get("accepted_members") if isinstance(authority_set, dict) else None
+        configured = {member.id: member for member in self.config.authority_members}
+        materializations: dict[str, Path] = {}
+        if isinstance(records, list) and records:
+            for record in records:
+                if not isinstance(record, dict):
+                    raise WorkspaceError("FROZEN_SOURCE_MISMATCH: accepted authority member record is invalid")
+                member_id = str(record.get("member_id", ""))
+                member = configured.get(member_id)
+                if member is None or member.path != record.get("path") or member.role != record.get("role"):
+                    raise WorkspaceError(f"FROZEN_SOURCE_MISMATCH: accepted authority member is not configured: {member_id}")
+                snapshot = Path(str(record.get("snapshot_path", ""))).expanduser().resolve()
+                expected = str(record.get("content_sha256", ""))
+                if not expected or not snapshot.is_file() or snapshot.is_symlink() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != expected:
+                    raise WorkspaceError(f"FROZEN_SOURCE_MISMATCH: accepted authority member snapshot is missing or drifted: {member_id}")
+                materializations[member.path] = snapshot
+            return materializations
+
+        # Preserve compatibility for legacy projects whose accepted external
+        # authority is represented by the Human Guide artifact alone.
+        guide = state.artifacts.get("human-guide")
+        if guide and guide.status == ArtifactStatus.ACCEPTED.value and guide.accepted_hash and guide.accepted_path:
+            member = next((item for item in self.config.authority_members if item.role == "ARCHITECTURE_GUIDE"), None)
+            if member:
+                snapshot = Path(guide.accepted_path).expanduser().resolve()
+                if not snapshot.is_file() or snapshot.is_symlink() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != guide.accepted_hash:
+                    raise WorkspaceError("FROZEN_SOURCE_MISMATCH: accepted Human Guide snapshot is missing or drifted")
+                materializations[member.path] = snapshot
+        return materializations
 
     def _apply_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         stage = state.current_stage

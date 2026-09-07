@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 IGNORED_DIRECTORY_NAMES = frozenset({
@@ -122,7 +122,13 @@ class RunWorkspace:
     excluded_roots: tuple[Path, ...] = ()
 
     @classmethod
-    def create(cls, real_project: Path, state_root: Path, run_id: str) -> "RunWorkspace":
+    def create(
+        cls,
+        real_project: Path,
+        state_root: Path,
+        run_id: str,
+        materialized_files: Mapping[str, Path] | None = None,
+    ) -> "RunWorkspace":
         real_project = real_project.resolve()
         workspace_root = (state_root / "workspaces" / run_id).resolve()
         path = workspace_root / "project"
@@ -132,6 +138,14 @@ class RunWorkspace:
         excluded = (state_root.resolve(),)
         before = real_fingerprint(real_project, excluded)
         _copy_tree(real_project, path, real_project, excluded)
+        for relative, source in sorted((materialized_files or {}).items()):
+            destination = path / _safe_relative(relative)
+            source = Path(source).expanduser().resolve()
+            if source.is_symlink() or not source.is_file():
+                shutil.rmtree(workspace_root, ignore_errors=True)
+                raise WorkspaceError(f"materialized source is not a regular file: {source}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
         after = real_fingerprint(real_project, excluded)
         if before != after:
             shutil.rmtree(workspace_root, ignore_errors=True)
