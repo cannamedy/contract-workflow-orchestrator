@@ -121,6 +121,28 @@ class ArtifactPipelineTests(unittest.TestCase):
         )
         self.assertIn("refresh frozen authority provenance", prompt)
 
+    def test_artifact_review_materializes_exact_external_candidate(self):
+        config = self.config(
+            "    - id: spec\n      kind: ENGINEERING_SPEC\n      accepted_path: artifact.md\n"
+        )
+        store = StateStore(self.state_root)
+        content = "external candidate\n"
+        candidate = store.save_artifact_candidate("spec", content)
+        artifact = EngineeringArtifact(
+            "spec", "ENGINEERING_SPEC", ArtifactStatus.REVIEW_REQUIRED.value,
+            candidate_hash=hashlib.sha256(content.encode()).hexdigest(),
+            candidate_path=str(candidate), review_required=True, accepted_path="artifact.md",
+        )
+        state = WorkflowState(
+            project_path=str(self.project), artifacts={"spec": artifact},
+            current_artifact_id="spec", current_stage=Stage.ARTIFACT_REVIEW.value,
+        )
+        materialized = Orchestrator(config, store=store)._artifact_materializations(
+            state, Stage.ARTIFACT_REVIEW.value
+        )
+        self.assertEqual(materialized, {"artifact.md": candidate.resolve()})
+        self.assertEqual(materialized["artifact.md"].read_text(), content)
+
     def test_optional_artifact_can_be_skipped_and_missing_skill_is_diagnostic(self):
         config = self.config("    - id: optional\n      kind: MACHINE_CONTRACT\n      optional: true\n      enabled: false\n      skill_role: machine_contract\n")
         self.assertEqual(missing_skill_roles(config), ["machine_contract"])

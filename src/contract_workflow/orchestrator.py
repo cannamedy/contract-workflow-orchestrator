@@ -652,6 +652,7 @@ class Orchestrator:
         authority_before = self._agent_authority_snapshot()
         try:
             authority_materializations = self._accepted_authority_materializations(state)
+            authority_materializations.update(self._artifact_materializations(state, stage))
             workspace = RunWorkspace.create(
                 Path(self.config.project_path),
                 self.store.root,
@@ -980,6 +981,35 @@ class Orchestrator:
                     raise WorkspaceError("FROZEN_SOURCE_MISMATCH: accepted Human Guide snapshot is missing or drifted")
                 materializations[member.path] = snapshot
         return materializations
+
+    def _artifact_materializations(self, state: WorkflowState, stage: str) -> dict[str, Path]:
+        """Project the exact external artifact candidate into Agent review/patch views.
+
+        Artifact candidates live in the external CWO store until promotion.
+        Reviewers and patch agents must nevertheless read that candidate at
+        the configured artifact path; otherwise the copied real project can
+        silently expose an older accepted file and produce a false review.
+        This projection is workspace-only and never changes the real project.
+        """
+        if stage not in {Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value}:
+            return {}
+        artifact = state.artifacts.get(state.current_artifact_id or "")
+        spec = next((item for item in self.config.artifact_pipeline if item.id == state.current_artifact_id), None)
+        if artifact is None or spec is None or not artifact.candidate_path or not spec.accepted_path:
+            return {}
+        source = Path(artifact.candidate_path).expanduser().resolve()
+        if source.is_symlink() or not source.is_file():
+            raise WorkspaceError(f"candidate artifact is not a regular file: {source}")
+        project = Path(self.config.project_path).resolve()
+        destination = Path(spec.accepted_path)
+        if destination.is_absolute():
+            destination = destination.resolve()
+            if not destination.is_relative_to(project):
+                raise WorkspaceError(f"unsafe artifact review destination: {spec.accepted_path}")
+            destination = destination.relative_to(project)
+        if destination.is_absolute() or ".." in destination.parts or ".git" in destination.parts:
+            raise WorkspaceError(f"unsafe artifact review destination: {spec.accepted_path}")
+        return {destination.as_posix(): source}
 
     def _apply_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         stage = state.current_stage

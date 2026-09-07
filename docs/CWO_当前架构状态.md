@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.6
+Documented version: 0.8.7
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -73,6 +73,9 @@ Repository snapshot observed for this state update:
 - 进程级中断若留下无 outcome 且无活跃 Agent 的 `RUNNING` invocation，受支持的 `recover`
   会先将其确定性标记为可恢复的 `RECOVERY_UNCERTAIN`，再执行既有 drift audit；活跃进程、
   late outcome 和真实目标漂移仍不会被绕过。
+- `ARTIFACT_REVIEW` 与 `ARTIFACT_PATCH` invocation 会把 external candidate 物化到该
+  artifact 的 configured path；reviewer 和 patcher 不会因读取 real project 中旧 accepted
+  文件而误判 candidate provenance。
 
 ### PARTIAL
 
