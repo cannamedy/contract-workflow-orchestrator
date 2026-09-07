@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from contract_workflow.artifacts import artifact_impact_closure, dependency_revisions, initialize_artifacts, missing_skill_roles, reconcile_artifact_staleness, validate_artifact_graph, validate_artifact_promotion, validate_final_conformance
+from contract_workflow.artifacts import artifact_impact_closure, dependency_revisions, initialize_artifacts, missing_skill_roles, reconcile_artifact_staleness, validate_artifact_graph, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance
 from contract_workflow.config import WorkflowConfigError, load_workflow
 from contract_workflow.models import ArtifactSpec, ArtifactStatus, EngineeringArtifact, Stage, WorkflowState
 from contract_workflow.orchestrator import Orchestrator
@@ -90,6 +90,26 @@ class ArtifactPipelineTests(unittest.TestCase):
         self.assertTrue(list((self.state_root / "artifacts" / "spec").glob("candidate")))
         self.assertTrue((self.state_root / "artifacts" / "spec" / "accepted").is_file())
         self.assertTrue((self.state_root / "artifacts" / "spec" / "promotion.json").is_file())
+
+    def test_structured_candidate_content_is_canonicalized_and_hashed(self):
+        config = self.config("    - id: contract\n      kind: MACHINE_CONTRACT\n      review_required: false\n")
+        state = WorkflowState(
+            project=config.project_name, project_path=config.project_path,
+            workflow_file=config.workflow_file, workflow_digest=config.digest,
+            current_stage=Stage.ARTIFACT_GENERATION.value,
+            current_artifact_id="contract",
+            artifacts=initialize_artifacts(config),
+        )
+        content = {"z": 1, "a": [True, "值"]}
+        canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        raw, errors = validate_artifact_outcome(
+            config, state,
+            {"id": "contract", "kind": "MACHINE_CONTRACT", "candidate_content": content},
+            stage=Stage.ARTIFACT_GENERATION.value,
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(raw["candidate_content"], canonical)
+        self.assertEqual(raw["candidate_hash"], hashlib.sha256(canonical.encode("utf-8")).hexdigest())
 
     def test_artifact_review_findings_are_carried_into_patch_prompt(self):
         config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n")

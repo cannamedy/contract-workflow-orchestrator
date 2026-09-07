@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.10
+Documented version: 0.8.11
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -83,6 +83,9 @@ Repository snapshot observed for this state update:
 - typed artifact invocation 的冻结 authority prompt 与 audit、workspace materialization 共享
   已接受 artifact 的 hash；因此 Agent 不会依据过时 bootstrap hash 拒绝 CWO 自己刚晋升的
   typed source。
+- 复合 typed artifact（例如 Machine Contract）的 JSON object/array candidate 会按稳定的
+  UTF-8 canonical JSON 序列化后再计算 hash、落盘和交给项目 validator；字符串 artifact
+  保持原始内容语义，避免 structured candidate 在通用生命周期中被错误当作 Python repr。
 
 ### PARTIAL
 

@@ -1128,7 +1128,7 @@ class Orchestrator:
             candidate_hash = raw.get("candidate_hash")
             candidate_path = raw.get("candidate_path") or current.candidate_path
             if raw.get("candidate_content") is not None:
-                candidate_path = str(self.store.save_artifact_candidate(artifact_id, str(raw["candidate_content"])))
+                candidate_path = str(self.store.save_artifact_candidate(artifact_id, raw["candidate_content"]))
             status = ArtifactStatus.REVIEW_REQUIRED.value if current.review_required else ArtifactStatus.APPROVED.value
             metadata = {
                 **{key: value for key, value in current.metadata.items() if key not in {"validator", "review", "validator_error"}},

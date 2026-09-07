@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -8,6 +9,15 @@ from typing import Any, Iterable
 
 from .models import ARTIFACT_KINDS, ArtifactSpec, ArtifactStatus, DecisionStatus, EngineeringArtifact, WorkflowConfig, WorkflowState
 from .project_validator import INTERNAL_VALIDATOR_ROLES
+
+
+def canonical_candidate_content(content: Any) -> str | None:
+    """Return the stable persisted representation of an artifact candidate."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return None
 
 
 def validate_artifact_graph(specs: Iterable[ArtifactSpec]) -> list[str]:
@@ -491,13 +501,15 @@ def validate_artifact_outcome(config: WorkflowConfig, state: WorkflowState, raw:
     if raw.get("kind") != spec.kind:
         return None, ["artifact.kind does not match the configured artifact kind"]
     errors: list[str] = []
+    serialized_content: str | None = None
     if stage in {"ARTIFACT_GENERATION", "ARTIFACT_PATCH"}:
         candidate_hash = raw.get("candidate_hash")
         content = raw.get("candidate_content")
-        if content is not None and not isinstance(content, str):
-            errors.append("artifact.candidate_content must be a string when present")
-        if content is not None:
-            calculated = hashlib.sha256(content.encode()).hexdigest()
+        serialized_content = canonical_candidate_content(content) if content is not None else None
+        if content is not None and serialized_content is None:
+            errors.append("artifact.candidate_content must be a string or JSON object/array when present")
+        if serialized_content is not None:
+            calculated = hashlib.sha256(serialized_content.encode("utf-8")).hexdigest()
             if candidate_hash is not None and candidate_hash != calculated:
                 errors.append("artifact.candidate_hash does not match candidate_content")
             candidate_hash = calculated
@@ -513,6 +525,8 @@ def validate_artifact_outcome(config: WorkflowConfig, state: WorkflowState, raw:
     if raw.get("validator") is not None and not isinstance(raw.get("validator"), dict):
         errors.append("artifact.validator must be an object")
     normalized = dict(raw)
+    if serialized_content is not None:
+        normalized["candidate_content"] = serialized_content
     normalized["candidate_hash"] = candidate_hash if stage in {"ARTIFACT_GENERATION", "ARTIFACT_PATCH"} else raw.get("candidate_hash")
     return (normalized, errors) if not errors else (None, errors)
 
