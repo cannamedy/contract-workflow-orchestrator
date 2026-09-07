@@ -436,13 +436,22 @@ class Orchestrator:
 
     def _audit_gate(self, scan: AuthorityScan | None = None) -> tuple[GitAudit, list[str], AuthorityScan]:
         scan = scan or scan_authority_changes(self.config, self.store, self._load_or_initialize_state_only())
-        integrity = source_integrity(Path(self.config.project_path), self.config.authoritative_sources, scan.integrity_overrides or {})
+        audit_state = self._load_or_initialize_state_only()
+        integrity_overrides = dict(scan.integrity_overrides or {})
+        # Typed downstream promotions may advance a configured legacy source
+        # path.  Once the corresponding EngineeringArtifact is accepted, its
+        # persisted hash/path is the runtime authority for that artifact; the
+        # bootstrap source hash in workflow.yaml must not reclassify the
+        # orchestrator's own promotion as frozen-source drift. Human Guide
+        # authority remains governed by the remote scan and is intentionally
+        # excluded from this adapter.
+        integrity_overrides.update(self._typed_accepted_source_overrides(audit_state))
+        integrity = source_integrity(Path(self.config.project_path), self.config.authoritative_sources, integrity_overrides)
         configured_authority_paths = tuple(str((Path(source.path) if Path(source.path).is_absolute() else Path(self.config.project_path) / source.path).resolve()) for source in self.config.authoritative_sources if not source.mutable_after_start)
         configured_authority_paths += tuple(
             str((Path(member.path) if Path(member.path).is_absolute() else Path(self.config.project_path) / member.path).resolve())
             for member in self.config.authority_members
         )
-        audit_state = self._load_or_initialize_state_only()
         plan_expected = tuple(path for raw in (audit_state.plan_graph or {}).get("tasks", []) if isinstance(raw, dict) for path in tuple(raw.get("expected_outputs", ()) or ()) + tuple(raw.get("allowed_paths", ()) or ()))
         active_invocation = bool(audit_state.run_id and audit_state.current_stage in AGENT_STAGE_NAMES)
         if active_invocation and audit_state.run_id:
@@ -485,6 +494,30 @@ class Orchestrator:
         audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected, baseline_paths=baseline_paths)
         self.logger.emit("doctor_check", git_blocking=audit.blocking, integrity_errors=len(integrity), classifications=[item.value for item in audit.classifications])
         return audit, integrity, scan
+
+    def _typed_accepted_source_overrides(self, state: WorkflowState) -> dict[str, tuple[str, str]]:
+        """Map bootstrap source paths to accepted typed artifact evidence."""
+        if not self.config.artifact_pipeline_explicit:
+            return {}
+        overrides: dict[str, tuple[str, str]] = {}
+        project = Path(self.config.project_path).resolve()
+        for source in self.config.authoritative_sources:
+            source_path = Path(source.path)
+            source_path = source_path if source_path.is_absolute() else project / source_path
+            for spec in self.config.artifact_pipeline:
+                if spec.kind == "HUMAN_GUIDE" or not spec.accepted_path:
+                    continue
+                configured_artifact_path = Path(spec.accepted_path)
+                configured_artifact_path = configured_artifact_path if configured_artifact_path.is_absolute() else project / configured_artifact_path
+                if configured_artifact_path.resolve() != source_path.resolve():
+                    continue
+                artifact = state.artifacts.get(spec.id)
+                if artifact and artifact.status == ArtifactStatus.ACCEPTED.value and artifact.accepted_hash and artifact.accepted_path:
+                    accepted_path = Path(artifact.accepted_path).expanduser().resolve()
+                    if accepted_path.is_file() and hashlib.sha256(accepted_path.read_bytes()).hexdigest() == artifact.accepted_hash:
+                        overrides[str(source_path.resolve())] = (str(accepted_path), artifact.accepted_hash)
+                break
+        return overrides
 
     def _load_or_initialize_state_only(self) -> WorkflowState:
         return self.store.load() or initial_state(self.config, self.store)
@@ -2213,8 +2246,14 @@ class Orchestrator:
             and state.blocked_stage in AGENT_STAGE_NAMES
             and state.run_id is not None
         )
+        typed_promotion_recovery = (
+            state.current_stage == Stage.HARD_STOP.value
+            and state.stop_code == "FROZEN_SOURCE_MISMATCH"
+            and state.blocked_stage in AGENT_STAGE_NAMES
+            and bool(self._typed_accepted_source_overrides(state))
+        )
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED" and not runner_recovery
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or schema_recovery or workflow_digest_recovery):
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or typed_promotion_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
@@ -2348,7 +2387,7 @@ class Orchestrator:
                 reason = "; ".join(safety_errors)
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                 raise OrchestratorError(reason)
-        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or legacy_recovery):
+        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or typed_promotion_recovery or legacy_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
 

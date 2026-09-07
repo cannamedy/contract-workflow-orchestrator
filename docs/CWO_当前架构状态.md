@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.7
+Documented version: 0.8.8
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -76,6 +76,10 @@ Repository snapshot observed for this state update:
 - `ARTIFACT_REVIEW` 与 `ARTIFACT_PATCH` invocation 会把 external candidate 物化到该
   artifact 的 configured path；reviewer 和 patcher 不会因读取 real project 中旧 accepted
   文件而误判 candidate provenance。
+- Typed artifact promotion 更新已配置的 bootstrap source 后，audit/recovery 会以已接受
+  artifact 的实际 hash 作为该非 Human Guide source 的运行时完整性证据；这避免 CWO 自己的
+  合法 promotion 被旧静态 source hash 误报为 frozen-source drift，同时仍保留严格的 authority
+  与目标漂移保护。
 
 ### PARTIAL
 

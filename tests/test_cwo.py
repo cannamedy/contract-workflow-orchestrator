@@ -11,7 +11,7 @@ from pathlib import Path
 
 from contract_workflow.config import load_workflow
 from contract_workflow.git_audit import GitClassification, audit_git, source_integrity, working_tree_paths
-from contract_workflow.models import AuthoritativeSource, DecisionStatus, EngineeringArtifact, Stage, Verdict, WorkItemStatus, WorkflowState
+from contract_workflow.models import ArtifactSpec, ArtifactStatus, AuthoritativeSource, DecisionStatus, EngineeringArtifact, Stage, Verdict, WorkItemStatus, WorkflowState
 from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
@@ -745,6 +745,39 @@ artifact_pipeline:
                 store.save(WorkflowState(project=config.project_name, project_path=config.project_path, workflow_file=config.workflow_file, workflow_digest=config.digest, current_stage=Stage.HARD_STOP.value, blocked_stage=Stage.FINAL_VERIFICATION.value, stop_code=code, stop_reason=code, recoverable=False, status="HARD_STOPPED"))
                 with self.assertRaises(OrchestratorError):
                     Orchestrator(config, store=store).recover()
+
+    def test_recovery_accepts_typed_source_advanced_by_own_promotion(self):
+        old = b"bootstrap contract\n"
+        current = b"promoted typed contract\n"
+        (self.project / "contract.md").write_bytes(current)
+        config = self.workflow("autonomous")
+        config = config.__class__(**{
+            **config.__dict__,
+            "authoritative_sources": (AuthoritativeSource("contract.md", hashlib.sha256(old).hexdigest(), source_id="contract", role="ENGINEERING_SPEC"),),
+            "artifact_pipeline": (ArtifactSpec("spec", "ENGINEERING_SPEC", review_required=False, accepted_path="contract.md"),),
+            "artifact_pipeline_explicit": True,
+        })
+        store = StateStore(self.state)
+        current_hash = hashlib.sha256(current).hexdigest()
+        store.save(WorkflowState(
+            project=config.project_name,
+            project_path=config.project_path,
+            workflow_file=config.workflow_file,
+            workflow_digest=config.digest,
+            current_stage=Stage.HARD_STOP.value,
+            current_artifact_id="spec",
+            blocked_stage=Stage.ARTIFACT_GENERATION.value,
+            stop_code="FROZEN_SOURCE_MISMATCH",
+            stop_reason="FROZEN_SOURCE_MISMATCH: contract.md",
+            status="HARD_STOPPED",
+            artifacts={"spec": EngineeringArtifact(
+                "spec", "ENGINEERING_SPEC", ArtifactStatus.ACCEPTED.value,
+                accepted_hash=current_hash, version_hash=current_hash, accepted_path=str(self.project / "contract.md"),
+            )},
+        ))
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertEqual(recovered.current_stage, Stage.ARTIFACT_GENERATION.value)
 
     def test_crash_recovery_reconciles_completed_outcome_without_runner(self):
         config = self.workflow()
