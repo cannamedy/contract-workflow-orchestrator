@@ -686,7 +686,8 @@ class Orchestrator:
         try:
             result = self.runner.run(workspace.path, prompt, run_dir, self.config.runner.timeout_seconds, env={"CWO_RUN_ID": run_id, "CWO_OUTCOME_PATH": str(outcome_path), "CWO_AUTHORITATIVE_ORIGIN": str(Path(self.config.project_path).resolve())})
         except Exception as exc:
-            workspace.discard()
+            if workspace:
+                workspace.discard()
             _write_json(run_dir / "metadata.json", {"run_id": run_id, "stage": stage, "status": "failed", "error": str(exc), "started_at": now_iso(), **workspace_metadata})
             return self._workspace_stop(state, None, f"Agent runner failed before completion: {exc}", "RUNNER_FAILURE")
         changes = workspace.diff()
@@ -2211,16 +2212,22 @@ class Orchestrator:
 
         if interrupted_recovery:
             metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
-            workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
-            if metadata.get("status") != "running" or workspace is None:
-                raise OrchestratorError("RECOVERY_UNCERTAIN: interrupted Agent metadata is incomplete")
-            if _agent_process_running(workspace.path):
-                raise OrchestratorError("RECOVERY_UNCERTAIN: Agent process is still running")
-            drift = self._classify_real_drift(workspace, state, str(metadata.get("stage") or state.blocked_stage or ""))
+            already_recovered = metadata.get("status") == "failed" and metadata.get("error") == "interrupted Agent invocation explicitly recovered" and isinstance(metadata.get("real_drift"), list)
+            if already_recovered:
+                workspace = None
+                drift = list(metadata["real_drift"])
+            else:
+                workspace = RunWorkspace.from_metadata(metadata, Path(self.config.project_path))
+                if metadata.get("status") != "running" or workspace is None:
+                    raise OrchestratorError("RECOVERY_UNCERTAIN: interrupted Agent metadata is incomplete")
+                if _agent_process_running(workspace.path):
+                    raise OrchestratorError("RECOVERY_UNCERTAIN: Agent process is still running")
+                drift = self._classify_real_drift(workspace, state, str(metadata.get("stage") or state.blocked_stage or ""))
             blocking_drift = next((item for item in drift if item["classification"] in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
             if blocking_drift:
                 raise OrchestratorError(f"{blocking_drift['classification']}: {blocking_drift['path']}")
-            workspace.discard()
+            if workspace:
+                workspace.discard()
             metadata.update({"status": "failed", "finished_at": now_iso(), "exit_code": -1, "timed_out": False, "error": "interrupted Agent invocation explicitly recovered", "real_drift": drift})
             _write_json(self.store.run_dir(state.run_id) / "metadata.json", metadata)
 
