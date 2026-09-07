@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.11
+Documented version: 0.8.12
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:

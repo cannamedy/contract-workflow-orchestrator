@@ -14,6 +14,7 @@ from contract_workflow.models import ArtifactSpec, ArtifactStatus, EngineeringAr
 from contract_workflow.orchestrator import Orchestrator
 from contract_workflow.project_validator import execute_project_validator
 from contract_workflow.state_store import StateStore
+from contract_workflow.workspace import RunWorkspace
 
 
 VALIDATOR = textwrap.dedent(
@@ -266,6 +267,83 @@ class ValidatorSeamTests(unittest.TestCase):
         config, spec = self.make_config(validator_role=None)
         self.assertIsNone(spec.validator_role)
         self.assertIsNotNone(config.project_validators)
+
+    def test_artifact_patch_allows_only_materialized_candidate_path(self):
+        config, _ = self.make_config()
+        config = config.__class__(**{**config.__dict__, "artifact_pipeline": (ArtifactSpec("spec", "ENGINEERING_SPEC", validator_role="validator", accepted_path="artifact.md"),)})
+        store = StateStore(self.state_root)
+        old = b"old\n"
+        old_path = store.save_artifact_candidate("spec", old.decode())
+        artifact = EngineeringArtifact(
+            "spec", "ENGINEERING_SPEC", ArtifactStatus.REQUIRES_PATCH.value,
+            candidate_hash=hashlib.sha256(old).hexdigest(), candidate_path=str(old_path),
+            validator_role="validator", accepted_path="artifact.md",
+        )
+        state = WorkflowState(
+            project_path=str(self.project), artifacts={"spec": artifact},
+            current_artifact_id="spec", current_stage=Stage.ARTIFACT_PATCH.value,
+        )
+        workspace = RunWorkspace.create(self.project, self.state_root, "artifact-patch", {"artifact.md": old_path})
+        new = b"new\n"
+        (workspace.path / "artifact.md").write_bytes(new)
+        metadata = {
+            "run_id": "artifact-patch", "stage": Stage.ARTIFACT_PATCH.value,
+            "workspace_path": str(workspace.path), "workspace_baseline": workspace.baseline,
+            "real_baseline": workspace.real_baseline,
+            "excluded_roots": [str(path) for path in workspace.excluded_roots],
+        }
+        outcome = {
+            "run_id": "artifact-patch", "stage": Stage.ARTIFACT_PATCH.value,
+            "verdict": "APPROVED", "summary": "patched",
+            "artifact": {
+                "id": "spec", "kind": "ENGINEERING_SPEC",
+                "candidate_content": new.decode(),
+                "candidate_hash": hashlib.sha256(new).hexdigest(),
+            },
+        }
+        result = Orchestrator(config, store=store)._finalize_agent_outcome(
+            state, outcome, store.run_dir("artifact-patch"), metadata,
+        )
+        self.assertEqual(result.state.current_stage, Stage.ARTIFACT_VALIDATION.value)
+        self.assertEqual(result.state.artifacts["spec"].candidate_hash, hashlib.sha256(new).hexdigest())
+
+    def test_artifact_patch_rejects_non_candidate_workspace_mutation(self):
+        config, _ = self.make_config()
+        config = config.__class__(**{**config.__dict__, "artifact_pipeline": (ArtifactSpec("spec", "ENGINEERING_SPEC", validator_role="validator", accepted_path="artifact.md"),)})
+        store = StateStore(self.state_root)
+        old = b"old\n"
+        old_path = store.save_artifact_candidate("spec", old.decode())
+        artifact = EngineeringArtifact(
+            "spec", "ENGINEERING_SPEC", ArtifactStatus.REQUIRES_PATCH.value,
+            candidate_hash=hashlib.sha256(old).hexdigest(), candidate_path=str(old_path),
+            validator_role="validator", accepted_path="artifact.md",
+        )
+        state = WorkflowState(
+            project_path=str(self.project), artifacts={"spec": artifact},
+            current_artifact_id="spec", current_stage=Stage.ARTIFACT_PATCH.value,
+        )
+        workspace = RunWorkspace.create(self.project, self.state_root, "artifact-patch-extra", {"artifact.md": old_path})
+        (workspace.path / "artifact.md").write_text("new\n", encoding="utf-8")
+        (workspace.path / "unrelated.txt").write_text("forbidden\n", encoding="utf-8")
+        metadata = {
+            "run_id": "artifact-patch-extra", "stage": Stage.ARTIFACT_PATCH.value,
+            "workspace_path": str(workspace.path), "workspace_baseline": workspace.baseline,
+            "real_baseline": workspace.real_baseline,
+            "excluded_roots": [str(path) for path in workspace.excluded_roots],
+        }
+        outcome = {
+            "run_id": "artifact-patch-extra", "stage": Stage.ARTIFACT_PATCH.value,
+            "verdict": "APPROVED",
+            "artifact": {
+                "id": "spec", "kind": "ENGINEERING_SPEC",
+                "candidate_content": "new\n", "candidate_hash": hashlib.sha256(b"new\n").hexdigest(),
+            },
+        }
+        result = Orchestrator(config, store=store)._finalize_agent_outcome(
+            state, outcome, store.run_dir("artifact-patch-extra"), metadata,
+        )
+        self.assertEqual(result.state.stop_code, "WORKSPACE_MUTATION_VIOLATION")
+        self.assertEqual(result.state.current_stage, Stage.HARD_STOP.value)
 
 
 if __name__ == "__main__":

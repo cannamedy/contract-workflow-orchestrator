@@ -65,7 +65,11 @@ STRICT_WORKSPACE_STAGES = frozenset({
     Stage.TASK_REBASE_ANALYSIS.value,
     Stage.TASK_INDEPENDENT_REVIEW.value,
     Stage.FINAL_VERIFICATION.value,
-    Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_REVIEW.value, Stage.ARTIFACT_PATCH.value,
+    Stage.ARTIFACT_REVIEW.value,
+})
+CANDIDATE_ARTIFACT_STAGES = frozenset({
+    Stage.ARTIFACT_GENERATION.value,
+    Stage.ARTIFACT_PATCH.value,
 })
 CANDIDATE_WORKSPACE_STAGES = frozenset({
     Stage.CONTRACT_REVISION.value,
@@ -791,6 +795,40 @@ class Orchestrator:
                 return self._workspace_stop(state, workspace, f"{stop_code}: {blocking_drift['path']}", stop_code)
         if stage in STRICT_WORKSPACE_STAGES and changes:
             return self._workspace_stop(state, workspace, f"workspace mutation is forbidden during {stage}", "WORKSPACE_MUTATION_VIOLATION")
+        if stage in CANDIDATE_ARTIFACT_STAGES and changes:
+            allowed_candidate_path = self._artifact_workspace_path(state)
+            unexpected = [
+                str(change.get("path", ""))
+                for change in changes
+                if str(change.get("path", "")) != allowed_candidate_path
+            ]
+            if unexpected:
+                return self._workspace_stop(
+                    state,
+                    workspace,
+                    f"workspace mutation is outside the current artifact candidate scope: {unexpected[0]}",
+                    "WORKSPACE_MUTATION_VIOLATION",
+                )
+            artifact = outcome.get("artifact")
+            if isinstance(artifact, dict) and artifact.get("candidate_content") is None:
+                source = workspace.path / allowed_candidate_path if workspace and allowed_candidate_path else None
+                if source is None or not source.is_file() or source.is_symlink():
+                    return self._workspace_stop(
+                        state,
+                        workspace,
+                        "artifact candidate workspace output is missing or not a regular file",
+                        "WORKSPACE_MUTATION_VIOLATION",
+                    )
+                try:
+                    candidate_content = source.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    return self._workspace_stop(
+                        state,
+                        workspace,
+                        f"artifact candidate workspace output is not UTF-8 text: {exc}",
+                        "WORKSPACE_MUTATION_VIOLATION",
+                    )
+                outcome = {**outcome, "artifact": {**artifact, "candidate_content": candidate_content}}
         if stage in PROJECT_MUTATING_STAGES and outcome.get("verdict") == Verdict.APPROVED.value and changes:
             task = self.config.task_at(state.current_group, state.current_task)
             if not task:
@@ -842,6 +880,32 @@ class Orchestrator:
                 if path.resolve().is_relative_to(project):
                     paths.add(path.resolve().relative_to(project).as_posix())
         return paths
+
+    def _artifact_workspace_path(self, state: WorkflowState) -> str:
+        """Return the only project-relative path an artifact agent may edit.
+
+        Artifact candidates are externalized into the RunWorkspace at the
+        configured accepted path so review/patch agents see the exact
+        candidate.  A generation or patch invocation may update that one
+        materialized candidate view; it must not use the exception to mutate
+        any other project file.  The candidate is still persisted from the
+        structured outcome and is never committed back by this workspace
+        path allowance.
+        """
+        artifact_id = state.current_artifact_id or ""
+        spec = next((item for item in self.config.artifact_pipeline if item.id == artifact_id), None)
+        if spec is None or not spec.accepted_path:
+            return ""
+        path = Path(spec.accepted_path)
+        project = Path(self.config.project_path).resolve()
+        if path.is_absolute():
+            resolved = path.resolve()
+            if not resolved.is_relative_to(project):
+                return ""
+            path = resolved.relative_to(project)
+        if path.is_absolute() or ".." in path.parts or ".git" in path.parts:
+            return ""
+        return path.as_posix()
 
     def _remote_human_guide_paths(self) -> set[str]:
         """Return local Human Guide paths that are only draft counterparts of remote authority."""
@@ -2258,6 +2322,12 @@ class Orchestrator:
             and state.blocked_stage in AGENT_STAGE_NAMES
             and state.run_id is not None
         )
+        artifact_workspace_recovery = (
+            state.stop_code == "WORKSPACE_MUTATION_VIOLATION"
+            and state.current_stage == Stage.HARD_STOP.value
+            and state.blocked_stage in CANDIDATE_ARTIFACT_STAGES
+            and state.run_id is not None
+        )
         typed_promotion_recovery = (
             state.current_stage == Stage.HARD_STOP.value
             and state.stop_code == "FROZEN_SOURCE_MISMATCH"
@@ -2265,7 +2335,7 @@ class Orchestrator:
             and bool(self._typed_accepted_source_overrides(state))
         )
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED" and not runner_recovery
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or typed_promotion_recovery or schema_recovery or workflow_digest_recovery):
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
@@ -2399,7 +2469,7 @@ class Orchestrator:
                 reason = "; ".join(safety_errors)
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                 raise OrchestratorError(reason)
-        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or typed_promotion_recovery or legacy_recovery):
+        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or legacy_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
 
