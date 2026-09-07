@@ -2130,6 +2130,37 @@ class Orchestrator:
     def recover(self) -> WorkflowState:
         state = self._load_or_initialize()
         self.logger.emit("recovery_requested", stop_code=state.stop_code, blocked_stage=state.blocked_stage)
+        # A process-level interruption can occur before ``_agent_step`` gets
+        # a chance to persist RECOVERY_UNCERTAIN.  Treat an unambiguously
+        # orphaned running invocation as the same recoverable condition, but
+        # never do so while its workspace still has a live Agent process or a
+        # completed outcome that should be reconciled normally.
+        orphaned_invocation = False
+        orphan_metadata: dict[str, Any] = {}
+        if state.current_stage in AGENT_STAGE_NAMES and state.run_id:
+            orphan_metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
+            outcome_exists = (self.store.run_dir(state.run_id) / "outcome.json").is_file()
+            workspace_raw = orphan_metadata.get("workspace_path")
+            workspace_path = Path(workspace_raw).expanduser() if isinstance(workspace_raw, str) and workspace_raw else None
+            orphaned_invocation = (
+                orphan_metadata.get("status") == "running"
+                and not outcome_exists
+                and workspace_path is not None
+                and not _agent_process_running(workspace_path)
+            )
+            if orphaned_invocation:
+                state = replace(
+                    state,
+                    current_stage=Stage.HARD_STOP.value,
+                    blocked_stage=state.current_stage,
+                    stop_code="RECOVERY_UNCERTAIN",
+                    stop_reason="RECOVERY_UNCERTAIN: Agent process is no longer running",
+                    recoverable=True,
+                    status=WorkflowStatus.HARD_STOPPED.value,
+                    updated_at=now_iso(),
+                )
+                self._save(state)
+                self.logger.emit("orphaned_agent_detected", run_id=state.run_id, blocked_stage=state.blocked_stage)
         legacy_recovery = (
             state.current_stage == Stage.HARD_STOP.value
             and state.stop_code == "UNEXPECTED_UNRELATED_CHANGE"

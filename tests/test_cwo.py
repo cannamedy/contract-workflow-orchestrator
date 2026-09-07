@@ -219,6 +219,38 @@ groups:
         self.assertEqual(recovered.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
         self.assertEqual(json.loads((run_dir / "metadata.json").read_text())["status"], "failed")
 
+    def test_recover_handles_orphaned_running_invocation_after_process_interruption(self):
+        config = self.workflow("autonomous")
+        store = StateStore(self.state)
+        run_id = "orphaned-running-invocation"
+        workspace = RunWorkspace.create(self.project, self.state, run_id)
+        run_dir = store.run_dir(run_id)
+        (run_dir / "metadata.json").write_text(json.dumps({
+            "run_id": run_id,
+            "stage": Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            "status": "running",
+            "workspace_path": str(workspace.path),
+            "workspace_baseline": workspace.baseline,
+            "real_baseline": workspace.real_baseline,
+            "excluded_roots": [str(item) for item in workspace.excluded_roots],
+        }), encoding="utf-8")
+        store.save(WorkflowState(
+            project=config.project_name,
+            project_path=config.project_path,
+            workflow_file=config.workflow_file,
+            workflow_digest=config.digest,
+            current_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+            run_id=run_id,
+            status="RUNNING",
+        ))
+
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertEqual(recovered.current_stage, Stage.AUTHORITY_CHANGE_ANALYSIS.value)
+        self.assertIsNone(recovered.run_id)
+        self.assertEqual(json.loads((run_dir / "metadata.json").read_text())["status"], "failed")
+
     def test_interrupted_recovery_preserves_unrelated_drift_observed_after_invocation(self):
         config = self.workflow("autonomous")
         store = StateStore(self.state)
