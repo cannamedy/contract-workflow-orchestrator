@@ -362,7 +362,12 @@ attempt 保留可审计的进程状态、stdout/stderr、workspace evidence 与�
 
 这条规则不允许 CWO 从候选文件存在、workspace mutation、进程消失或部分输出推断语义成功。
 只有合法的结构化完成结果，加上既有 scope、authority、deterministic validation 和 independent
- review 条件，才能使 Artifact 继续传播。
+review 条件，才能使 Artifact 继续传播。
+
+RunWorkspace 建立本身也属于事务边界。若真实项目在复制 snapshot 的短窗口内发生变化，CWO
+可以在同一 bounded invocation 中重新获取 snapshot；只有稳定的 snapshot 才会启动 Agent。若
+变化持续存在，CWO 必须保守地停止并保留 setup evidence，而不能把不完整 workspace、候选文件
+或并发写入解释为成功。
 
 失败 invocation 的恢复同样必须服从固定的 RunWorkspace/real-project snapshot。CWO 可以把
 local draft 或 unrelated concurrent drift 作为审计证据保留并继续恢复，但不得因此放宽 authority、

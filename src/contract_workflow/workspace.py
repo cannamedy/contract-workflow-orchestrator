@@ -128,29 +128,35 @@ class RunWorkspace:
         state_root: Path,
         run_id: str,
         materialized_files: Mapping[str, Path] | None = None,
+        snapshot_attempts: int = 1,
     ) -> "RunWorkspace":
+        if snapshot_attempts < 1:
+            raise WorkspaceError("snapshot_attempts must be at least one")
         real_project = real_project.resolve()
         workspace_root = (state_root / "workspaces" / run_id).resolve()
         path = workspace_root / "project"
         if path.exists():
             raise WorkspaceError(f"run workspace already exists: {path}")
-        workspace_root.mkdir(parents=True, exist_ok=False)
         excluded = (state_root.resolve(),)
-        before = real_fingerprint(real_project, excluded)
-        _copy_tree(real_project, path, real_project, excluded)
-        for relative, source in sorted((materialized_files or {}).items()):
-            destination = path / _safe_relative(relative)
-            source = Path(source).expanduser().resolve()
-            if source.is_symlink() or not source.is_file():
-                shutil.rmtree(workspace_root, ignore_errors=True)
-                raise WorkspaceError(f"materialized source is not a regular file: {source}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-        after = real_fingerprint(real_project, excluded)
-        if before != after:
+        last_drift: TargetDriftError | None = None
+        for snapshot_attempt in range(snapshot_attempts):
+            workspace_root.mkdir(parents=True, exist_ok=False)
+            before = real_fingerprint(real_project, excluded)
+            _copy_tree(real_project, path, real_project, excluded)
+            for relative, source in sorted((materialized_files or {}).items()):
+                destination = path / _safe_relative(relative)
+                source = Path(source).expanduser().resolve()
+                if source.is_symlink() or not source.is_file():
+                    shutil.rmtree(workspace_root, ignore_errors=True)
+                    raise WorkspaceError(f"materialized source is not a regular file: {source}")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            after = real_fingerprint(real_project, excluded)
+            if before == after:
+                return cls(real_project, path, tree_fingerprint(path), before, excluded)
+            last_drift = TargetDriftError("real project changed while creating run workspace")
             shutil.rmtree(workspace_root, ignore_errors=True)
-            raise TargetDriftError("real project changed while creating run workspace")
-        return cls(real_project, path, tree_fingerprint(path), before, excluded)
+        raise last_drift or TargetDriftError("real project changed while creating run workspace")
 
     @classmethod
     def from_metadata(cls, metadata: dict[str, Any], real_project: Path) -> "RunWorkspace | None":

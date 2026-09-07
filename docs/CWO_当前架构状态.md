@@ -91,6 +91,9 @@ Repository snapshot observed for this state update:
   可以根据运行时证据生成明确的失败 outcome，但绝不因候选文件存在或 workspace 有变化而合成
   语义成功。失败尝试、stdout/stderr、workspace diff 和 failure classification 会保留在 run
   evidence 中，供有界重试与恢复使用。
+- RunWorkspace 建立期间若真实项目发生瞬时变化，CWO 会在同一 bounded invocation 中重新获取
+  完整 snapshot；只有 snapshot 稳定后才启动 Agent。持续的 snapshot race 仍是可审计的 workspace
+  setup hard stop，不能被当作候选成功或绕过 authority/target drift 保护。
 - 对失败 runner 的恢复会基于该 invocation 固定的 real-project snapshot 重新执行 scoped drift
   分类；local draft 与 unrelated concurrent drift 被记录并保留，authority、accepted upstream
   与 current target drift 仍然阻塞。恢复不会复活或采用失败 workspace，也不会把并发修改导入旧

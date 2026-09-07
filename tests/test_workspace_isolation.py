@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from contract_workflow.config import load_workflow
@@ -15,6 +16,7 @@ from contract_workflow.outcome import make_outcome
 from contract_workflow.runners.base import RunnerResult, run_times
 from contract_workflow.state_store import StateStore
 from contract_workflow.workspace import RunWorkspace, apply_validated_diff
+import contract_workflow.workspace as workspace_module
 
 
 class WorkspaceRunner:
@@ -221,6 +223,24 @@ class WorkspaceIsolationTests(unittest.TestCase):
         next_workspace = RunWorkspace.create(self.project, self.state, "second")
         self.assertEqual((next_workspace.path / "concurrent.txt").read_text(), "after first\n")
         next_workspace.discard()
+
+    def test_snapshot_race_retries_before_agent_invocation(self):
+        original_copy = workspace_module._copy_tree
+        calls = 0
+
+        def copy_once_with_concurrent_change(source, destination, root, excluded_roots):
+            nonlocal calls
+            original_copy(source, destination, root, excluded_roots)
+            if source.resolve() == self.project.resolve():
+                calls += 1
+            if calls == 1 and source.resolve() == self.project.resolve():
+                (self.project / "concurrent.txt").write_text("during snapshot\n", encoding="utf-8")
+
+        with patch.object(workspace_module, "_copy_tree", side_effect=copy_once_with_concurrent_change):
+            workspace = RunWorkspace.create(self.project, self.state, "snapshot-race", snapshot_attempts=2)
+        self.assertEqual(calls, 2)
+        self.assertEqual((workspace.path / "concurrent.txt").read_text(), "during snapshot\n")
+        workspace.discard()
 
     def test_allowed_change_with_unrelated_concurrent_drift_commits_only_target(self):
         unrelated = self.project / "concurrent.txt"

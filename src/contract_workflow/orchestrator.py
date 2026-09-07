@@ -511,6 +511,7 @@ class Orchestrator:
             and bool(self._typed_accepted_source_overrides(audit_state))
         )
         candidate_validation_recovery = self._candidate_validation_recovery(audit_state)[0]
+        workspace_setup_recovery = self._workspace_setup_recovery(audit_state)[0]
         pre_invocation_recovery = (
             pre_invocation_digest_stop
             or legacy_drift_recovery
@@ -518,6 +519,7 @@ class Orchestrator:
             or interrupted_invocation_recovery
             or typed_promotion_recovery
             or candidate_validation_recovery
+            or workspace_setup_recovery
         )
         baseline_paths = () if active_invocation or (audit_state.current_stage == Stage.HARD_STOP.value and not pre_invocation_recovery) else working_tree_paths(Path(self.config.project_path))
         audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected, baseline_paths=baseline_paths)
@@ -805,10 +807,18 @@ class Orchestrator:
         self.logger.emit("outcome_validated", run_id=run_id, stage=stage, verdict=outcome["verdict"])
         return self._finalize_agent_outcome(state, outcome, run_dir, _read_json(run_dir / "metadata.json"))
 
-    def _workspace_stop(self, state: WorkflowState, workspace: RunWorkspace | None, reason: str, stop_code: str) -> StepResult:
+    def _workspace_stop(
+        self,
+        state: WorkflowState,
+        workspace: RunWorkspace | None,
+        reason: str,
+        stop_code: str,
+        *,
+        recoverable: bool = False,
+    ) -> StepResult:
         if workspace:
             workspace.discard()
-        stopped = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code=stop_code, blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
+        stopped = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, pending_human_gate=None, stop_reason=reason, stop_code=stop_code, blocked_stage=state.current_stage, recoverable=recoverable, updated_at=now_iso())
         self.logger.emit("hard_stop_entered", reason=reason, stop_code=stop_code)
         return StepResult(self._save(stopped), "hard_stop")
 
@@ -2519,6 +2529,7 @@ class Orchestrator:
             and state.blocked_stage in CANDIDATE_ARTIFACT_STAGES
             and state.run_id is not None
         )
+        workspace_setup_recovery, workspace_setup_recovery_errors = self._workspace_setup_recovery(state)
         typed_promotion_recovery = (
             state.current_stage == Stage.HARD_STOP.value
             and state.stop_code == "FROZEN_SOURCE_MISMATCH"
@@ -2536,7 +2547,15 @@ class Orchestrator:
                 reason="; ".join(historical_recovery_errors),
             )
             raise OrchestratorError("; ".join(historical_recovery_errors))
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or candidate_validation_recovery or schema_recovery or workflow_digest_recovery):
+        if workspace_setup_recovery_errors:
+            self.logger.emit(
+                "recovery_validation_failed",
+                stop_code=state.stop_code,
+                blocked_stage=state.blocked_stage,
+                reason="; ".join(workspace_setup_recovery_errors),
+            )
+            raise OrchestratorError("; ".join(workspace_setup_recovery_errors))
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or candidate_validation_recovery or workspace_setup_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
@@ -2780,7 +2799,7 @@ class Orchestrator:
                 reason = "; ".join(safety_errors)
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                 raise OrchestratorError(reason)
-        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or legacy_recovery):
+        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or workspace_setup_recovery or legacy_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
 
@@ -2858,6 +2877,53 @@ class Orchestrator:
             descendants = set(artifact_impact_closure(self.config, (artifact_id,))) - {artifact_id}
             if any(state.artifacts.get(item) and state.artifacts[item].status == ArtifactStatus.ACCEPTED.value for item in descendants):
                 errors.append("candidate validation recovery cannot run after downstream typed promotion")
+        return not errors, errors
+
+    def _workspace_setup_recovery(self, state: WorkflowState) -> tuple[bool, list[str]]:
+        """Validate a retry after a snapshot race before Agent execution.
+
+        A workspace setup race has no Agent workspace or candidate to
+        reconcile.  It is safe to reopen only the same logical stage when the
+        durable candidate and its accepted dependencies are still intact.
+        This never reconstructs the failed workspace and never treats a
+        setup failure as semantic success.
+        """
+        exact_stop = (
+            state.current_stage == Stage.HARD_STOP.value
+            and state.stop_code == "WORKSPACE_SETUP_FAILED"
+            and state.blocked_stage in AGENT_STAGES
+            and state.run_id is not None
+        )
+        if not exact_stop:
+            return False, []
+        errors: list[str] = []
+        metadata = _read_json(self.store.run_dir(state.run_id) / "metadata.json")
+        if metadata.get("status") != "failed" or metadata.get("error") != "real project changed while creating run workspace":
+            errors.append("workspace setup recovery requires a recorded real-project snapshot race")
+        if metadata.get("workspace_path") or (self.store.run_dir(state.run_id) / "outcome.json").exists():
+            errors.append("workspace setup recovery cannot reconcile an Agent invocation")
+        artifact_id = state.current_artifact_id or ""
+        artifact = state.artifacts.get(artifact_id)
+        if state.current_authority_change_id not in state.authority_changes:
+            errors.append("workspace setup recovery requires the existing AuthorityChange")
+        if artifact is None or artifact.status != ArtifactStatus.REQUIRES_PATCH.value:
+            errors.append("workspace setup recovery requires a REQUIRES_PATCH artifact")
+        elif not self._stored_candidate_matches(artifact_id, artifact):
+            errors.append("workspace setup recovery requires the matching durable candidate")
+        if artifact is not None:
+            dependency_revisions = artifact.metadata.get("dependency_revisions", []) if isinstance(artifact.metadata, dict) else []
+            for dependency in dependency_revisions if isinstance(dependency_revisions, list) else []:
+                if not isinstance(dependency, dict):
+                    errors.append("workspace setup recovery found an invalid dependency revision record")
+                    continue
+                dependency_artifact = state.artifacts.get(str(dependency.get("artifact_id", "")))
+                if dependency_artifact is None or dependency_artifact.status != ArtifactStatus.ACCEPTED.value:
+                    errors.append(f"accepted dependency is not available: {dependency.get('artifact_id', '')}")
+                elif dependency_artifact.accepted_hash != dependency.get("hash"):
+                    errors.append(f"accepted dependency hash drifted: {dependency.get('artifact_id', '')}")
+            descendants = set(artifact_impact_closure(self.config, (artifact_id,))) - {artifact_id}
+            if any(state.artifacts.get(item) and state.artifacts[item].status == ArtifactStatus.ACCEPTED.value for item in descendants):
+                errors.append("workspace setup recovery cannot run after downstream typed promotion")
         return not errors, errors
 
     def _late_outcome_check(self, state: WorkflowState) -> tuple[dict[str, Any] | None, list[str], bool]:
