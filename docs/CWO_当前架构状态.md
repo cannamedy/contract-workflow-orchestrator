@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.1
+Documented version: 0.8.2
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -46,6 +46,9 @@ Repository snapshot observed for this state update:
 - Codex CLI adapter 的 workspace cwd binding；配置的 authoritative origin 不作为 Agent cwd。
 - 已接受的 external Authority/Authority Set member snapshot 会在 Agent invocation 前只物化到
   RunWorkspace 的对应项目路径；真实项目中的 Human Draft 不会成为下游生成的冻结上游。
+- Typed Agent prompt 的冻结 authority 视图会以当前 accepted external snapshot/set-member
+  hash 为准，而不会继续暴露已过期的静态配置 hash；这与 workspace materialization 使用同一
+  个 accepted authority revision。
 - recovery 对已完成 outcome、运行中 Agent、失败 runner、workflow digest 和遗留 drift 状态
   的受限处理。
 - canonical review evidence registry 位于 `WorkflowState` / 外部 runtime `state.json`；支持

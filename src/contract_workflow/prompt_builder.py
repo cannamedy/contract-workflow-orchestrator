@@ -7,6 +7,50 @@ from .models import Stage, WorkflowConfig, WorkflowState
 from .outcome import render_outcome_contract
 
 
+def _frozen_authority_lines(config: WorkflowConfig, state: WorkflowState) -> str:
+    """Render the authority actually frozen for this invocation.
+
+    ``authoritative_sources`` remains the compatibility/configuration view, but
+    an accepted external Human Authority may have advanced since that source
+    entry was authored.  Typed runs must describe the accepted snapshot (and
+    all accepted set members) to the Agent; otherwise a valid workspace
+    materialization can be rejected against a stale configured hash.
+    """
+    sources = [
+        {
+            "path": item.path,
+            "sha256": item.sha256,
+            "commit": item.git_commit or "-",
+            "tag": item.git_tag or "-",
+        }
+        for item in config.authoritative_sources
+    ]
+    by_path = {item["path"]: item for item in sources}
+
+    propagation = state.propagation.get(state.current_authority_change_id or "", {})
+    promotion = propagation.get("human_guide_promotion", {}) if isinstance(propagation, dict) else {}
+    members = promotion.get("authority_set_members") if isinstance(promotion, dict) else None
+    if isinstance(members, list) and members:
+        for member in members:
+            if not isinstance(member, dict) or not member.get("path"):
+                continue
+            entry = by_path.setdefault(member["path"], {"path": member["path"], "sha256": "", "commit": "-", "tag": "-"})
+            entry["sha256"] = str(member.get("content_sha256") or entry["sha256"])
+            entry["commit"] = str(member.get("source_revision") or entry["commit"])
+    else:
+        guide = state.artifacts.get("human-guide")
+        if guide and guide.status == "ACCEPTED" and guide.accepted_hash:
+            for item in sources:
+                if item["path"] == guide.accepted_path or item["path"].lower().endswith("架构原理与设计指南.md") or item["path"].lower().endswith("human-guide.md"):
+                    item["sha256"] = guide.accepted_hash
+                    accepted_source = guide.metadata.get("accepted_source", {})
+                    if isinstance(accepted_source, dict):
+                        item["commit"] = str(accepted_source.get("commit_sha") or item["commit"])
+                    break
+
+    return "\n".join(f"- {item['path']} sha256={item['sha256']} commit={item['commit']} tag={item['tag']}" for item in by_path.values()) or "- none declared"
+
+
 DEFAULT_TEMPLATES = {
     "TASK_EXECUTION": "task-execution.md",
     "TASK_INDEPENDENT_REVIEW": "task-review.md",
@@ -79,7 +123,7 @@ class PromptBuilder:
             if path.is_file():
                 template = path.read_text(encoding="utf-8")
         skill = _skill_for_stage(config, stage, state)
-        frozen = "\n".join(f"- {item.path} sha256={item.sha256} commit={item.git_commit or '-'} tag={item.git_tag or '-'}" for item in config.authoritative_sources) or "- none declared"
+        frozen = _frozen_authority_lines(config, state)
         task = config.task_at(state.current_group, state.current_task)
         task_paths = []
         task_requirements = "none declared"

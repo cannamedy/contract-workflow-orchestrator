@@ -11,7 +11,7 @@ from pathlib import Path
 
 from contract_workflow.config import load_workflow
 from contract_workflow.git_audit import GitClassification, audit_git, source_integrity, working_tree_paths
-from contract_workflow.models import AuthoritativeSource, DecisionStatus, Stage, Verdict, WorkItemStatus, WorkflowState
+from contract_workflow.models import AuthoritativeSource, DecisionStatus, EngineeringArtifact, Stage, Verdict, WorkItemStatus, WorkflowState
 from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
@@ -300,6 +300,56 @@ groups:
         self.assertIn(f"EXECUTION WORKSPACE: {workspace}", prompt)
         self.assertIn(f"AUTHORITATIVE ORIGIN: {self.project}", prompt)
         self.assertIn("Do not access or modify the authoritative origin repository directly", prompt)
+
+    def test_prompt_uses_accepted_external_authority_instead_of_stale_configured_hash(self):
+        old_hash = hashlib.sha256(b"R1\n").hexdigest()
+        accepted_hash = hashlib.sha256(b"R2 accepted\n").hexdigest()
+        config_path = self.project / ".contract-workflow" / "workflow.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text(f'''version: "1"
+project:
+  name: typed-authority-prompt
+  path: {self.project}
+mode: autonomous
+authoritative_sources:
+  - source_id: human-guide
+    role: HUMAN_GUIDE
+    path: guide.md
+    sha256: {old_hash}
+skills: {{}}
+runner:
+  type: mock
+groups:
+  - id: g
+    tasks:
+      - id: t
+artifact_pipeline:
+  artifacts:
+    - id: human-guide
+      kind: HUMAN_GUIDE
+      promotion_policy: EXTERNAL
+    - id: engineering-spec
+      kind: ENGINEERING_SPEC
+      dependencies: [human-guide]
+''', encoding="utf-8")
+        config = load_workflow(config_path, self.project)
+        state = WorkflowState(
+            project=config.project_name, project_path=config.project_path,
+            workflow_file=config.workflow_file, workflow_digest=config.digest,
+            current_stage=Stage.ARTIFACT_GENERATION.value,
+            current_artifact_id="engineering-spec", current_authority_change_id="CR-1",
+            artifacts={"human-guide": EngineeringArtifact(
+                id="human-guide", kind="HUMAN_GUIDE", status="ACCEPTED",
+                accepted_hash=accepted_hash, accepted_path="/state/accepted-guide.md",
+                metadata={"accepted_source": {"commit_sha": "remote-r2"}},
+            )},
+            propagation={"CR-1": {"human_guide_promotion": {"authority_set_members": [
+                {"member_id": "human-guide", "role": "ARCHITECTURE_GUIDE", "path": "guide.md", "content_sha256": accepted_hash, "source_revision": "remote-r2"},
+            ]}}},
+        )
+        prompt = PromptBuilder().build(config, state, self.root / "run" / "outcome.json")
+        self.assertIn(f"guide.md sha256={accepted_hash} commit=remote-r2", prompt)
+        self.assertNotIn(f"guide.md sha256={old_hash}", prompt)
 
     def test_review_prompt_contains_complete_nested_issue_schema(self):
         config = self.workflow()
