@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.13
+Documented version: 0.8.14
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -91,6 +91,10 @@ Repository snapshot observed for this state update:
   可以根据运行时证据生成明确的失败 outcome，但绝不因候选文件存在或 workspace 有变化而合成
   语义成功。失败尝试、stdout/stderr、workspace diff 和 failure classification 会保留在 run
   evidence 中，供有界重试与恢复使用。
+- 对失败 runner 的恢复会基于该 invocation 固定的 real-project snapshot 重新执行 scoped drift
+  分类；local draft 与 unrelated concurrent drift 被记录并保留，authority、accepted upstream
+  与 current target drift 仍然阻塞。恢复不会复活或采用失败 workspace，也不会把并发修改导入旧
+  invocation view。
 
 ### PARTIAL
 

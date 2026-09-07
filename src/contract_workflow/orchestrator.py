@@ -486,7 +486,18 @@ class Orchestrator:
             failed_run = _read_json(self.store.run_dir(audit_state.run_id) / "metadata.json")
             try:
                 failed_workspace = RunWorkspace.from_metadata(failed_run, Path(self.config.project_path))
-                runner_failure_baseline = bool(failed_workspace and failed_workspace.real_unchanged())
+                if failed_workspace:
+                    # A failed Agent attempt may coincide with an unrelated
+                    # human edit in the real project.  Classify the content
+                    # drift against the fixed invocation snapshot instead of
+                    # treating every Git/status change as a recovery blocker.
+                    # Authority, accepted-upstream, and current-target drift
+                    # remain blocking; local drafts and unrelated concurrent
+                    # edits are preserved and recorded by recovery.
+                    failed_stage = str(failed_run.get("stage") or audit_state.blocked_stage or "")
+                    real_drift = self._classify_real_drift(failed_workspace, audit_state, failed_stage)
+                    blocking_classes = {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}
+                    runner_failure_baseline = not any(item.get("classification") in blocking_classes for item in real_drift)
             except WorkspaceError:
                 runner_failure_baseline = False
         interrupted_invocation_recovery = False
@@ -2531,6 +2542,15 @@ class Orchestrator:
             if latest.get("stage") != state.blocked_stage or latest.get("status") != "completed" or (latest.get("exit_code", 0) == 0 and latest.get("timed_out") is not True) or (state.run_id is not None and latest.get("run_id") != state.run_id):
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="runner failure recovery does not match the last completed failed invocation")
                 raise OrchestratorError("runner failure recovery does not match the last completed failed invocation")
+            failed_workspace = RunWorkspace.from_metadata(latest, Path(self.config.project_path))
+            if failed_workspace is not None:
+                real_drift = self._classify_real_drift(failed_workspace, state, str(latest.get("stage") or state.blocked_stage or ""))
+                _write_json(self.store.run_dir(str(latest.get("run_id"))) / "real-drift.json", real_drift)
+                blocking_drift = next((item for item in real_drift if item.get("classification") in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}), None)
+                if blocking_drift:
+                    reason = f"{blocking_drift['classification']}: {blocking_drift['path']}"
+                    self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
+                    raise OrchestratorError(reason)
 
         legacy_restored_stage = None
         if legacy_recovery:

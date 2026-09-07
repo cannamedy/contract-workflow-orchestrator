@@ -54,6 +54,16 @@ class OutcomeRunner:
         )
 
 
+class TimeoutWithRealDriftRunner(OutcomeRunner):
+    def __init__(self, project: Path):
+        super().__init__("timeout")
+        self.project = project
+
+    def run(self, cwd: Path, prompt: str, run_dir: Path, timeout: int, env=None) -> RunnerResult:
+        (self.project / "concurrent.txt").write_text("human edit during invocation\n", encoding="utf-8")
+        return super().run(cwd, prompt, run_dir, timeout, env)
+
+
 class OutcomeOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -205,6 +215,26 @@ groups:
         repeated = Orchestrator(config, store=store, runner=OutcomeRunner("missing")).recover()
         self.assertEqual(repeated.current_stage, Stage.ARTIFACT_PATCH.value)
         self.assertEqual(repeated.status, "RUNNING")
+
+    def test_runner_timeout_with_unrelated_real_drift_recovers_and_records_classification(self):
+        config = self.config(max_attempts=1)
+        store = StateStore(self.state_root)
+        runner = TimeoutWithRealDriftRunner(self.project)
+        orchestrator = Orchestrator(config, store=store, runner=runner)
+        self.assertEqual(orchestrator.step().state.current_stage, Stage.ARTIFACT_GENERATION.value)
+        stopped = orchestrator.step().state
+        self.assertEqual(stopped.stop_code, "RETRY_EXHAUSTED")
+        self.assertTrue(stopped.recoverable)
+        recovered = orchestrator.recover()
+        self.assertEqual(recovered.current_stage, Stage.ARTIFACT_GENERATION.value)
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertIsNone(recovered.run_id)
+        drift_files = list(store.runs_path.glob("*/real-drift.json"))
+        self.assertTrue(drift_files)
+        drift = json.loads(drift_files[-1].read_text(encoding="utf-8"))
+        self.assertEqual(drift[0]["path"], "concurrent.txt")
+        self.assertEqual(drift[0]["classification"], "UNRELATED_CONCURRENT_DRIFT")
+        self.assertEqual((self.project / "concurrent.txt").read_text(encoding="utf-8"), "human edit during invocation\n")
 
 
 if __name__ == "__main__":

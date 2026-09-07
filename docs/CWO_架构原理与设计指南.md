@@ -362,7 +362,11 @@ attempt 保留可审计的进程状态、stdout/stderr、workspace evidence 与�
 
 这条规则不允许 CWO 从候选文件存在、workspace mutation、进程消失或部分输出推断语义成功。
 只有合法的结构化完成结果，加上既有 scope、authority、deterministic validation 和 independent
-review 条件，才能使 Artifact 继续传播。
+ review 条件，才能使 Artifact 继续传播。
+
+失败 invocation 的恢复同样必须服从固定的 RunWorkspace/real-project snapshot。CWO 可以把
+local draft 或 unrelated concurrent drift 作为审计证据保留并继续恢复，但不得因此放宽 authority、
+accepted upstream 或 current target 的漂移保护；失败 workspace 也不得被重新采用。
 
 ## 10. Scheduling、Gate 与 Recovery
 
