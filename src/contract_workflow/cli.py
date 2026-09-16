@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import __version__
 from .config import default_workflow, load_workflow
 from .orchestrator import Orchestrator, OrchestratorError, doctor, state_root
 from .remote import check_remote_authority
@@ -13,7 +14,7 @@ from .state_store import StateStore
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cwo", description="Contract Workflow Orchestrator v0.8.1")
+    parser = argparse.ArgumentParser(prog="cwo", description=f"Contract Workflow Orchestrator v{__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a project workflow contract")
     init.add_argument("project", type=Path)

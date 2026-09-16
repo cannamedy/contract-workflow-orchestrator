@@ -20,7 +20,10 @@
 | ARTIFACT_VALIDATION | FAIL / ARTIFACT_MISSING | ARTIFACT_PATCH |
 | ARTIFACT_REVIEW | REQUIRES_PATCH | ARTIFACT_PATCH |
 | ARTIFACT_REVIEW | APPROVED | promotion policy: AUTO, HUMAN_GATE, or EXTERNAL |
-| ARTIFACT_PATCH | APPROVED | ARTIFACT_REVIEW when review is required, otherwise promotion |
+| ARTIFACT_PATCH | PATCH_APPLIED + changed candidate | ARTIFACT_VALIDATION, then independent ARTIFACT_REVIEW |
+| ARTIFACT_PATCH | NO_PATCH_NEEDED + complete finding reconciliation | independent ARTIFACT_REVIEW; never direct promotion |
+| ARTIFACT_PATCH | PATCH_BLOCKED + scoped upstream/authority blocker | existing scoped Decision Request |
+| ARTIFACT_PATCH | missing/invalid semantic result | CWO-owned EXECUTION_FAILED evidence and bounded retry |
 | TASK_EXECUTION | APPROVED | TASK_INDEPENDENT_REVIEW |
 | TASK_INDEPENDENT_REVIEW | REQUIRES_PATCH | TASK_PATCH |
 | TASK_PATCH | APPROVED | TASK_INDEPENDENT_REVIEW |

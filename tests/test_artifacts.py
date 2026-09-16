@@ -34,6 +34,8 @@ class ArtifactRunner:
         if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_PATCH.value}:
             content = f"candidate-{artifact_id}-{len(self.calls)}\n"
             extra["artifact"] = {"id": artifact_id, "kind": "ENGINEERING_SPEC", "candidate_content": content, "candidate_hash": hashlib.sha256(content.encode()).hexdigest()}
+            if stage == Stage.ARTIFACT_PATCH.value:
+                extra["artifact"]["patch_result"] = {"status": "PATCH_APPLIED", "reasoning": "reported defects were repaired"}
         outcome = make_outcome(env["CWO_RUN_ID"], stage, self.project, verdict, **extra)
         (run_dir / "outcome.json").write_text(json.dumps(outcome), encoding="utf-8")
         started, finished = run_times()

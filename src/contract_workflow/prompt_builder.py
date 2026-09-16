@@ -123,7 +123,7 @@ STAGE_VERDICT_GUIDANCE = {
     "TASK_REBASE_ANALYSIS": "Use APPROVED when affected task rebase evidence is complete; do not modify implementation files in this stage.",
     "ARTIFACT_GENERATION": "Use APPROVED when the candidate artifact is complete; include its id, kind, candidate_hash, and candidate_content or external candidate evidence.",
     "ARTIFACT_REVIEW": "Use APPROVED when the candidate artifact is valid and traceable, or REQUIRES_PATCH for a machine-repairable defect.",
-    "ARTIFACT_PATCH": "Use APPROVED when the repaired candidate artifact is complete; report a scoped decision only for genuine authority ambiguity.",
+    "ARTIFACT_PATCH": "Emit artifact.patch_result.status=PATCH_APPLIED only when the scoped candidate changed; use NO_PATCH_NEEDED with explicit reconciliation when every finding needs no content change; use PATCH_BLOCKED only with an explicit upstream/authority blocker and scoped decision verdict.",
 }
 
 
@@ -159,6 +159,8 @@ class PromptBuilder:
         allowed = "- .contract-workflow runtime tracker (orchestrator-owned)"
         if task_paths:
             allowed += "\n" + "\n".join(f"- {path}" for path in task_paths)
+        elif artifact_spec and stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_PATCH.value} and artifact_spec.accepted_path:
+            allowed += f"\n- {artifact_spec.accepted_path} (isolated workspace candidate only)"
         else:
             allowed += "\n- no task-specific mutable paths declared"
         previous_issues = _previous_issues(state)
@@ -233,7 +235,13 @@ For `AUTHORITY_CHANGE_ANALYSIS`, include an `authority_change` object with chang
 
 For propagation stages, emit only structured fields appropriate to the stage: `propagation_plan`, `candidate_artifacts`, `contract_revision_report`, `plan_revision_report`, `plan_graph`, or `task_rebase` as requested by the prompt. Candidate artifact content is evidence in CWO external state and must never be written to accepted project authority files by the Agent.
 
-For generic artifact stages, emit an `artifact` object with the current artifact `id` and `kind`. Generation and patch stages must include `candidate_hash` and may include `candidate_content`; review stages must include a concise `review` object. CWO validates lifecycle and dependency state deterministically. Artifact promotion is performed by CWO according to the declared promotion_policy; do not copy or overwrite accepted artifacts from the Agent.
+For generic artifact stages, emit an `artifact` object with the current artifact `id` and `kind`. Generation must include `candidate_hash` and may include `candidate_content`; review must include a concise `review` object. CWO validates lifecycle and dependency state deterministically. Artifact promotion is performed by CWO according to the declared promotion_policy; do not copy or overwrite accepted artifacts from the Agent.
+
+For `ARTIFACT_PATCH`, modify only the materialized workspace candidate path listed in Allowed scope and never access the external CWO artifact store directly. Include `artifact.patch_result` with exactly one semantic status:
+- `PATCH_APPLIED`: verdict `APPROVED`; include the changed candidate hash/content plus non-empty `reasoning`.
+- `NO_PATCH_NEEDED`: verdict `APPROVED`; do not emit candidate content or change the candidate; include non-empty `reasoning` and `finding_reconciliation` entries for every current finding. Each entry requires `finding_index`, `disposition`, `reasoning`, and `evidence`. This result returns to independent semantic review and does not promote.
+- `PATCH_BLOCKED`: use `OPEN_CONTRACT_ISSUE` or `ARCHITECTURE_DECISION_REQUIRED`; do not change the candidate; include non-empty `reasoning`, `blocked_by` with `type` (`UPSTREAM_DEPENDENCY` or `HUMAN_AUTHORITY`), `id`, and `reason`, plus the existing scoped Decision fields.
+CWO alone records `EXECUTION_FAILED` when no valid semantic patch result exists.
 
 {render_outcome_contract(values['run_id'], values['stage'], values['project'], values['group'], values['task'])}
 Do not include private chain-of-thought.'''

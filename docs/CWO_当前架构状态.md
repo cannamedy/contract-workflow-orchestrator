@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.15
+Documented version: 0.8.17
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -101,6 +101,12 @@ Repository snapshot observed for this state update:
 - Artifact candidate 的成功完成必须有可信内容来源：结构化结果含 candidate content，或本次
   workspace 产生了唯一允许的 candidate 文件变化；只有 CWO 外部 candidate store 中存在且 hash
   完全匹配的内容才可用于确定性路径修复，不能由 candidate 文件声明或 partial output 推断成功。
+- `ARTIFACT_PATCH` 使用显式语义结果：`PATCH_APPLIED` 必须同时证明 candidate 已改变；
+  `NO_PATCH_NEEDED` 必须逐条 reconcile 当前 finding 并回到独立语义审查，不能直接 promotion；
+  `PATCH_BLOCKED` 复用 scoped HumanDecision；结果缺失或与 candidate 变化矛盾时由 CWO 记录
+  `EXECUTION_FAILED`。已失败 invocation 不会被采用；若旧版 Agent 越过 workspace 改写 external
+  candidate store，受限 recovery 只可从与 state hash、已持久化 summary 完全匹配的历史成功
+  CWO outcome 恢复最后 adopted candidate，并记录 failed workspace 未被复用。
 
 ### PARTIAL
 

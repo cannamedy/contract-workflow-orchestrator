@@ -215,7 +215,7 @@ class ValidatorSeamTests(unittest.TestCase):
         )
         state = WorkflowState(project_path=str(self.project), artifacts={"spec": artifact}, current_artifact_id="spec", current_stage=Stage.ARTIFACT_PATCH.value)
         new = b"new\n"
-        outcome = {"verdict": "APPROVED", "artifact": {"id": "spec", "kind": "ENGINEERING_SPEC", "candidate_content": new.decode(), "candidate_hash": hashlib.sha256(new).hexdigest()}}
+        outcome = {"verdict": "APPROVED", "artifact": {"id": "spec", "kind": "ENGINEERING_SPEC", "candidate_content": new.decode(), "candidate_hash": hashlib.sha256(new).hexdigest(), "patch_result": {"status": "PATCH_APPLIED", "reasoning": "candidate was repaired"}}}
         updated = Orchestrator(config, store=store)._apply_artifact_outcome(state, outcome).state
         self.assertEqual(updated.current_stage, Stage.ARTIFACT_VALIDATION.value)
         self.assertNotIn("validator", updated.artifacts["spec"].metadata)
@@ -233,7 +233,7 @@ class ValidatorSeamTests(unittest.TestCase):
         self.assertEqual(failed.current_stage, Stage.ARTIFACT_PATCH.value)
         (self.project / "validator-mode").write_text("pass\n", encoding="utf-8")
         second = b"second\n"
-        patched = orchestrator._apply_artifact_outcome(failed, {"verdict": "APPROVED", "artifact": {"id": "spec", "kind": "ENGINEERING_SPEC", "candidate_content": second.decode(), "candidate_hash": hashlib.sha256(second).hexdigest()}}).state
+        patched = orchestrator._apply_artifact_outcome(failed, {"verdict": "APPROVED", "artifact": {"id": "spec", "kind": "ENGINEERING_SPEC", "candidate_content": second.decode(), "candidate_hash": hashlib.sha256(second).hexdigest(), "patch_result": {"status": "PATCH_APPLIED", "reasoning": "validator findings were repaired"}}}).state
         self.assertEqual(patched.current_stage, Stage.ARTIFACT_VALIDATION.value)
         reviewed = orchestrator._artifact_validation_step(patched).state
         self.assertEqual(reviewed.current_stage, Stage.ARTIFACT_REVIEW.value)
@@ -299,6 +299,7 @@ class ValidatorSeamTests(unittest.TestCase):
                 "id": "spec", "kind": "ENGINEERING_SPEC",
                 "candidate_content": new.decode(),
                 "candidate_hash": hashlib.sha256(new).hexdigest(),
+                "patch_result": {"status": "PATCH_APPLIED", "reasoning": "candidate was repaired"},
             },
         }
         result = Orchestrator(config, store=store)._finalize_agent_outcome(

@@ -11,6 +11,9 @@ from .models import ARTIFACT_KINDS, ArtifactSpec, ArtifactStatus, DecisionStatus
 from .project_validator import INTERNAL_VALIDATOR_ROLES
 
 
+ARTIFACT_PATCH_RESULTS = frozenset({"PATCH_APPLIED", "NO_PATCH_NEEDED", "PATCH_BLOCKED"})
+
+
 def canonical_candidate_content(content: Any) -> str | None:
     """Return the stable persisted representation of an artifact candidate."""
     if isinstance(content, str):
@@ -505,6 +508,90 @@ def validate_artifact_promotion(config: WorkflowConfig, state: WorkflowState, ar
     return []
 
 
+def validate_artifact_patch_result(
+    state: WorkflowState,
+    outcome: dict[str, Any],
+    raw: dict[str, Any],
+    *,
+    workspace_candidate_changed: bool = False,
+) -> list[str]:
+    """Validate the semantic result of an ``ARTIFACT_PATCH`` invocation.
+
+    Candidate bytes and semantic completion are deliberately independent
+    evidence.  A changed candidate is not a successful patch without an
+    explicit result, and an asserted patch is not successful when the
+    candidate identity did not change.
+    """
+
+    result = raw.get("patch_result")
+    if not isinstance(result, dict):
+        return ["artifact.patch_result is required for ARTIFACT_PATCH"]
+    status = result.get("status")
+    if status not in ARTIFACT_PATCH_RESULTS:
+        return ["artifact.patch_result.status must be PATCH_APPLIED, NO_PATCH_NEEDED, or PATCH_BLOCKED"]
+    reasoning = result.get("reasoning")
+    errors: list[str] = []
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        errors.append("artifact.patch_result.reasoning is required")
+
+    current = state.artifacts.get(state.current_artifact_id or "")
+    current_hash = current.candidate_hash if current else None
+    candidate_hash = raw.get("candidate_hash")
+    has_content = raw.get("candidate_content") is not None
+    candidate_changed = isinstance(candidate_hash, str) and candidate_hash != current_hash
+    verdict = outcome.get("verdict")
+
+    if status == "PATCH_APPLIED":
+        if verdict != "APPROVED":
+            errors.append("PATCH_APPLIED requires verdict APPROVED")
+        if not candidate_changed:
+            errors.append("PATCH_APPLIED requires a changed candidate")
+    elif status == "NO_PATCH_NEEDED":
+        if verdict != "APPROVED":
+            errors.append("NO_PATCH_NEEDED requires verdict APPROVED")
+        if workspace_candidate_changed or has_content or candidate_changed:
+            errors.append("NO_PATCH_NEEDED must not change or replace the candidate")
+        reconciliation = result.get("finding_reconciliation")
+        if not isinstance(reconciliation, list) or not reconciliation:
+            errors.append("NO_PATCH_NEEDED requires finding_reconciliation")
+        else:
+            expected_issues = []
+            if current and isinstance(current.metadata.get("patch_context"), dict):
+                expected_issues = current.metadata["patch_context"].get("issues", [])
+                if not isinstance(expected_issues, list):
+                    expected_issues = []
+            indexes: set[int] = set()
+            for index, item in enumerate(reconciliation):
+                if not isinstance(item, dict):
+                    errors.append(f"artifact.patch_result.finding_reconciliation[{index}] must be an object")
+                    continue
+                finding_index = item.get("finding_index")
+                if not isinstance(finding_index, int) or finding_index < 0:
+                    errors.append(f"artifact.patch_result.finding_reconciliation[{index}].finding_index is required")
+                else:
+                    indexes.add(finding_index)
+                for field in ("disposition", "reasoning", "evidence"):
+                    if not isinstance(item.get(field), str) or not item[field].strip():
+                        errors.append(f"artifact.patch_result.finding_reconciliation[{index}].{field} is required")
+            if expected_issues and indexes != set(range(len(expected_issues))):
+                errors.append("NO_PATCH_NEEDED must reconcile every current patch finding exactly once")
+    else:
+        if verdict not in {"OPEN_CONTRACT_ISSUE", "ARCHITECTURE_DECISION_REQUIRED"}:
+            errors.append("PATCH_BLOCKED requires a scoped authority or contract decision verdict")
+        if workspace_candidate_changed or has_content or candidate_changed:
+            errors.append("PATCH_BLOCKED must not change or replace the candidate")
+        blocked_by = result.get("blocked_by")
+        if not isinstance(blocked_by, dict):
+            errors.append("PATCH_BLOCKED requires patch_result.blocked_by")
+        else:
+            if blocked_by.get("type") not in {"UPSTREAM_DEPENDENCY", "HUMAN_AUTHORITY"}:
+                errors.append("PATCH_BLOCKED blocked_by.type must be UPSTREAM_DEPENDENCY or HUMAN_AUTHORITY")
+            for field in ("id", "reason"):
+                if not isinstance(blocked_by.get(field), str) or not blocked_by[field].strip():
+                    errors.append(f"PATCH_BLOCKED blocked_by.{field} is required")
+    return errors
+
+
 def validate_artifact_outcome(config: WorkflowConfig, state: WorkflowState, raw: Any, *, stage: str) -> tuple[dict[str, Any] | None, list[str]]:
     if not isinstance(raw, dict):
         return None, ["artifact must be an object"]
@@ -518,8 +605,11 @@ def validate_artifact_outcome(config: WorkflowConfig, state: WorkflowState, raw:
         return None, ["artifact.kind does not match the configured artifact kind"]
     errors: list[str] = []
     serialized_content: str | None = None
+    candidate_hash = raw.get("candidate_hash")
+    patch_result = raw.get("patch_result") if stage == "ARTIFACT_PATCH" else None
+    patch_status = patch_result.get("status") if isinstance(patch_result, dict) else None
+    candidate_required = stage == "ARTIFACT_GENERATION" or patch_status == "PATCH_APPLIED"
     if stage in {"ARTIFACT_GENERATION", "ARTIFACT_PATCH"}:
-        candidate_hash = raw.get("candidate_hash")
         content = raw.get("candidate_content")
         serialized_content = canonical_candidate_content(content) if content is not None else None
         if content is not None and serialized_content is None:
@@ -529,8 +619,10 @@ def validate_artifact_outcome(config: WorkflowConfig, state: WorkflowState, raw:
             if candidate_hash is not None and candidate_hash != calculated:
                 errors.append("artifact.candidate_hash does not match candidate_content")
             candidate_hash = calculated
-        if not isinstance(candidate_hash, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", candidate_hash):
+        if candidate_required and (not isinstance(candidate_hash, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", candidate_hash)):
             errors.append("artifact.candidate_hash must be a SHA-256 string")
+        elif candidate_hash is not None and (not isinstance(candidate_hash, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", candidate_hash)):
+            errors.append("artifact.candidate_hash must be a SHA-256 string when present")
         candidate_path = raw.get("candidate_path")
         if candidate_path is not None and not isinstance(candidate_path, str):
             errors.append("artifact.candidate_path must be a string")

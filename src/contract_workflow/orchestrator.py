@@ -15,7 +15,7 @@ from .config import WorkflowConfigError, load_workflow, workflow_schema_errors
 from .git_audit import GitAudit, audit_git, source_integrity, working_tree_paths
 from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
 from .authority_set import aggregate_authority_set_hash, canonical_member_records
-from .artifacts import artifact_impact_closure, artifact_specs, dependency_revisions, effective_artifact_specs, hydrate_external_artifacts, hydrate_typed_artifacts, initialize_artifacts, missing_skill_roles, typed_plan_graph_prerequisite_errors, validate_artifact_outcome, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
+from .artifacts import artifact_impact_closure, artifact_specs, canonical_candidate_content, dependency_revisions, effective_artifact_specs, hydrate_external_artifacts, hydrate_typed_artifacts, initialize_artifacts, missing_skill_roles, typed_plan_graph_prerequisite_errors, validate_artifact_outcome, validate_artifact_patch_result, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
 from .plan_graph import reconcile_plan_graph, validate_plan_graph
 from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
 from .logging import EventLogger
@@ -512,6 +512,7 @@ class Orchestrator:
         )
         candidate_validation_recovery = self._candidate_validation_recovery(audit_state)[0]
         workspace_setup_recovery = self._workspace_setup_recovery(audit_state)[0]
+        artifact_patch_result_recovery = self._artifact_patch_result_recovery(audit_state)[0]
         pre_invocation_recovery = (
             pre_invocation_digest_stop
             or legacy_drift_recovery
@@ -520,6 +521,7 @@ class Orchestrator:
             or typed_promotion_recovery
             or candidate_validation_recovery
             or workspace_setup_recovery
+            or artifact_patch_result_recovery
         )
         baseline_paths = () if active_invocation or (audit_state.current_stage == Stage.HARD_STOP.value and not pre_invocation_recovery) else working_tree_paths(Path(self.config.project_path))
         audit = audit_git(Path(self.config.project_path), self.config, tuple(sorted(set(scan.registered_paths) | set(configured_authority_paths))), plan_expected, baseline_paths=baseline_paths)
@@ -872,6 +874,8 @@ class Orchestrator:
             "workspace_diff_count": len(changes),
             "workspace_diff": changes,
         }
+        if state.current_stage == Stage.ARTIFACT_PATCH.value:
+            execution_failure["result"] = "EXECUTION_FAILED"
         failure = make_outcome(
             run_id,
             state.current_stage,
@@ -995,7 +999,10 @@ class Orchestrator:
             # later validator to discover a false/missing candidate after the
             # workspace is discarded.
             artifact = outcome.get("artifact")
-            if isinstance(artifact, dict) and artifact.get("candidate_content") is None:
+            patch_result = artifact.get("patch_result") if isinstance(artifact, dict) else None
+            patch_status = patch_result.get("status") if isinstance(patch_result, dict) else None
+            no_candidate_expected = stage == Stage.ARTIFACT_PATCH.value and patch_status in {"NO_PATCH_NEEDED", "PATCH_BLOCKED"}
+            if isinstance(artifact, dict) and artifact.get("candidate_content") is None and not no_candidate_expected:
                 self._persist_execution_failure(
                     state, run_dir, _read_json(run_dir / "metadata.json"),
                     "AGENT_RESULT_MISSING", "artifact candidate content is missing and the workspace has no scoped candidate change",
@@ -1007,6 +1014,31 @@ class Orchestrator:
                     "artifact candidate content is missing and the workspace has no scoped candidate change",
                     "AGENT_RESULT_MISSING",
                 )
+        if stage == Stage.ARTIFACT_PATCH.value:
+            artifact = outcome.get("artifact")
+            patch_errors = (
+                validate_artifact_patch_result(
+                    state,
+                    outcome,
+                    artifact,
+                    workspace_candidate_changed=bool(changes),
+                )
+                if isinstance(artifact, dict)
+                else ["artifact.patch_result is required for ARTIFACT_PATCH"]
+            )
+            if patch_errors:
+                reason = "; ".join(patch_errors)
+                self._persist_execution_failure(
+                    state,
+                    run_dir,
+                    _read_json(run_dir / "metadata.json"),
+                    "ARTIFACT_PATCH_RESULT_INVALID",
+                    reason,
+                    changes=changes,
+                )
+                if workspace:
+                    workspace.discard()
+                return self._invalid_or_failed(state, patch_errors)
         if stage in PROJECT_MUTATING_STAGES and outcome.get("verdict") == Verdict.APPROVED.value and changes:
             task = self.config.task_at(state.current_group, state.current_task)
             if not task:
@@ -1356,6 +1388,63 @@ class Orchestrator:
         current = state.artifacts.get(artifact_id)
         if current is None:
             return self._invalid_or_failed(state, ["current artifact state is missing"])
+        patch_result = raw.get("patch_result") if stage == Stage.ARTIFACT_PATCH.value else None
+        patch_status = patch_result.get("status") if isinstance(patch_result, dict) else None
+        if stage == Stage.ARTIFACT_PATCH.value:
+            patch_errors = validate_artifact_patch_result(state, outcome, raw)
+            if patch_errors:
+                return self._invalid_or_failed(state, patch_errors)
+            if patch_status == "NO_PATCH_NEEDED":
+                updated_artifact = replace(
+                    current,
+                    status=ArtifactStatus.REVIEW_REQUIRED.value,
+                    metadata={**current.metadata, "patch_result": patch_result, "last_outcome": outcome.get("summary", "")},
+                )
+                artifacts = {**state.artifacts, artifact_id: updated_artifact}
+                self.store.save_artifact(updated_artifact.to_dict())
+                updated = replace(
+                    state,
+                    artifacts=artifacts,
+                    current_artifact_id=None,
+                    current_stage=Stage.READY.value,
+                    current_group=None,
+                    current_task=None,
+                    run_id=None,
+                    attempt=0,
+                    last_outcome=outcome,
+                    status=WorkflowStatus.RUNNING.value,
+                )
+                return StepResult(self._save(schedule(self.config, updated)), "artifact_patch_no_change_rereview")
+            if patch_status == "PATCH_BLOCKED":
+                updated_artifact = replace(
+                    current,
+                    status=ArtifactStatus.BLOCKED.value,
+                    metadata={**current.metadata, "patch_result": patch_result, "last_outcome": outcome.get("summary", "")},
+                )
+                artifacts = {**state.artifacts, artifact_id: updated_artifact}
+                self.store.save_artifact(updated_artifact.to_dict())
+                blocked = replace(
+                    state,
+                    artifacts=artifacts,
+                    current_artifact_id=None,
+                    current_stage=Stage.READY.value,
+                    current_group=None,
+                    current_task=None,
+                    run_id=None,
+                    attempt=0,
+                    last_outcome=outcome,
+                    status=WorkflowStatus.RUNNING.value,
+                )
+                decision_outcome = {
+                    **outcome,
+                    "decision_requests": [
+                        {**request, "source_artifact_id": request.get("source_artifact_id", artifact_id)}
+                        for request in (outcome.get("decision_requests") or [outcome])
+                        if isinstance(request, dict)
+                    ],
+                }
+                blocked, _ = self._record_decisions(blocked, decision_outcome)
+                return StepResult(self._save(schedule(self.config, blocked)), "artifact_patch_blocked")
         if stage in {Stage.ARTIFACT_GENERATION.value, Stage.ARTIFACT_PATCH.value}:
             if current.kind == "PLAN_GRAPH":
                 prerequisite_errors = typed_plan_graph_prerequisite_errors(self.config, state)
@@ -1384,6 +1473,8 @@ class Orchestrator:
                 "last_outcome": outcome.get("summary", ""),
                 "dependency_revisions": dependency_revisions(self.config, state, next(item for item in self.config.artifact_pipeline if item.id == artifact_id)),
             }
+            if stage == Stage.ARTIFACT_PATCH.value:
+                metadata["patch_result"] = patch_result
             validation_required = requires_project_validation(current.validator_role)
             updated_artifact = replace(current, status=ArtifactStatus.CANDIDATE.value if validation_required else status, version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=candidate_path, change_id=state.current_authority_change_id, metadata=metadata)
         else:
@@ -2539,6 +2630,7 @@ class Orchestrator:
         candidate_validation_recovery, candidate_validation_errors = self._candidate_validation_recovery(state)
         schema_recovery = state.stop_code == "RETRY_EXHAUSTED" and not runner_recovery
         historical_missing_outcome_recovery, historical_recovery_errors = self._historical_missing_outcome_recovery(state)
+        artifact_patch_result_recovery, artifact_patch_result_errors, artifact_patch_recovery_evidence = self._artifact_patch_result_recovery(state)
         if historical_recovery_errors:
             self.logger.emit(
                 "recovery_validation_failed",
@@ -2555,7 +2647,15 @@ class Orchestrator:
                 reason="; ".join(workspace_setup_recovery_errors),
             )
             raise OrchestratorError("; ".join(workspace_setup_recovery_errors))
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or candidate_validation_recovery or workspace_setup_recovery or schema_recovery or workflow_digest_recovery):
+        if artifact_patch_result_errors:
+            self.logger.emit(
+                "recovery_validation_failed",
+                stop_code=state.stop_code,
+                blocked_stage=state.blocked_stage,
+                reason="; ".join(artifact_patch_result_errors),
+            )
+            raise OrchestratorError("; ".join(artifact_patch_result_errors))
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or candidate_validation_recovery or workspace_setup_recovery or artifact_patch_result_recovery or schema_recovery or workflow_digest_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
@@ -2799,9 +2899,38 @@ class Orchestrator:
                 reason = "; ".join(safety_errors)
                 self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason=reason)
                 raise OrchestratorError(reason)
-        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or workspace_setup_recovery or legacy_recovery):
+        elif (not state.blocked_stage or state.run_id is not None) and not (runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or workspace_setup_recovery or artifact_patch_result_recovery or legacy_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="recovery uncertainty")
             raise OrchestratorError("recovery uncertainty prevents resume")
+
+        if artifact_patch_result_recovery and artifact_patch_recovery_evidence:
+            restore_content = artifact_patch_recovery_evidence.get("restore_content")
+            artifact_id = str(artifact_patch_recovery_evidence["artifact_id"])
+            if isinstance(restore_content, str):
+                restored_path = self.store.save_artifact_candidate(artifact_id, restore_content)
+                restored_hash = hashlib.sha256(restored_path.read_bytes()).hexdigest()
+                if restored_hash != artifact_patch_recovery_evidence["candidate_hash"]:
+                    raise OrchestratorError("artifact patch recovery could not restore the recorded candidate")
+            recovery_record = {
+                key: value
+                for key, value in artifact_patch_recovery_evidence.items()
+                if key != "restore_content"
+            }
+            recovery_record.update({
+                "failed_workspace_adopted": False,
+                "recovered_at": now_iso(),
+            })
+            recovery_events = self.store.root / "recovery-events"
+            recovery_events.mkdir(parents=True, exist_ok=True)
+            recovery_path = recovery_events / f"artifact-patch-result-{state.run_id}.json"
+            _write_json(recovery_path, recovery_record)
+            self.logger.emit(
+                "artifact_patch_result_recovered",
+                run_id=state.run_id,
+                artifact_id=artifact_id,
+                source_run_id=recovery_record.get("source_run_id"),
+                candidate_restored=isinstance(restore_content, str),
+            )
 
         audit, integrity, _ = self._audit_gate()
         if integrity or audit.blocking or not audit.is_repository or audit.error:
@@ -2827,6 +2956,120 @@ class Orchestrator:
         if not candidate.is_file() or candidate.is_symlink():
             return False
         return hashlib.sha256(candidate.read_bytes()).hexdigest().lower() == artifact.candidate_hash.lower()
+
+    def _artifact_patch_result_recovery(self, state: WorkflowState) -> tuple[bool, list[str], dict[str, Any] | None]:
+        """Recover the proven pre-result-contract ARTIFACT_PATCH stop.
+
+        The failed invocation is never adopted.  If it mutated the external
+        candidate store, recovery restores only bytes from an earlier,
+        successful Agent outcome that exactly matches the candidate hash and
+        summary already persisted in the artifact record.
+        """
+
+        exact_stop = (
+            state.current_stage == Stage.HARD_STOP.value
+            and state.stop_code in {"AGENT_RESULT_MISSING", "ARTIFACT_PATCH_RESULT_INVALID"}
+            and state.blocked_stage == Stage.ARTIFACT_PATCH.value
+            and bool(state.run_id)
+            and bool(state.current_artifact_id)
+        )
+        if not exact_stop:
+            return False, [], None
+
+        errors: list[str] = []
+        artifact_id = state.current_artifact_id or ""
+        artifact = state.artifacts.get(artifact_id)
+        if artifact is None or artifact.status != ArtifactStatus.REQUIRES_PATCH.value:
+            errors.append("artifact patch result recovery requires a REQUIRES_PATCH artifact")
+        elif not isinstance(artifact.candidate_hash, str) or len(artifact.candidate_hash) != 64:
+            errors.append("artifact patch result recovery requires a recorded candidate hash")
+
+        failed_metadata = _read_json(self.store.run_dir(state.run_id or "") / "metadata.json")
+        if (
+            failed_metadata.get("run_id") != state.run_id
+            or failed_metadata.get("stage") != Stage.ARTIFACT_PATCH.value
+            or failed_metadata.get("status") != "completed"
+            or failed_metadata.get("exit_code") != 0
+            or failed_metadata.get("timed_out") is not False
+        ):
+            errors.append("artifact patch result recovery requires a completed successful runner attempt")
+        if failed_metadata.get("workspace_diff_count") != 0:
+            errors.append("artifact patch result recovery refuses a failed invocation with workspace mutations")
+        try:
+            real_drift = json.loads(
+                (self.store.run_dir(state.run_id or "") / "real-drift.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            real_drift = None
+        if not isinstance(real_drift, list):
+            errors.append("artifact patch result recovery requires persisted real-drift evidence")
+        elif any(
+            isinstance(item, dict)
+            and item.get("classification") in {"AUTHORITY_DRIFT", "ACCEPTED_UPSTREAM_DRIFT", "CURRENT_TARGET_DRIFT"}
+            for item in real_drift
+        ):
+            errors.append("artifact patch result recovery is blocked by authority, upstream, or target drift")
+
+        if artifact is not None:
+            dependency_revisions = artifact.metadata.get("dependency_revisions", [])
+            for dependency in dependency_revisions if isinstance(dependency_revisions, list) else []:
+                if not isinstance(dependency, dict):
+                    errors.append("artifact patch result recovery found invalid dependency evidence")
+                    continue
+                upstream = state.artifacts.get(str(dependency.get("artifact_id", "")))
+                if upstream is None or upstream.status != ArtifactStatus.ACCEPTED.value:
+                    errors.append(f"accepted dependency is not available: {dependency.get('artifact_id', '')}")
+                elif upstream.accepted_hash != dependency.get("hash"):
+                    errors.append(f"accepted dependency hash drifted: {dependency.get('artifact_id', '')}")
+            descendants = set(artifact_impact_closure(self.config, (artifact_id,))) - {artifact_id}
+            if any(state.artifacts.get(item) and state.artifacts[item].status == ArtifactStatus.ACCEPTED.value for item in descendants):
+                errors.append("artifact patch result recovery cannot run after downstream typed promotion")
+        if errors or artifact is None:
+            return False, errors, None
+
+        evidence: dict[str, Any] = {
+            "artifact_id": artifact_id,
+            "candidate_hash": artifact.candidate_hash,
+            "failed_run_id": state.run_id,
+            "source_run_id": None,
+            "restore_content": None,
+        }
+        if self._stored_candidate_matches(artifact_id, artifact):
+            return True, [], evidence
+
+        expected_summary = artifact.metadata.get("last_outcome")
+        candidates: list[tuple[str, str, str]] = []
+        for outcome_path in self.store.runs_path.glob("*/outcome.json"):
+            source_run_id = outcome_path.parent.name
+            if source_run_id == state.run_id:
+                continue
+            metadata = _read_json(outcome_path.parent / "metadata.json")
+            if (
+                metadata.get("status") != "completed"
+                or metadata.get("exit_code") != 0
+                or metadata.get("timed_out") is not False
+            ):
+                continue
+            valid, outcome, _ = validate_outcome(outcome_path, source_run_id, str(metadata.get("stage") or ""))
+            if not valid or not isinstance(outcome, dict) or outcome.get("verdict") != Verdict.APPROVED.value:
+                continue
+            raw_artifact = outcome.get("artifact")
+            if not isinstance(raw_artifact, dict) or raw_artifact.get("id") != artifact_id:
+                continue
+            if raw_artifact.get("candidate_hash") != artifact.candidate_hash:
+                continue
+            if expected_summary and outcome.get("summary") != expected_summary:
+                continue
+            content = canonical_candidate_content(raw_artifact.get("candidate_content"))
+            if content is None or hashlib.sha256(content.encode("utf-8")).hexdigest() != artifact.candidate_hash:
+                continue
+            completed_at = str(metadata.get("finished_at") or metadata.get("started_at") or "")
+            candidates.append((completed_at, source_run_id, content))
+        if not candidates:
+            return False, ["artifact patch result recovery found no prior CWO-adopted candidate evidence"], None
+        _, source_run_id, content = max(candidates)
+        evidence.update({"source_run_id": source_run_id, "restore_content": content})
+        return True, [], evidence
 
     def _candidate_validation_recovery(self, state: WorkflowState) -> tuple[bool, list[str]]:
         """Validate the narrow stop caused by losing a persisted candidate path.
