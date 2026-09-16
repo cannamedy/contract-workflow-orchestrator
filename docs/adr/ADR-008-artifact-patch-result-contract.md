@@ -14,6 +14,11 @@ external candidate store。即使 state 没有采用该结果，candidate bytes 
 
 ## Decision
 
+当 Agent 在唯一允许的 workspace candidate path 产生 scoped mutation、但没有重复返回顶层
+`artifact.candidate_hash` 时，CWO 会先读取该受信 workspace 内容并按 canonical candidate
+serialization 计算 identity，再验证 `PATCH_APPLIED` 的“candidate 确实改变”前置条件。Agent
+放在 `patch_result` 内的 hash 不能替代此计算；未发生 scoped mutation 时也不能借此声明成功。
+
 `ARTIFACT_PATCH` 必须返回 `artifact.patch_result`，并使用以下互斥状态：
 
 - `PATCH_APPLIED`：top-level verdict 为 `APPROVED`，且 candidate hash 必须相对当前记录发生变化；

@@ -300,6 +300,31 @@ groups:
         self.assertEqual(updated.candidate_hash, hashlib.sha256(b"new\n").hexdigest())
         self.assertEqual(updated.metadata["patch_result"]["status"], "PATCH_APPLIED")
 
+    def test_patch_applied_derives_candidate_identity_from_changed_workspace_content(self) -> None:
+        state, candidate = self.patch_state()
+        outcome = self.outcome(
+            "workspace-patch-applied",
+            patch_status="PATCH_APPLIED",
+        )
+        workspace, metadata = self.workspace_metadata("workspace-patch-applied", candidate)
+        (workspace.path / "contract.json").write_text("new from workspace\n", encoding="utf-8")
+
+        result = Orchestrator(self.config, store=self.store)._finalize_agent_outcome(
+            state,
+            outcome,
+            self.store.run_dir("workspace-patch-applied"),
+            metadata,
+        )
+
+        updated = result.state.artifacts["contract"]
+        self.assertEqual(result.state.current_stage, Stage.ARTIFACT_VALIDATION.value)
+        self.assertEqual(updated.status, ArtifactStatus.CANDIDATE.value)
+        self.assertEqual(
+            updated.candidate_hash,
+            hashlib.sha256(b"new from workspace\n").hexdigest(),
+        )
+        self.assertEqual(updated.metadata["patch_result"]["status"], "PATCH_APPLIED")
+
     def test_recovery_restores_last_cwo_adopted_candidate_not_failed_mutation(self) -> None:
         state, candidate = self.patch_state()
         adopted = "old\n"

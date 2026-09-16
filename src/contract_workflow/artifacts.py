@@ -570,7 +570,11 @@ def validate_artifact_patch_result(
     current = state.artifacts.get(state.current_artifact_id or "")
     current_hash = current.candidate_hash if current else None
     candidate_hash = raw.get("candidate_hash")
-    has_content = raw.get("candidate_content") is not None
+    candidate_content = raw.get("candidate_content")
+    has_content = candidate_content is not None
+    serialized_content = canonical_candidate_content(candidate_content) if has_content else None
+    if serialized_content is not None:
+        candidate_hash = hashlib.sha256(serialized_content.encode("utf-8")).hexdigest()
     candidate_changed = isinstance(candidate_hash, str) and candidate_hash != current_hash
     verdict = outcome.get("verdict")
 
