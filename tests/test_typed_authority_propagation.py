@@ -6,12 +6,13 @@ import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from contract_workflow.config import load_workflow
 from contract_workflow.authority_set import aggregate_authority_set_hash
-from contract_workflow.models import ArtifactStatus, DecisionStatus, EngineeringArtifact, HumanDecision, Stage, WorkflowState, WorkflowStatus
+from contract_workflow.models import ArtifactSpec, ArtifactStatus, DecisionStatus, EngineeringArtifact, HumanDecision, Stage, WorkflowState, WorkflowStatus
 from contract_workflow.orchestrator import Orchestrator
 from contract_workflow.state_store import StateStore
 
@@ -303,6 +304,98 @@ class TypedAuthorityPropagationTests(unittest.TestCase):
         self.assertEqual(recovered.artifacts["engineering-spec"].status, ArtifactStatus.ACCEPTED.value)
         self.assertEqual(recovered.artifacts["engineering-spec"].metadata["dependency_revisions"][0]["hash"], candidate_hash)
         self.assertTrue((self.state_root / "recovery-events" / "nonsemantic-authority-CR-1.json").is_file())
+
+    def test_recovery_supersedes_decision_caused_by_stale_authority_prompt(self):
+        config = self._config()
+        config = replace(config, artifact_pipeline=(*config.artifact_pipeline, ArtifactSpec(
+            "machine-contract", "MACHINE_CONTRACT", dependencies=("engineering-spec",),
+            review_required=True, accepted_path="machine-contract.json",
+        )))
+        store = StateStore(self.state_root)
+        accepted_content = b"R2 accepted\n"
+        accepted_hash = hashlib.sha256(accepted_content).hexdigest()
+        declared_hash = hashlib.sha256(b"R1 historical\n").hexdigest()
+        snapshot = self.state_root / "authority" / "snapshots" / "r2" / "guide.md"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_bytes(accepted_content)
+        store.save_authority_ledger({"schema_version": "1.0", "sources": {"human-guide": {
+            "source_id": "human-guide", "role": "HUMAN_GUIDE", "status": "ACCEPTED",
+            "path": "guide.md", "accepted_content_sha256": accepted_hash,
+            "accepted_authority_content_sha256": accepted_hash,
+            "accepted_remote_commit": "commit-r2", "accepted_remote_blob": "blob-r2",
+            "accepted_snapshot_path": str(snapshot),
+        }}})
+        candidate_content = "machine candidate\n"
+        candidate_path = store.save_artifact_candidate("machine-contract", candidate_content)
+        candidate_hash = hashlib.sha256(candidate_content.encode()).hexdigest()
+        false_finding = {"type": "FROZEN_SOURCE_MISMATCH", "message": "stale prompt mismatch", "blocking": True}
+        real_finding = {"type": "IMPLEMENTATION_DEFECT", "message": "repair candidate", "blocking": True}
+        guide = EngineeringArtifact(
+            "human-guide", "HUMAN_GUIDE", ArtifactStatus.ACCEPTED.value,
+            version_hash=accepted_hash, accepted_hash=accepted_hash, accepted_path=str(snapshot),
+            promotion_policy="EXTERNAL", metadata={"accepted_source": {"commit_sha": "commit-r2"}},
+        )
+        machine = EngineeringArtifact(
+            "machine-contract", "MACHINE_CONTRACT", ArtifactStatus.BLOCKED.value,
+            version_hash=candidate_hash, candidate_hash=candidate_hash, candidate_path=str(candidate_path),
+            review_required=True, accepted_path="machine-contract.json",
+            metadata={
+                "patch_context": {"issues": [false_finding, real_finding], "summary": "one false and one real finding"},
+                "patch_result": {"status": "PATCH_BLOCKED"},
+            },
+        )
+        decision_id = "STALE-AUTHORITY-DECISION"
+        decision = HumanDecision(
+            decision_id=decision_id, source_artifact_id="machine-contract",
+            directly_blocked_items=("TASK-002",), affected_tasks=("TASK-002",),
+        )
+        run_id = "stale-prompt-run"
+        outcome = {
+            "schema_version": "1.0", "run_id": run_id, "stage": Stage.ARTIFACT_PATCH.value,
+            "verdict": "OPEN_CONTRACT_ISSUE", "blocking": True, "decision_id": decision_id,
+            "artifact": {"id": "machine-contract", "kind": "MACHINE_CONTRACT", "patch_result": {
+                "status": "PATCH_BLOCKED", "reasoning": "stale authority prompt",
+                "blocked_by": {"type": "HUMAN_AUTHORITY", "id": "human-guide", "reason": "hash mismatch"},
+            }},
+            "blocking_scope": {
+                "type": "FROZEN_SOURCE_MISMATCH", "path": "guide.md",
+                "declared_sha256": declared_hash, "materialized_sha256": accepted_hash,
+            },
+        }
+        state = WorkflowState(
+            project=config.project_name, project_path=config.project_path,
+            workflow_file=config.workflow_file, workflow_digest=config.digest,
+            current_stage=Stage.WAITING_FOR_HUMAN.value, status=WorkflowStatus.WAITING_HUMAN.value,
+            artifacts={"human-guide": guide, "machine-contract": machine},
+            decisions={decision_id: decision}, last_outcome=outcome,
+        )
+        store.save_artifact(guide.to_dict())
+        store.save_artifact(machine.to_dict())
+        store.save_decision(decision)
+        store.save(state)
+        run_dir = store.run_dir(run_id)
+        (run_dir / "metadata.json").write_text(json.dumps({
+            "run_id": run_id, "stage": Stage.ARTIFACT_PATCH.value, "status": "completed",
+            "workspace_diff_count": 0,
+            "authority_materializations": [{"path": "guide.md", "snapshot_path": str(snapshot), "sha256": accepted_hash}],
+        }), encoding="utf-8")
+        (run_dir / "workspace-diff.json").write_text("[]\n", encoding="utf-8")
+        (run_dir / "prompt.md").write_text(f"Frozen authority:\n- guide.md sha256={declared_hash} commit=old tag=-\n", encoding="utf-8")
+
+        recovered = Orchestrator(config, store=store).recover()
+
+        self.assertEqual(recovered.status, WorkflowStatus.RUNNING.value)
+        self.assertEqual(recovered.current_stage, Stage.ARTIFACT_PATCH.value)
+        self.assertEqual(recovered.current_artifact_id, "machine-contract")
+        self.assertEqual(recovered.decisions[decision_id].status, DecisionStatus.SUPERSEDED.value)
+        self.assertEqual(recovered.decisions[decision_id].superseded_reason, "STALE_ACCEPTED_AUTHORITY_PROMPT_RECOVERED")
+        recovered_artifact = recovered.artifacts["machine-contract"]
+        self.assertEqual(recovered_artifact.status, ArtifactStatus.REQUIRES_PATCH.value)
+        self.assertEqual(recovered_artifact.metadata["patch_context"]["issues"], [real_finding])
+        self.assertEqual(Path(recovered_artifact.candidate_path).read_text(encoding="utf-8"), candidate_content)
+        evidence = self.state_root / "recovery-events" / f"stale-authority-prompt-{decision_id}.json"
+        self.assertTrue(evidence.is_file())
+        self.assertFalse(json.loads(evidence.read_text(encoding="utf-8"))["failed_workspace_adopted"])
 
 
 if __name__ == "__main__":

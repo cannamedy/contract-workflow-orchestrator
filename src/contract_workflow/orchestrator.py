@@ -2705,8 +2705,181 @@ class Orchestrator:
         self._save(updated)
         return {"status": "RESOLVED", "finding": resolved.to_dict(), "canonical_store": str(self.store.state_path)}
 
+    def _stale_authority_prompt_decision_recovery(self, state: WorkflowState) -> tuple[WorkflowState | None, list[str]]:
+        """Supersede a decision caused only by stale frozen-authority prompt metadata."""
+        if state.current_stage != Stage.WAITING_FOR_HUMAN.value or state.status != WorkflowStatus.WAITING_HUMAN.value or state.run_id is not None:
+            return None, []
+        outcome = state.last_outcome if isinstance(state.last_outcome, dict) else {}
+        artifact_result = outcome.get("artifact") if isinstance(outcome.get("artifact"), dict) else {}
+        patch_result = artifact_result.get("patch_result") if isinstance(artifact_result.get("patch_result"), dict) else {}
+        blocked_by = patch_result.get("blocked_by") if isinstance(patch_result.get("blocked_by"), dict) else {}
+        scope = outcome.get("blocking_scope") if isinstance(outcome.get("blocking_scope"), dict) else {}
+        if not (
+            outcome.get("stage") == Stage.ARTIFACT_PATCH.value
+            and patch_result.get("status") == "PATCH_BLOCKED"
+            and blocked_by.get("type") == "HUMAN_AUTHORITY"
+            and scope.get("type") == "FROZEN_SOURCE_MISMATCH"
+        ):
+            return None, []
+
+        errors: list[str] = []
+        run_id = str(outcome.get("run_id", ""))
+        artifact_id = str(artifact_result.get("id", ""))
+        authority_path = str(scope.get("path", ""))
+        declared_hash = str(scope.get("declared_sha256", "")).lower()
+        materialized_hash = str(scope.get("materialized_sha256", "")).lower()
+        decision_id = str(outcome.get("decision_id", ""))
+        decision = state.decisions.get(decision_id)
+        artifact = state.artifacts.get(artifact_id)
+        if not run_id or not artifact_id or not authority_path or not declared_hash or not materialized_hash:
+            errors.append("stale authority prompt recovery evidence is incomplete")
+        if declared_hash == materialized_hash:
+            errors.append("stale authority prompt recovery requires distinct declared and materialized hashes")
+        if decision is None or decision.status != DecisionStatus.PENDING.value or decision.source_artifact_id != artifact_id:
+            errors.append("stale authority prompt recovery does not match one pending artifact decision")
+        if artifact is None or artifact.status != ArtifactStatus.BLOCKED.value or not self._stored_candidate_matches(artifact_id, artifact):
+            errors.append("stale authority prompt recovery artifact candidate is missing, changed, or not blocked")
+
+        guides = [
+            item for item in state.artifacts.values()
+            if item.kind == "HUMAN_GUIDE" and item.status == ArtifactStatus.ACCEPTED.value
+            and str(item.accepted_hash or "").lower() == materialized_hash
+        ]
+        if len(guides) != 1:
+            errors.append("materialized authority hash is not the unique accepted Human Guide revision")
+        try:
+            accepted_materializations = self._accepted_authority_materializations(state)
+        except WorkspaceError as exc:
+            errors.append(str(exc))
+            accepted_materializations = {}
+        accepted_snapshot = accepted_materializations.get(authority_path)
+        if accepted_snapshot is None or not accepted_snapshot.is_file() or hashlib.sha256(accepted_snapshot.read_bytes()).hexdigest().lower() != materialized_hash:
+            errors.append("accepted authority materialization does not match the reported workspace hash")
+
+        run_dir = self.store.run_dir(run_id)
+        metadata = _read_json(run_dir / "metadata.json")
+        if metadata.get("status") != "completed" or metadata.get("stage") != Stage.ARTIFACT_PATCH.value or metadata.get("workspace_diff_count") != 0:
+            errors.append("stale authority prompt recovery run is not a completed no-change artifact patch")
+        materialization = next(
+            (
+                item for item in (metadata.get("authority_materializations") or [])
+                if isinstance(item, dict) and item.get("path") == authority_path
+            ),
+            None,
+        )
+        if not isinstance(materialization, dict) or str(materialization.get("sha256", "")).lower() != materialized_hash:
+            errors.append("run metadata does not prove the accepted authority materialization")
+        try:
+            workspace_diff = json.loads((run_dir / "workspace-diff.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            workspace_diff = None
+        if workspace_diff != []:
+            errors.append("stale authority prompt recovery requires an unchanged Agent workspace")
+        try:
+            prompt = (run_dir / "prompt.md").read_text(encoding="utf-8")
+        except OSError:
+            prompt = ""
+        if f"- {authority_path} sha256={declared_hash}" not in prompt:
+            errors.append("run prompt does not contain the stale declared authority hash")
+        if any(_read_json(path).get("status") == "running" for path in self.store.runs_path.glob("*/metadata.json")):
+            errors.append("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+        audit, integrity, _ = self._audit_gate()
+        if integrity or audit.blocking or not audit.is_repository or audit.error:
+            reason = "; ".join(integrity) or "; ".join(
+                item.classification.value
+                for item in audit.changes
+                if item.classification.value in {"FROZEN_AUTHORITY_CHANGE", "MERGE_CONFLICT", "UNEXPECTED_UNRELATED_CHANGE"}
+            )
+            errors.append(reason or audit.error or "Git audit blocked")
+        if errors:
+            return None, errors
+
+        patch_context = dict(artifact.metadata.get("patch_context", {}))
+        issues = patch_context.get("issues") if isinstance(patch_context.get("issues"), list) else []
+        remaining_issues = [
+            issue for issue in issues
+            if not (isinstance(issue, dict) and issue.get("type") == "FROZEN_SOURCE_MISMATCH")
+        ]
+        resumed_stage = Stage.ARTIFACT_PATCH.value if remaining_issues else Stage.ARTIFACT_REVIEW.value
+        resumed_status = ArtifactStatus.REQUIRES_PATCH.value if remaining_issues else ArtifactStatus.REVIEW_REQUIRED.value
+        recovered_at = now_iso()
+        recovery_evidence = {
+            "type": "STALE_AUTHORITY_PROMPT_DECISION_RECOVERY",
+            "owner": "CWO_RUNTIME",
+            "run_id": run_id,
+            "decision_id": decision_id,
+            "artifact_id": artifact_id,
+            "authority_path": authority_path,
+            "stale_declared_sha256": declared_hash,
+            "accepted_sha256": materialized_hash,
+            "resumed_stage": resumed_stage,
+            "remaining_finding_count": len(remaining_issues),
+            "candidate_adopted": False,
+            "failed_workspace_adopted": False,
+            "recovered_at": recovered_at,
+        }
+        artifact_metadata = {
+            key: value for key, value in artifact.metadata.items()
+            if key not in {"patch_result", "last_outcome"}
+        }
+        artifact_metadata["patch_context"] = {
+            **patch_context,
+            "issues": remaining_issues,
+            "recovery": recovery_evidence,
+        }
+        recovered_artifact = replace(artifact, status=resumed_status, metadata=artifact_metadata)
+        superseded_decision = replace(
+            decision,
+            status=DecisionStatus.SUPERSEDED.value,
+            superseded_reason="STALE_ACCEPTED_AUTHORITY_PROMPT_RECOVERED",
+        )
+        recovered = replace(
+            state,
+            artifacts={**state.artifacts, artifact_id: recovered_artifact},
+            decisions={**state.decisions, decision_id: superseded_decision},
+            current_stage=resumed_stage,
+            current_artifact_id=artifact_id,
+            current_group=None,
+            current_task=None,
+            run_id=None,
+            attempt=0,
+            status=WorkflowStatus.RUNNING.value,
+            pending_human_gate=None,
+            stop_reason=None,
+            stop_code=None,
+            blocked_stage=None,
+            recoverable=False,
+            last_outcome=recovery_evidence,
+            updated_at=recovered_at,
+        )
+        recovered = recompute(self.config, recovered)
+        self.store.save_artifact(recovered_artifact.to_dict())
+        self.store.save_decision(superseded_decision)
+        recovery_events = self.store.root / "recovery-events"
+        recovery_events.mkdir(parents=True, exist_ok=True)
+        _write_json(recovery_events / f"stale-authority-prompt-{decision_id}.json", recovery_evidence)
+        self.logger.emit(
+            "stale_authority_prompt_decision_recovered",
+            decision_id=decision_id,
+            artifact_id=artifact_id,
+            resumed_stage=resumed_stage,
+            remaining_finding_count=len(remaining_issues),
+        )
+        return self._save(recovered), []
+
     def recover(self) -> WorkflowState:
         state = self._load_or_initialize()
+        stale_prompt_recovery, stale_prompt_recovery_errors = self._stale_authority_prompt_decision_recovery(state)
+        if stale_prompt_recovery_errors:
+            self.logger.emit(
+                "recovery_validation_failed",
+                stop_code=state.stop_code,
+                blocked_stage=state.blocked_stage,
+                reason="; ".join(stale_prompt_recovery_errors),
+            )
+            raise OrchestratorError("; ".join(stale_prompt_recovery_errors))
+        if stale_prompt_recovery is not None:
+            return stale_prompt_recovery
         if state.status == WorkflowStatus.RUNNING.value and state.current_stage in AGENT_STAGES and state.run_id is None:
             self.logger.emit("recovery_noop", stage=state.current_stage, reason="logical stage is already ready for a fresh invocation")
             return state
