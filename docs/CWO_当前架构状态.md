@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.21
+Documented version: 0.8.22
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -81,6 +81,9 @@ Repository snapshot observed for this state update:
 - Artifact semantic-review 的 blocking findings 会以结构化 `patch_context` 保留在当前
   artifact runtime record，并在后续 `ARTIFACT_PATCH` prompt 中重新提供；patch 后仍必须
   重新 deterministic validate 和 independent review。
+- Project validator 拒绝 candidate 时，其当次结构化 findings 会替换过时的 semantic-review
+  `patch_context`，确保 `ARTIFACT_PATCH` 修复当前 validator 证据，而不是重复 reconcile 已解决的
+  旧 finding。
 - 进程级中断若留下无 outcome 且无活跃 Agent 的 `RUNNING` invocation，受支持的 `recover`
   会先将其确定性标记为可恢复的 `RECOVERY_UNCERTAIN`，再执行既有 drift audit；活跃进程、
   late outcome 和真实目标漂移仍不会被绕过。

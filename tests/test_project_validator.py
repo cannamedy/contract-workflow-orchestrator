@@ -27,7 +27,9 @@ VALIDATOR = textwrap.dedent(
         'validator': sys.argv[1], 'status': status,
         'artifact': 'artifact.md',
         'source_sha256': hashlib.sha256(artifact.read_bytes()).hexdigest() if artifact.is_file() else None,
-        'findings': [], 'coverage': {}
+        'findings': ([{'code': 'CANDIDATE_DEFECT', 'severity': 'ERROR', 'message': 'candidate needs validator repair'}]
+                     if status in {'FAIL', 'ARTIFACT_MISSING'} else []),
+        'coverage': {}
     }
     if mode == 'mutate':
         pathlib.Path('validator-mutated.txt').write_text('bad')
@@ -196,10 +198,15 @@ class ValidatorSeamTests(unittest.TestCase):
         store = StateStore(self.state_root)
         orchestrator = Orchestrator(config, store=store)
         content = "candidate\n"
-        state = WorkflowState(project_path=str(self.project), artifacts={"spec": EngineeringArtifact("spec", "ENGINEERING_SPEC", ArtifactStatus.CANDIDATE.value, candidate_hash=hashlib.sha256(content.encode()).hexdigest(), candidate_path=str(store.save_artifact_candidate("spec", content)), validator_role="validator", accepted_path="artifact.md")}, current_artifact_id="spec", current_stage=Stage.ARTIFACT_VALIDATION.value)
+        state = WorkflowState(project_path=str(self.project), artifacts={"spec": EngineeringArtifact("spec", "ENGINEERING_SPEC", ArtifactStatus.CANDIDATE.value, candidate_hash=hashlib.sha256(content.encode()).hexdigest(), candidate_path=str(store.save_artifact_candidate("spec", content)), validator_role="validator", accepted_path="artifact.md", metadata={"patch_context": {"issues": [{"message": "stale semantic review finding"}]}})}, current_artifact_id="spec", current_stage=Stage.ARTIFACT_VALIDATION.value)
         result = orchestrator._artifact_validation_step(state).state
         self.assertEqual(result.current_stage, Stage.ARTIFACT_PATCH.value)
         self.assertEqual(result.artifacts["spec"].status, ArtifactStatus.REQUIRES_PATCH.value)
+        self.assertEqual(
+            result.artifacts["spec"].metadata["patch_context"]["issues"],
+            [{"code": "CANDIDATE_DEFECT", "severity": "ERROR", "message": "candidate needs validator repair"}],
+        )
+        self.assertEqual(result.last_outcome["issues"], result.artifacts["spec"].metadata["patch_context"]["issues"])
         self.assertFalse(result.decisions)
 
     def test_candidate_replacement_invalidates_previous_validator_and_review_evidence(self):

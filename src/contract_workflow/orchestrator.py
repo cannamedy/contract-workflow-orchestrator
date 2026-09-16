@@ -816,8 +816,15 @@ class Orchestrator:
             self.logger.emit("project_validator_retry", artifact_id=artifact_id, validator_role=artifact.validator_role, code=result.code, attempt=attempts)
             return StepResult(self._save(updated), "validator_retry", self.config.policy.retry_backoff_seconds)
         if result.kind == "ARTIFACT_FAIL":
+            validator_findings = [dict(item) for item in evidence.get("findings", []) if isinstance(item, dict)]
+            metadata["patch_context"] = {
+                "validation_id": evidence.get("validation_id"),
+                "summary": result.message,
+                "validator": evidence,
+                "issues": validator_findings,
+            }
             updated_artifact = replace(artifact, status=ArtifactStatus.REQUIRES_PATCH.value, metadata=metadata)
-            updated = replace(state, artifacts={**state.artifacts, artifact_id: updated_artifact}, current_stage=Stage.ARTIFACT_PATCH.value, current_artifact_id=artifact_id, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome={"verdict": Verdict.REQUIRES_PATCH.value, "summary": result.message, "validator": evidence}, status=WorkflowStatus.RUNNING.value, updated_at=now_iso())
+            updated = replace(state, artifacts={**state.artifacts, artifact_id: updated_artifact}, current_stage=Stage.ARTIFACT_PATCH.value, current_artifact_id=artifact_id, current_group=None, current_task=None, run_id=None, attempt=0, last_outcome={"verdict": Verdict.REQUIRES_PATCH.value, "summary": result.message, "validator": evidence, "issues": validator_findings}, status=WorkflowStatus.RUNNING.value, updated_at=now_iso())
             self.store.save_artifact(updated_artifact.to_dict())
             self.logger.emit("project_validator_failed", artifact_id=artifact_id, validator_role=artifact.validator_role, status=evidence.get("status"))
             return StepResult(self._save(updated), "artifact_validation_failed")
