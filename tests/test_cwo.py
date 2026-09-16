@@ -498,6 +498,63 @@ artifact_pipeline:
         self.assertIn(f"guide.md sha256={accepted_hash} commit=remote-r2", prompt)
         self.assertNotIn(f"guide.md sha256={old_hash}", prompt)
 
+    def test_prompt_uses_current_accepted_authority_over_historical_propagation(self):
+        configured_hash = hashlib.sha256(b"configured\n").hexdigest()
+        historical_hash = hashlib.sha256(b"historical accepted\n").hexdigest()
+        accepted_hash = hashlib.sha256(b"current accepted\n").hexdigest()
+        config_path = self.project / ".contract-workflow" / "workflow.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text(f'''version: "1"
+project:
+  name: historical-authority-prompt
+  path: {self.project}
+mode: autonomous
+authoritative_sources:
+  - source_id: human-guide
+    role: HUMAN_GUIDE
+    path: human-guide.md
+    sha256: {configured_hash}
+  - source_id: directive
+    role: ENGINEERING_DIRECTIVE
+    path: directive.md
+    sha256: {configured_hash}
+skills: {{}}
+runner:
+  type: mock
+groups:
+  - id: g
+    tasks:
+      - id: t
+artifact_pipeline:
+  artifacts:
+    - id: human-guide
+      kind: HUMAN_GUIDE
+      promotion_policy: EXTERNAL
+''', encoding="utf-8")
+        config = load_workflow(config_path, self.project)
+        state = WorkflowState(
+            project=config.project_name, project_path=config.project_path,
+            workflow_file=config.workflow_file, workflow_digest=config.digest,
+            current_stage=Stage.ARTIFACT_REVIEW.value,
+            current_authority_change_id="CR-HISTORICAL",
+            artifacts={"human-guide": EngineeringArtifact(
+                id="human-guide", kind="HUMAN_GUIDE", status="ACCEPTED",
+                accepted_hash=accepted_hash, accepted_path="/state/current-guide.md",
+                change_id="CR-CURRENT",
+                metadata={"accepted_source": {"commit_sha": "remote-current"}},
+            )},
+            propagation={"CR-HISTORICAL": {"human_guide_promotion": {"authority_set_members": [
+                {"member_id": "human-guide", "role": "ARCHITECTURE_GUIDE", "path": "human-guide.md", "content_sha256": historical_hash, "source_revision": "remote-historical"},
+                {"member_id": "directive", "role": "ENGINEERING_DIRECTIVE", "path": "directive.md", "content_sha256": configured_hash, "source_revision": "remote-historical"},
+            ]}}},
+        )
+
+        prompt = PromptBuilder().build(config, state, self.root / "run" / "outcome.json")
+
+        self.assertIn(f"human-guide.md sha256={accepted_hash} commit=remote-current", prompt)
+        self.assertNotIn(f"human-guide.md sha256={historical_hash}", prompt)
+        self.assertIn(f"directive.md sha256={configured_hash} commit=remote-historical", prompt)
+
     def test_prompt_uses_accepted_typed_source_instead_of_bootstrap_hash(self):
         old_hash = hashlib.sha256(b"bootstrap\n").hexdigest()
         accepted_hash = hashlib.sha256(b"typed accepted\n").hexdigest()

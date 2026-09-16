@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.19
+Documented version: 0.8.20
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -54,7 +54,8 @@ Repository snapshot observed for this state update:
   RunWorkspace 的对应项目路径；真实项目中的 Human Draft 不会成为下游生成的冻结上游。
 - Typed Agent prompt 的冻结 authority 视图会以当前 accepted external snapshot/set-member
   hash 为准，而不会继续暴露已过期的静态配置 hash；这与 workspace materialization 使用同一
-  个 accepted authority revision。
+  个 accepted authority revision。若当前 artifact 仍属于早期 propagation，该历史记录可以补充其他
+  Authority Set member，但不得覆盖后续已接受的 Human Guide hash/commit。
 - `RECOVERY_UNCERTAIN` 的已中止 invocation 在其 workspace drift 已完成 scoped 检查后，恢复阶段
   会把恢复时可见的工作树作为审计基线；无关并发变化继续保留，不会重新被误报为 Agent 未授权
   变化，而 authority、accepted upstream 和当前 target 仍由恢复前的严格分类阻断。

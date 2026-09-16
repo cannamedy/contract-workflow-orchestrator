@@ -37,16 +37,20 @@ def _frozen_authority_lines(config: WorkflowConfig, state: WorkflowState) -> str
             entry = by_path.setdefault(member["path"], {"path": member["path"], "sha256": "", "commit": "-", "tag": "-"})
             entry["sha256"] = str(member.get("content_sha256") or entry["sha256"])
             entry["commit"] = str(member.get("source_revision") or entry["commit"])
-    else:
-        guide = state.artifacts.get("human-guide")
-        if guide and guide.status == "ACCEPTED" and guide.accepted_hash:
-            for item in sources:
-                if item["path"] == guide.accepted_path or item["path"].lower().endswith("架构原理与设计指南.md") or item["path"].lower().endswith("human-guide.md"):
-                    item["sha256"] = guide.accepted_hash
-                    accepted_source = guide.metadata.get("accepted_source", {})
-                    if isinstance(accepted_source, dict):
-                        item["commit"] = str(accepted_source.get("commit_sha") or item["commit"])
-                    break
+
+    # The current accepted Human Guide is authoritative even when the active
+    # artifact belongs to an older propagation.  Historical propagation data
+    # may still be needed for its other set members, but it must never replace
+    # a newer accepted external authority revision in the invocation contract.
+    guide = state.artifacts.get("human-guide")
+    if guide and guide.status == "ACCEPTED" and guide.accepted_hash:
+        for item in sources:
+            if item["path"] == guide.accepted_path or item["path"].lower().endswith("架构原理与设计指南.md") or item["path"].lower().endswith("human-guide.md"):
+                item["sha256"] = guide.accepted_hash
+                accepted_source = guide.metadata.get("accepted_source", {})
+                if isinstance(accepted_source, dict):
+                    item["commit"] = str(accepted_source.get("commit_sha") or item["commit"])
+                break
 
     # A typed artifact promoted by CWO may advance a legacy configured source
     # path.  Render that accepted artifact hash in the execution contract so
