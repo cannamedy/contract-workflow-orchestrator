@@ -16,6 +16,7 @@ from contract_workflow.outcome import make_outcome
 from contract_workflow.prompt_builder import PromptBuilder
 from contract_workflow.runners.base import RunnerResult, run_times
 from contract_workflow.state_store import StateStore
+from contract_workflow.workspace import RunWorkspace
 
 
 class ArtifactRunner:
@@ -164,6 +165,47 @@ class ArtifactPipelineTests(unittest.TestCase):
         )
         self.assertEqual(materialized, {"artifact.md": candidate.resolve()})
         self.assertEqual(materialized["artifact.md"].read_text(), content)
+
+    def test_artifact_review_materializes_exact_linked_candidate_projection(self):
+        config = self.config(
+            "    - id: spec\n      kind: MACHINE_CONTRACT\n      accepted_path: bundle/index.json\n"
+        )
+        store = StateStore(self.state_root)
+        linked_content = "linked candidate\n"
+        linked_hash = hashlib.sha256(linked_content.encode()).hexdigest()
+        content = json.dumps({
+            "candidate_files": [{
+                "path": "bundle/linked.txt",
+                "content": linked_content,
+                "sha256": linked_hash,
+            }],
+        }, indent=2) + "\n"
+        candidate = store.save_artifact_candidate("spec", content)
+        artifact = EngineeringArtifact(
+            "spec", "MACHINE_CONTRACT", ArtifactStatus.REVIEW_REQUIRED.value,
+            candidate_hash=hashlib.sha256(content.encode()).hexdigest(),
+            candidate_path=str(candidate), review_required=True, accepted_path="bundle/index.json",
+        )
+        state = WorkflowState(
+            project_path=str(self.project), artifacts={"spec": artifact},
+            current_artifact_id="spec", current_stage=Stage.ARTIFACT_REVIEW.value,
+        )
+        materialized = Orchestrator(config, store=store)._artifact_materializations(
+            state, Stage.ARTIFACT_REVIEW.value
+        )
+        self.assertEqual(materialized["bundle/index.json"], candidate.resolve())
+        self.assertEqual(materialized["bundle/linked.txt"], linked_content.encode())
+
+        workspace = RunWorkspace.create(
+            self.project, self.state_root, "linked-review", materialized_files=materialized
+        )
+        self.assertEqual((workspace.path / "bundle/index.json").read_text(), content)
+        self.assertEqual((workspace.path / "bundle/linked.txt").read_text(), linked_content)
+
+        patch_materialized = Orchestrator(config, store=store)._artifact_materializations(
+            state, Stage.ARTIFACT_PATCH.value
+        )
+        self.assertEqual(patch_materialized, {"bundle/index.json": candidate.resolve()})
 
     def test_optional_artifact_can_be_skipped_and_missing_skill_is_diagnostic(self):
         config = self.config("    - id: optional\n      kind: MACHINE_CONTRACT\n      optional: true\n      enabled: false\n      skill_role: machine_contract\n")

@@ -869,7 +869,7 @@ class Orchestrator:
         outcome_path = run_dir / "outcome.json"
         authority_before = self._agent_authority_snapshot()
         try:
-            authority_materializations = self._accepted_authority_materializations(state)
+            authority_materializations: dict[str, Path | bytes] = self._accepted_authority_materializations(state)
             authority_materializations.update(self._artifact_materializations(state, stage))
             workspace = RunWorkspace.create(
                 Path(self.config.project_path),
@@ -891,8 +891,9 @@ class Orchestrator:
             "authority_materializations": [
                 {
                     "path": relative,
-                    "snapshot_path": str(source),
-                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "snapshot_path": str(source) if isinstance(source, Path) else None,
+                    "sha256": hashlib.sha256(source if isinstance(source, bytes) else source.read_bytes()).hexdigest(),
+                    "source": "embedded_candidate" if isinstance(source, bytes) else "snapshot",
                 }
                 for relative, source in sorted(authority_materializations.items())
             ],
@@ -1460,7 +1461,7 @@ class Orchestrator:
                 materializations[member.path] = snapshot
         return materializations
 
-    def _artifact_materializations(self, state: WorkflowState, stage: str) -> dict[str, Path]:
+    def _artifact_materializations(self, state: WorkflowState, stage: str) -> dict[str, Path | bytes]:
         """Project the exact external artifact candidate into Agent review/patch views.
 
         Artifact candidates live in the external CWO store until promotion.
@@ -1487,7 +1488,21 @@ class Orchestrator:
             destination = destination.relative_to(project)
         if destination.is_absolute() or ".." in destination.parts or ".git" in destination.parts:
             raise WorkspaceError(f"unsafe artifact review destination: {spec.accepted_path}")
-        return {destination.as_posix(): source}
+        materializations: dict[str, Path | bytes] = {destination.as_posix(): source}
+        if stage != Stage.ARTIFACT_REVIEW.value:
+            return materializations
+        projection, errors = candidate_projection(
+            project,
+            source,
+            spec.accepted_path,
+            previous_accepted_sha256=artifact.accepted_hash,
+        )
+        if errors:
+            raise WorkspaceError("invalid linked artifact review projection: " + "; ".join(errors))
+        for item in projection:
+            if not item.primary:
+                materializations[item.path] = item.content
+        return materializations
 
     def _apply_outcome(self, state: WorkflowState, outcome: dict[str, Any]) -> StepResult:
         stage = state.current_stage

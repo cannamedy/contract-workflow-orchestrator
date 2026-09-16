@@ -385,6 +385,11 @@ projection。这不允许 candidate 自行授权任意 project path：linked fil
 before/new hash，再以可恢复的多文件事务提交。任意部分提交或第三种 target hash 都不得进入
 `ACCEPTED`。
 
+Independent semantic review 必须看到与 Project Validator 相同的完整 linked projection，而不是
+“主 candidate + real project 旧文件”的混合视图。CWO 在 review RunWorkspace 中按 candidate
+声明的 content/hash 物化全部 linked files；这只是隔离的只读审查视图，不扩大 patch scope，也
+不会直接写入真实项目。否则 reviewer 直接运行 validator 时会把未物化文件误判为 candidate 缺陷。
+
 ## 10. Scheduling、Gate 与 Recovery
 
 CWO 使用依赖感知 scheduler 维护 work item 状态。直接受影响的 work 可进入

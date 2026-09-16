@@ -127,7 +127,7 @@ class RunWorkspace:
         real_project: Path,
         state_root: Path,
         run_id: str,
-        materialized_files: Mapping[str, Path] | None = None,
+        materialized_files: Mapping[str, Path | bytes] | None = None,
         snapshot_attempts: int = 1,
     ) -> "RunWorkspace":
         if snapshot_attempts < 1:
@@ -145,12 +145,18 @@ class RunWorkspace:
             _copy_tree(real_project, path, real_project, excluded)
             for relative, source in sorted((materialized_files or {}).items()):
                 destination = path / _safe_relative(relative)
-                source = Path(source).expanduser().resolve()
-                if source.is_symlink() or not source.is_file():
-                    shutil.rmtree(workspace_root, ignore_errors=True)
-                    raise WorkspaceError(f"materialized source is not a regular file: {source}")
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+                if isinstance(source, bytes):
+                    if destination.exists() and not destination.is_file():
+                        shutil.rmtree(workspace_root, ignore_errors=True)
+                        raise WorkspaceError(f"materialized destination is not a regular file: {destination}")
+                    destination.write_bytes(source)
+                else:
+                    source = Path(source).expanduser().resolve()
+                    if source.is_symlink() or not source.is_file():
+                        shutil.rmtree(workspace_root, ignore_errors=True)
+                        raise WorkspaceError(f"materialized source is not a regular file: {source}")
+                    shutil.copy2(source, destination)
             after = real_fingerprint(real_project, excluded)
             if before == after:
                 return cls(real_project, path, tree_fingerprint(path), before, excluded)

@@ -31,6 +31,11 @@ projection，而不是仅供描述的旁路内容。Linked path 必须位于 con
 只能创建，不能覆盖。Project Validator workspace 必须同时物化主文件和全部 linked files，且
 validator evidence 必须固定完整 projection。
 
+Independent Reviewer 的 RunWorkspace 也必须物化同一组 hash-checked linked projection。语义
+review 若只看到主 candidate，而其余路径仍来自 real-project baseline，会产生不可采信的
+missing/stale-file finding，并使 Validator 与 Reviewer 实际审查不同的 artifact。Review
+materialization 不改变 patch 的可写 scope；`ARTIFACT_PATCH` 仍只允许主 candidate 文件发生变化。
+
 Artifact 只有在 candidate、upstream、validator、review、Decision、drift 和依赖前置条件
 均满足时，才由 deterministic CWO code 从 `APPROVED` 经 `PROMOTION_READY` 变为 `ACCEPTED`。
 Agent shell 不直接复制或覆盖 accepted artifact。`HUMAN_GATE` 复用既有 HumanDecision，
