@@ -15,6 +15,7 @@
 | [ADR-006](ADR-006-candidate-revision-rollover.md) | 未接受 Authority Candidate 的 revision rollover | Implemented |
 | [ADR-007](ADR-007-human-authority-set.md) | Human Authority Set、多成员权威与 Reference Policy 边界 | Implemented |
 | [ADR-008](ADR-008-artifact-patch-result-contract.md) | Artifact Patch 语义结果、candidate 变化与恢复边界 | Implemented |
+| [ADR-009](ADR-009-nonsemantic-authority-revision.md) | Non-semantic Authority revision 的 provenance-only 接受 | Implemented |
 
 “Implemented”表示该决定已体现在当前 CWO 代码、配置模型或测试中；不表示所有未来扩展都
 已完成，也不追溯虚构历史会议或批准人。PAIS-specific Decision、Requirement 和 review

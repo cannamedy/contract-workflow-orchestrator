@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.17
+Documented version: 0.8.18
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -35,6 +35,9 @@ Repository snapshot observed for this state update:
 - external authority ledger、remote commit/blob/content provenance 和 immutable snapshots。
 - Authority Change Intake、C0-C4 分类结果接收、直接影响声明校验、依赖闭包计算和同一
   Change Record 下的 candidate revision rollover。
+- C0/C1 且无 task/artifact 影响的远端 Authority revision 只更新已接受 provenance：不会启动
+  空 typed propagation、不会把已接受 Engineering Specification 标为 stale，也不会调度 external
+  Human Guide generation；若分析打断了 typed candidate，CWO 会恢复其 validation/review/patch 阶段。
 - typed `EngineeringArtifact` 模型及八种当前支持的 artifact kind；candidate/accepted 分离。
 - generic artifact generation、validation、review、patch stage；`AUTO`、`HUMAN_GATE`、
   `EXTERNAL` promotion policy 和 deterministic promotion primitive。

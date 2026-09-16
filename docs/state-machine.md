@@ -5,7 +5,7 @@
 | INITIALIZING | setup | READY |
 | READY | setup | TASK_EXECUTION |
 | any bounded-run boundary | registered external authority candidate | AUTHORITY_CHANGE_ANALYSIS |
-| AUTHORITY_CHANGE_ANALYSIS | C0/C1, no semantic/task impact | accepted revision, then normal scheduling |
+| AUTHORITY_CHANGE_ANALYSIS | C0/C1, no semantic/task/artifact impact | accept the external revision, rebase provenance only, then resume the interrupted typed stage |
 | AUTHORITY_CHANGE_ANALYSIS | C2-C4 machine-resolvable | scoped authority blockers and unaffected continuation |
 | AUTHORITY_CHANGE_ANALYSIS | unresolved authority ambiguity | existing scoped Decision Request / `WAITING_FOR_HUMAN` when no READY work |
 | CHANGE_PROPAGATION_PLANNING | APPROVED | `CONTRACT_REVISION` / `PLAN_REVISION` / `PLAN_GRAPH_BUILD` according to deterministic propagation plan |
@@ -42,7 +42,7 @@
 
 `HUMAN_PLAN_FREEZE`, `HUMAN_GROUP_APPROVAL`, and `HUMAN_FINAL_ACCEPTANCE` cannot be bypassed by a model outcome. `approve` only releases the exact pending gate.
 
-An authority candidate is not accepted as the new baseline merely because its hash changed. `AUTHORITY_CHANGE_ANALYSIS` persists the candidate and its propagation requirements. Only a C0/C1 analysis with `semantic_change=false` and no affected task auto-accepts. Machine-resolvable semantic changes create external candidate Contract/Plan artifacts and a re-buildable `plan_graph`; accepted artifacts are promoted together only after independent reviews and the existing scoped HumanDecision. An active Agent's unauthorized authority mutation remains `UNAUTHORIZED_AUTHORITY_MUTATION` and enters `HARD_STOP`.
+An authority candidate is not accepted as the new baseline merely because its hash changed. `AUTHORITY_CHANGE_ANALYSIS` persists the candidate and its propagation requirements. Only a C0/C1 analysis with `semantic_change=false` and no affected task or artifact auto-accepts. In a typed pipeline that result does not create an empty propagation and does not stale accepted downstream content: CWO accepts the immutable external revision, updates direct dependency provenance, and resumes an interrupted candidate at validation/review/patch as appropriate. Machine-resolvable semantic changes create external candidate Contract/Plan artifacts and a re-buildable `plan_graph`; accepted artifacts are promoted together only after independent reviews and the existing scoped HumanDecision. An active Agent's unauthorized authority mutation remains `UNAUTHORIZED_AUTHORITY_MUTATION` and enters `HARD_STOP`.
 
 An explicitly configured typed artifact pipeline schedules only artifacts whose dependencies are `ACCEPTED` by default. A downstream spec may explicitly opt into consuming an `APPROVED` candidate, and CWO records the exact upstream hashes for stale derivation detection. Optional disabled artifacts are skipped; unaffected artifacts retain their lifecycle state. Artifact candidate generation and review use generic stages carrying `current_artifact_id`, while task scheduling remains the existing scheduler path.
 

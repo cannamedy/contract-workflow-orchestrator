@@ -438,6 +438,153 @@ class Orchestrator:
             updated_at=now_iso(),
         )
 
+    def _accept_nonsemantic_authority_revision(self, ledger: dict[str, Any], change: dict[str, Any]) -> None:
+        """Accept a C0/C1 remote revision without creating downstream work."""
+        candidate_hash = str(change.get("candidate_sha256", ""))
+        snapshot_raw = change.get("candidate_snapshot_path")
+        candidate_source = (
+            Path(str(snapshot_raw)).expanduser().resolve()
+            if isinstance(snapshot_raw, str) and snapshot_raw
+            else safe_project_path(Path(self.config.project_path), str(change.get("source_path", "")))
+        )
+        if not candidate_hash or candidate_source is None or not candidate_source.is_file() or hashlib.sha256(candidate_source.read_bytes()).hexdigest() != candidate_hash:
+            raise OrchestratorError("non-semantic authority candidate snapshot is missing or has drifted")
+        entry = ledger.setdefault("sources", {}).setdefault(str(change.get("source_id")), {})
+        entry.update({
+            "accepted_sha256": candidate_hash,
+            "candidate_sha256": candidate_hash,
+            "accepted_content_sha256": candidate_hash,
+            "accepted_authority_content_sha256": candidate_hash,
+            "accepted_remote_commit": change.get("candidate_commit"),
+            "accepted_remote_blob": change.get("candidate_blob_sha"),
+            "accepted_authority_blob": change.get("candidate_blob_sha"),
+            "accepted_snapshot_path": str(candidate_source),
+            "candidate_remote_commit": change.get("candidate_commit"),
+            "candidate_remote_blob": change.get("candidate_blob_sha"),
+            "candidate_authority_blob": change.get("candidate_blob_sha"),
+            "candidate_content_sha256": candidate_hash,
+            "candidate_snapshot_path": str(candidate_source),
+            "path": change.get("source_path"),
+            "candidate_path": change.get("source_path"),
+            "status": "ACCEPTED",
+            "change_id": change.get("change_id"),
+        })
+        authority_set_hash = str(change.get("candidate_authority_set_hash", ""))
+        if not authority_set_hash:
+            return
+        manifest_path = Path(str(change.get("candidate_authority_set_snapshot_path", ""))).expanduser().resolve()
+        if not manifest_path.is_file():
+            raise OrchestratorError("non-semantic Human Authority Set manifest is missing")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise OrchestratorError("non-semantic Human Authority Set manifest is invalid") from exc
+        members = canonical_member_records(manifest.get("members", [])) if isinstance(manifest, dict) else []
+        manifest_hash = str(manifest.get("aggregate_hash", "")) if isinstance(manifest, dict) else ""
+        if not members or manifest_hash.lower() != authority_set_hash.lower() or aggregate_authority_set_hash(members).lower() != authority_set_hash.lower():
+            raise OrchestratorError("non-semantic Human Authority Set aggregate hash mismatch")
+        for member in members:
+            snapshot = Path(str(member.get("snapshot_path", ""))).expanduser().resolve()
+            expected = str(member.get("content_sha256", ""))
+            if not snapshot.is_file() or not expected or hashlib.sha256(snapshot.read_bytes()).hexdigest() != expected:
+                raise OrchestratorError(f"non-semantic Human Authority Set member snapshot is missing or drifted: {member.get('member_id')}")
+        ledger["authority_set"] = {
+            **(ledger.get("authority_set", {}) if isinstance(ledger.get("authority_set"), dict) else {}),
+            "accepted_hash": authority_set_hash,
+            "accepted_members": members,
+            "candidate_hash": authority_set_hash,
+            "candidate_members": members,
+            "accepted_commit": change.get("candidate_commit"),
+            "accepted_revision_id": change.get("candidate_revision_id"),
+            "candidate_revision_id": change.get("candidate_revision_id"),
+            "status": "ACCEPTED",
+            "change_id": change.get("change_id"),
+        }
+
+    def _resume_after_nonsemantic_typed_authority(self, state: WorkflowState, change: dict[str, Any], outcome: dict[str, Any]) -> WorkflowState:
+        """Rebase provenance only and resume the interrupted typed stage."""
+        projected = initialize_artifacts(self.config, self.store)
+        artifacts = dict(state.artifacts)
+        guide_ids: set[str] = set()
+        for spec in artifact_specs(self.config):
+            if spec.kind != "HUMAN_GUIDE" or spec.promotion_policy != "EXTERNAL":
+                continue
+            projected_guide = projected.get(spec.id)
+            if projected_guide is None or projected_guide.status != ArtifactStatus.ACCEPTED.value:
+                raise OrchestratorError("accepted non-semantic authority revision did not project to the external Human Guide artifact")
+            artifacts[spec.id] = replace(projected_guide, change_id=str(change.get("change_id")))
+            guide_ids.add(spec.id)
+
+        previous_hash = str(change.get("base_sha256", ""))
+        accepted_hash = str(change.get("candidate_sha256", ""))
+        for artifact_id, artifact in tuple(artifacts.items()):
+            revisions = artifact.metadata.get("dependency_revisions")
+            if not isinstance(revisions, list):
+                continue
+            changed = False
+            rebased: list[dict[str, Any]] = []
+            for revision in revisions:
+                item = dict(revision) if isinstance(revision, dict) else revision
+                if isinstance(item, dict) and item.get("artifact_id") in guide_ids and item.get("hash") == previous_hash:
+                    item.update({
+                        "status": ArtifactStatus.ACCEPTED.value,
+                        "hash": accepted_hash,
+                        "accepted_hash": accepted_hash,
+                        "candidate_hash": None,
+                    })
+                    changed = True
+                rebased.append(item)
+            if changed:
+                history = list(artifact.metadata.get("nonsemantic_authority_revisions", []))
+                history.append({
+                    "change_id": change.get("change_id"),
+                    "classification": change.get("classification"),
+                    "previous_hash": previous_hash,
+                    "accepted_hash": accepted_hash,
+                })
+                artifacts[artifact_id] = replace(artifact, metadata={
+                    **artifact.metadata,
+                    "dependency_revisions": rebased,
+                    "nonsemantic_authority_revisions": history,
+                })
+
+        for artifact in artifacts.values():
+            self.store.save_artifact(artifact.to_dict())
+        current_artifact_id = state.current_artifact_id
+        current_artifact = artifacts.get(current_artifact_id or "")
+        if current_artifact and current_artifact.status == ArtifactStatus.CANDIDATE.value:
+            next_stage = Stage.ARTIFACT_VALIDATION.value
+        elif current_artifact and current_artifact.status == ArtifactStatus.REVIEW_REQUIRED.value:
+            next_stage = Stage.ARTIFACT_REVIEW.value
+        elif current_artifact and current_artifact.status == ArtifactStatus.REQUIRES_PATCH.value:
+            next_stage = Stage.ARTIFACT_PATCH.value
+        else:
+            next_stage = Stage.READY.value
+            current_artifact_id = None
+        current_change_id = current_artifact.change_id if current_artifact and current_artifact.change_id != change.get("change_id") else None
+        propagation = {key: value for key, value in state.propagation.items() if key != change.get("change_id")}
+        resumed = replace(
+            state,
+            artifacts=artifacts,
+            authority_changes={**state.authority_changes, str(change["change_id"]): change},
+            propagation=propagation,
+            current_authority_change_id=current_change_id,
+            current_stage=next_stage,
+            current_artifact_id=current_artifact_id,
+            current_group=None,
+            current_task=None,
+            run_id=None,
+            attempt=0,
+            status=WorkflowStatus.RUNNING.value,
+            last_outcome=outcome,
+            stop_reason=None,
+            stop_code=None,
+            blocked_stage=None,
+            recoverable=False,
+            updated_at=now_iso(),
+        )
+        return recompute(self.config, resumed) if next_stage != Stage.READY.value else schedule(self.config, recompute(self.config, resumed))
+
     def _audit_gate(self, scan: AuthorityScan | None = None) -> tuple[GitAudit, list[str], AuthorityScan]:
         scan = scan or scan_authority_changes(self.config, self.store, self._load_or_initialize_state_only())
         audit_state = self._load_or_initialize_state_only()
@@ -1710,8 +1857,9 @@ class Orchestrator:
         self.store.save_authority_change(record)
         ledger = bootstrap_ledger(self.config, self.store)
         entry = ledger.setdefault("sources", {}).setdefault(record["source_id"], {})
-        if analysis["classification"] in {"C0", "C1"} and not analysis["semantic_change"] and not direct:
-            entry.update({"accepted_sha256": record["candidate_sha256"], "candidate_sha256": record["candidate_sha256"], "path": record["source_path"], "candidate_path": record["source_path"], "status": "ACCEPTED", "change_id": change_id})
+        nonsemantic_acceptance = analysis["classification"] in {"C0", "C1"} and not analysis["semantic_change"] and not direct and not record["affected_artifacts"]
+        if nonsemantic_acceptance:
+            self._accept_nonsemantic_authority_revision(ledger, record)
             record["status"] = "ACCEPTED"
             self.logger.emit("authority_change_auto_accepted", change_id=change_id, classification=analysis["classification"])
         else:
@@ -1740,6 +1888,10 @@ class Orchestrator:
                 blocked_stage=None,
                 recoverable=False,
             )
+            if nonsemantic_acceptance:
+                resumed = self._resume_after_nonsemantic_typed_authority(typed_state, record, outcome)
+                self.logger.emit("nonsemantic_typed_authority_accepted", change_id=change_id, resumed_stage=resumed.current_stage, current_artifact_id=resumed.current_artifact_id)
+                return StepResult(self._save(resumed), "nonsemantic_typed_authority_accepted")
             typed_state = self._start_typed_authority_propagation(typed_state, record)
             if typed_state.current_stage == Stage.WAITING_FOR_HUMAN.value:
                 typed_state = recompute(self.config, typed_state)
@@ -2561,6 +2713,12 @@ class Orchestrator:
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="; ".join(candidate_validation_errors))
             raise OrchestratorError("; ".join(candidate_validation_errors))
         self.logger.emit("recovery_requested", stop_code=state.stop_code, blocked_stage=state.blocked_stage)
+        nonsemantic_recovery, nonsemantic_recovery_errors = self._nonsemantic_typed_authority_recovery(state)
+        if nonsemantic_recovery_errors:
+            self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="; ".join(nonsemantic_recovery_errors))
+            raise OrchestratorError("; ".join(nonsemantic_recovery_errors))
+        if nonsemantic_recovery is not None:
+            return nonsemantic_recovery
         # A process-level interruption can occur before ``_agent_step`` gets
         # a chance to persist RECOVERY_UNCERTAIN.  Treat an unambiguously
         # orphaned running invocation as the same recoverable condition, but
@@ -2947,6 +3105,92 @@ class Orchestrator:
         new_state = replace(state, current_stage=restored_stage, status=WorkflowStatus.RUNNING.value, pending_human_gate=None, run_id=None, attempt=0, stop_reason=None, stop_code=None, blocked_stage=None, recoverable=False, updated_at=now_iso())
         self.logger.emit("hard_stop_recovered", stop_code=state.stop_code, restored_stage=restored_stage)
         return self._save(new_state)
+
+    def _nonsemantic_typed_authority_recovery(self, state: WorkflowState) -> tuple[WorkflowState | None, list[str]]:
+        """Repair the pre-0.8.18 empty-propagation result for C0/C1 authority."""
+        from .models import EngineeringArtifact
+
+        if not self.config.artifact_pipeline_explicit or state.current_stage != Stage.HARD_STOP.value or state.run_id is not None:
+            return None, []
+        outcome = state.last_outcome if isinstance(state.last_outcome, dict) else {}
+        analysis = outcome.get("authority_change") if isinstance(outcome.get("authority_change"), dict) else None
+        if not analysis or analysis.get("classification") not in {"C0", "C1"} or analysis.get("semantic_change") is not False:
+            return None, []
+        if any(analysis.get(key) for key in ("directly_affected_tasks", "dependency_affected_tasks", "directly_affected_artifacts", "dependency_affected_artifacts", "affected_artifacts")):
+            return None, []
+        change_id = str(analysis.get("change_id", ""))
+        change = dict(state.authority_changes.get(change_id, {}))
+        propagation = state.propagation.get(change_id, {})
+        if not change_id or not change or not isinstance(propagation, dict) or propagation.get("artifact_order") not in (None, []):
+            return None, []
+        errors: list[str] = []
+        if change.get("candidate_sha256") != analysis.get("candidate_sha256") or change.get("base_sha256") != analysis.get("base_sha256"):
+            errors.append("non-semantic authority recovery identity does not match the analyzed revision")
+        if any(_read_json(path).get("status") == "running" for path in self.store.runs_path.glob("*/metadata.json")):
+            errors.append("RECOVERY_UNCERTAIN: an Agent invocation is still running")
+        records: dict[str, EngineeringArtifact] = {}
+        for spec in artifact_specs(self.config):
+            path = self.store.artifacts_path / f"{spec.id}.json"
+            raw = _read_json(path)
+            if not raw:
+                errors.append(f"non-semantic authority recovery is missing artifact record {spec.id}")
+                continue
+            try:
+                artifact = EngineeringArtifact.from_dict(raw)
+            except (TypeError, ValueError) as exc:
+                errors.append(f"non-semantic authority recovery has invalid artifact record {spec.id}: {exc}")
+                continue
+            if artifact.id != spec.id or artifact.kind != spec.kind:
+                errors.append(f"non-semantic authority recovery artifact identity mismatch: {spec.id}")
+                continue
+            prior = state.artifacts.get(spec.id)
+            if prior and prior.accepted_hash and artifact.accepted_hash != prior.accepted_hash:
+                errors.append(f"non-semantic authority recovery accepted hash mismatch: {spec.id}")
+            if artifact.status == ArtifactStatus.CANDIDATE.value and not self._stored_candidate_matches(spec.id, artifact):
+                errors.append(f"non-semantic authority recovery candidate store mismatch: {spec.id}")
+            records[spec.id] = artifact
+        candidates = [artifact.id for artifact in records.values() if artifact.status == ArtifactStatus.CANDIDATE.value]
+        if len(candidates) > 1:
+            errors.append("non-semantic authority recovery found multiple interrupted artifact candidates")
+        if errors:
+            return None, errors
+
+        record = {**change, **analysis, "affected_artifacts": [], "status": "ACCEPTED", "recovered_at": now_iso()}
+        ledger = bootstrap_ledger(self.config, self.store)
+        self._accept_nonsemantic_authority_revision(ledger, record)
+        self.store.save_authority_ledger(ledger)
+        self.store.save_authority_change(record)
+        self.store.save_propagation_json(change_id, "propagation-plan.json", {
+            **propagation,
+            "status": "NOOP_ACCEPTED",
+            "artifact_order": [],
+            "next_stage": None,
+            "completed_at": now_iso(),
+        })
+        recovered_base = replace(
+            state,
+            artifacts=records,
+            authority_changes={**state.authority_changes, change_id: record},
+            current_artifact_id=candidates[0] if candidates else None,
+            current_stage=Stage.AUTHORITY_CHANGE_ANALYSIS.value,
+        )
+        recovered = self._resume_after_nonsemantic_typed_authority(recovered_base, record, outcome)
+        recovery_events = self.store.root / "recovery-events"
+        recovery_events.mkdir(parents=True, exist_ok=True)
+        _write_json(recovery_events / f"nonsemantic-authority-{change_id}.json", {
+            "type": "NONSEMANTIC_TYPED_AUTHORITY_RECOVERY",
+            "owner": "CWO_RUNTIME",
+            "change_id": change_id,
+            "classification": analysis.get("classification"),
+            "restored_artifact_records": sorted(records),
+            "resumed_stage": recovered.current_stage,
+            "current_artifact_id": recovered.current_artifact_id,
+            "candidate_adopted": False,
+            "failed_workspace_adopted": False,
+            "recovered_at": now_iso(),
+        })
+        self.logger.emit("nonsemantic_typed_authority_recovered", change_id=change_id, resumed_stage=recovered.current_stage, current_artifact_id=recovered.current_artifact_id)
+        return self._save(recovered), []
 
     def _stored_candidate_matches(self, artifact_id: str, artifact: Any) -> bool:
         """Return whether the durable CWO candidate is the exact recorded candidate."""
