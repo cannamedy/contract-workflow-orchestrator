@@ -127,6 +127,67 @@ class ValidatorSeamTests(unittest.TestCase):
         self.assertEqual((self.project / "artifact.md").exists(), False)
         self.assertEqual(result.evidence["source_sha256"], result.evidence["candidate_hash"])
 
+    def test_validator_materializes_exact_linked_candidate_projection(self):
+        linked_content = "linked candidate\n"
+        linked_hash = hashlib.sha256(linked_content.encode()).hexdigest()
+        content = json.dumps(
+            {"candidate_files": [{"path": "linked.txt", "content": linked_content, "sha256": linked_hash}]},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        (self.project / "validator.py").write_text(
+            textwrap.dedent(
+                """
+                import hashlib, json, pathlib, sys
+                artifact = pathlib.Path('artifact.md')
+                linked = pathlib.Path('linked.txt')
+                passed = artifact.is_file() and linked.read_text() == 'linked candidate\\n'
+                print(json.dumps({
+                    'validator': sys.argv[1],
+                    'status': 'PASS' if passed else 'FAIL',
+                    'source_sha256': hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    'findings': [],
+                }))
+                raise SystemExit(0 if passed else 1)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config, spec = self.make_config()
+        store, artifact = self.artifact_and_candidate(config, spec, content.encode())
+        state = WorkflowState(project_path=str(self.project), artifacts={"spec": artifact})
+        result = execute_project_validator(
+            config, state, artifact, spec,
+            state_root=self.state_root, upstream_hashes=[], timeout_seconds=10,
+        )
+        self.assertEqual(result.kind, "PASS")
+        self.assertEqual(len(result.evidence["candidate_projection"]), 2)
+        self.assertFalse((self.project / "linked.txt").exists())
+
+    def test_linked_candidate_cannot_replace_validator_entrypoint(self):
+        injected = "print('forged pass')\n"
+        content = json.dumps(
+            {"candidate_files": [{
+                "path": "validator.py",
+                "content": injected,
+                "sha256": hashlib.sha256(injected.encode()).hexdigest(),
+                "accepted_sha256": hashlib.sha256((self.project / "validator.py").read_bytes()).hexdigest(),
+            }]},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        config, spec = self.make_config()
+        store, artifact = self.artifact_and_candidate(config, spec, content.encode())
+        state = WorkflowState(project_path=str(self.project), artifacts={"spec": artifact})
+        result = execute_project_validator(
+            config, state, artifact, spec,
+            state_root=self.state_root, upstream_hashes=[], timeout_seconds=10,
+        )
+        self.assertEqual(result.kind, "ARTIFACT_FAIL")
+        self.assertEqual(result.code, "CANDIDATE_PROJECTION_INVALID")
+        self.assertIn("protected validator inputs", result.message)
+
     def test_pass_with_warnings_is_accepted_for_review(self):
         result, _ = self.run_validator("warn")
         self.assertEqual(result.kind, "PASS")

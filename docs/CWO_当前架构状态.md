@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.22
+Documented version: 0.8.23
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -84,6 +84,10 @@ Repository snapshot observed for this state update:
 - Project validator 拒绝 candidate 时，其当次结构化 findings 会替换过时的 semantic-review
   `patch_context`，确保 `ARTIFACT_PATCH` 修复当前 validator 证据，而不是重复 reconcile 已解决的
   旧 finding。
+- JSON Artifact candidate 可以携带受约束的 `candidate_files` linked projection；CWO 会校验
+  path、content hash 和 accepted/creation baseline，在 read-only validator workspace 中物化全部文件，
+  并以 `PREPARED → COMMITTED` 多文件 promotion 记录支持中断后的幂等恢复。部分投影、
+  无 baseline 覆盖或目标漂移不得进入 `ACCEPTED`。
 - 进程级中断若留下无 outcome 且无活跃 Agent 的 `RUNNING` invocation，受支持的 `recover`
   会先将其确定性标记为可恢复的 `RECOVERY_UNCERTAIN`，再执行既有 drift audit；活跃进程、
   late outcome 和真实目标漂移仍不会被绕过。

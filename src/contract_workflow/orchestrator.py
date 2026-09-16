@@ -16,6 +16,7 @@ from .git_audit import GitAudit, audit_git, source_integrity, working_tree_paths
 from .authority import AuthorityScan, authority_snapshot, dependency_tasks, scan_authority_changes, validate_analysis, bootstrap_ledger, source_id
 from .authority_set import aggregate_authority_set_hash, canonical_member_records
 from .artifacts import artifact_impact_closure, artifact_specs, canonical_candidate_content, dependency_revisions, effective_artifact_specs, hydrate_external_artifacts, hydrate_typed_artifacts, initialize_artifacts, missing_skill_roles, typed_plan_graph_prerequisite_errors, validate_artifact_outcome, validate_artifact_patch_result, validate_artifact_promotion, validate_final_conformance, reconcile_artifact_impact
+from .candidate_projection import CandidateProjectionFile, candidate_projection
 from .plan_graph import reconcile_plan_graph, validate_plan_graph
 from .propagation import PROPAGATION_STAGES, canonical_digest, contract_text, propagation_steps, safe_project_path, source_path_for_role, validate_candidate_artifacts, validate_propagation_plan, validate_rebase
 from .logging import EventLogger
@@ -1751,52 +1752,103 @@ class Orchestrator:
         spec = next(item for item in self.config.artifact_pipeline if item.id == artifact_id)
         existing = self.store.load_artifact_promotion(artifact_id)
         destination = self._artifact_acceptance_path(artifact_id)
+        candidate = Path(str(artifact.candidate_path))
+        if not candidate.is_file():
+            raise OrchestratorError("artifact promotion candidate is missing")
+        if spec.accepted_path:
+            projection, projection_errors = candidate_projection(
+                Path(self.config.project_path),
+                candidate,
+                spec.accepted_path,
+                previous_accepted_sha256=artifact.accepted_hash,
+            )
+            if projection_errors:
+                raise OrchestratorError("; ".join(projection_errors))
+            projected = [(item, Path(self.config.project_path) / item.path) for item in projection]
+        else:
+            content = candidate.read_bytes()
+            projection = [CandidateProjectionFile(str(destination), content, hashlib.sha256(content).hexdigest(), primary=True, expected_before_sha256=artifact.accepted_hash)]
+            projected = [(projection[0], destination)]
+
+        def target_hash(path: Path) -> str | None:
+            return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+        def all_committed() -> bool:
+            return all(target_hash(target) == item.sha256 for item, target in projected)
+
         if artifact.status == ArtifactStatus.ACCEPTED.value and artifact.accepted_hash == artifact.candidate_hash:
-            return state
+            if all_committed():
+                return state
+            raise OrchestratorError("accepted linked artifact projection drifted")
         if isinstance(existing, dict) and existing.get("status") == "COMMITTED" and existing.get("new_accepted_hash") == artifact.candidate_hash:
-            if destination.is_file() and hashlib.sha256(destination.read_bytes()).hexdigest() == artifact.candidate_hash:
+            if all_committed():
                 return self._finalize_artifact_acceptance(state, artifact_id, destination, existing)
-        if isinstance(existing, dict) and existing.get("status") == "PREPARED":
-            target_hash = hashlib.sha256(destination.read_bytes()).hexdigest() if destination.is_file() else None
-            if target_hash == existing.get("new_accepted_hash") == artifact.candidate_hash:
-                existing["status"] = "COMMITTED"
-                existing["after_accepted_hash"] = target_hash
-                self.store.save_artifact_promotion(artifact_id, existing)
-                return self._finalize_artifact_acceptance(state, artifact_id, destination, existing)
-            if target_hash not in {None, existing.get("before_accepted_hash"), existing.get("previous_accepted_hash")}:
-                raise OrchestratorError("artifact promotion target drifted during recovery")
+            raise OrchestratorError("committed linked artifact projection drifted")
         spec_uses_external_store = not spec.accepted_path
         if spec_uses_external_store and destination.exists() and not isinstance(existing, dict):
             raise OrchestratorError("artifact accepted target drifted before first promotion")
-        errors = validate_artifact_promotion(self.config, state, artifact_id)
+        prepared = isinstance(existing, dict) and existing.get("status") == "PREPARED"
+        validation_state = state
+        if prepared and target_hash(destination) == artifact.candidate_hash:
+            validation_artifact = replace(artifact, accepted_hash=artifact.candidate_hash)
+            validation_state = replace(state, artifacts={**state.artifacts, artifact_id: validation_artifact})
+        errors = validate_artifact_promotion(self.config, validation_state, artifact_id)
         if errors:
             raise OrchestratorError("; ".join(errors))
-        candidate = Path(str(artifact.candidate_path))
-        content = candidate.read_bytes()
         before_hash = hashlib.sha256(destination.read_bytes()).hexdigest() if destination.is_file() else None
-        if isinstance(existing, dict) and existing.get("status") == "PREPARED":
-            if existing.get("candidate_hash") != artifact.candidate_hash or existing.get("before_accepted_hash") != before_hash:
+        if prepared:
+            recorded_files = existing.get("files")
+            if existing.get("candidate_hash") != artifact.candidate_hash or not isinstance(recorded_files, list):
                 raise OrchestratorError("artifact promotion precondition changed during recovery")
+            expected_files = {(str(target), item.sha256) for item, target in projected}
+            if {(str(item.get("path")), str(item.get("new_sha256"))) for item in recorded_files if isinstance(item, dict)} != expected_files:
+                raise OrchestratorError("artifact promotion projection changed during recovery")
+            for file_record in recorded_files:
+                target = Path(str(file_record["path"]))
+                current = target_hash(target)
+                if current not in {file_record.get("before_sha256"), file_record.get("new_sha256")}:
+                    raise OrchestratorError(f"artifact promotion target drifted during recovery: {target}")
         review = artifact.metadata.get("review", {})
         validator = artifact.metadata.get("validator", {})
-        record = {
-            "artifact_id": artifact_id,
-            "artifact_kind": spec.kind,
-            "status": "PREPARED",
-            "previous_accepted_hash": artifact.accepted_hash,
-            "before_accepted_hash": before_hash,
-            "new_accepted_hash": artifact.candidate_hash,
-            "candidate_hash": artifact.candidate_hash,
-            "change_id": artifact.change_id,
-            "derived_from": dependency_revisions(self.config, state, spec),
-            "review_evidence": review,
-            "validator_evidence": validator,
-            "promotion_policy": spec.promotion_policy,
-            "promotion_time": now_iso(),
-            "accepted_path": str(destination),
-        }
-        self.store.save_artifact_promotion(artifact_id, record)
-        self._atomic_write_bytes(destination, content)
+        if prepared:
+            record = existing
+        else:
+            record = {
+                "artifact_id": artifact_id,
+                "artifact_kind": spec.kind,
+                "status": "PREPARED",
+                "previous_accepted_hash": artifact.accepted_hash,
+                "before_accepted_hash": before_hash,
+                "new_accepted_hash": artifact.candidate_hash,
+                "candidate_hash": artifact.candidate_hash,
+                "change_id": artifact.change_id,
+                "derived_from": dependency_revisions(self.config, state, spec),
+                "review_evidence": review,
+                "validator_evidence": validator,
+                "promotion_policy": spec.promotion_policy,
+                "promotion_time": now_iso(),
+                "accepted_path": str(destination),
+                "files": [
+                    {
+                        "path": str(target),
+                        "relative_path": item.path,
+                        "primary": item.primary,
+                        "before_sha256": target_hash(target),
+                        "new_sha256": item.sha256,
+                    }
+                    for item, target in projected
+                ],
+            }
+            self.store.save_artifact_promotion(artifact_id, record)
+        records_by_path = {str(item["path"]): item for item in record["files"]}
+        for item, target in projected:
+            file_record = records_by_path[str(target)]
+            current = target_hash(target)
+            if current == item.sha256:
+                continue
+            if current != file_record.get("before_sha256"):
+                raise OrchestratorError(f"artifact promotion target drifted before write: {target}")
+            self._atomic_write_bytes(target, item.content)
         record["status"] = "COMMITTED"
         record["after_accepted_hash"] = artifact.candidate_hash
         self.store.save_artifact_promotion(artifact_id, record)
@@ -1814,6 +1866,7 @@ class Orchestrator:
                 **artifact.metadata,
                 "promotion": record,
                 "promotion_history": [*(artifact.metadata.get("promotion_history", []) or []), record],
+                "accepted_projection": record.get("files", []),
             },
         )
         self.store.save_artifact(accepted.to_dict())

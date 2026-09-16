@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .candidate_projection import candidate_projection, projection_evidence, projection_target_errors
 from .models import ArtifactStatus, ArtifactSpec, EngineeringArtifact, ProjectValidatorConfig, WorkflowConfig, WorkflowState, now_iso
 from .workspace import RunWorkspace, WorkspaceError, tree_fingerprint
 
@@ -91,6 +92,12 @@ def _materialize_file(workspace: RunWorkspace, source: Path, destination: Path) 
     target = workspace.path / _safe_relative(destination.as_posix())
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(source.read_bytes())
+
+
+def _materialize_bytes(workspace: RunWorkspace, content: bytes, destination: Path) -> None:
+    target = workspace.path / _safe_relative(destination.as_posix())
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
 
 
 def _configured_command(config: WorkflowConfig, role: str, workspace: Path) -> tuple[str, ...]:
@@ -184,14 +191,59 @@ def execute_project_validator(
         return ProjectValidatorResult("INFRA_FAIL", evidence, "PROJECT_VALIDATOR_EXECUTION_FAILED", "candidate artifact is missing")
     if _sha256(candidate) != candidate_hash:
         return ProjectValidatorResult("INFRA_FAIL", evidence, "VALIDATOR_CANDIDATE_HASH_MISMATCH", "candidate file hash does not match artifact candidate_hash")
+    if not spec.accepted_path:
+        return ProjectValidatorResult("INFRA_FAIL", evidence, "PROJECT_VALIDATOR_EXECUTION_FAILED", f"artifact {artifact.id} has no project-relative accepted_path for validator materialization")
+    projection, projection_errors = candidate_projection(
+        Path(config.project_path),
+        candidate,
+        spec.accepted_path,
+        previous_accepted_sha256=artifact.accepted_hash,
+    )
+    protected_paths: set[str] = {_safe_relative(config.project_validators.entrypoint).as_posix()} if config.project_validators else set()
+    for source in config.authoritative_sources:
+        relative = _project_relative(config, source.path)
+        if relative is not None:
+            protected_paths.add(relative.as_posix())
+    for member in config.authority_members:
+        relative = _project_relative(config, member.path)
+        if relative is not None:
+            protected_paths.add(relative.as_posix())
+    for dependency_id in spec.dependencies:
+        dependency_spec = next((item for item in config.artifact_pipeline if item.id == dependency_id), None)
+        relative = _project_relative(config, dependency_spec.accepted_path) if dependency_spec else None
+        if relative is not None:
+            protected_paths.add(relative.as_posix())
+    collisions = [item.path for item in projection if not item.primary and item.path in protected_paths]
+    if collisions:
+        projection_errors.append(f"linked candidate projection overlaps protected validator inputs: {', '.join(sorted(collisions))}")
+    projection_errors.extend(projection_target_errors(Path(config.project_path), projection))
+    evidence["candidate_projection"] = projection_evidence(projection)
+    if projection_errors:
+        evidence.update(
+            {
+                "status": "FAIL",
+                "findings": [
+                    {
+                        "code": "CANDIDATE_PROJECTION_INVALID",
+                        "severity": "ERROR",
+                        "message": message,
+                        "artifact": spec.accepted_path,
+                    }
+                    for message in projection_errors
+                ],
+            }
+        )
+        return ProjectValidatorResult("ARTIFACT_FAIL", evidence, "CANDIDATE_PROJECTION_INVALID", "; ".join(projection_errors))
 
     workspace: RunWorkspace | None = None
     try:
         workspace = RunWorkspace.create(Path(config.project_path), state_root, f"validator-{validation_id}")
-        destination = _authority_destination(config, spec)
-        if destination is None:
-            raise WorkspaceError(f"artifact {artifact.id} has no project-relative accepted_path for validator materialization")
-        _materialize_file(workspace, candidate, destination)
+        for projected in projection:
+            destination = Path(projected.path)
+            if projected.primary:
+                _materialize_file(workspace, candidate, destination)
+            else:
+                _materialize_bytes(workspace, projected.content, destination)
 
         # External accepted artifacts (notably remote Human Guide snapshots)
         # are projected at their configured project path. Accepted artifacts

@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from .candidate_projection import candidate_projection, projection_evidence, projection_target_errors
 from .models import ARTIFACT_KINDS, ArtifactSpec, ArtifactStatus, DecisionStatus, EngineeringArtifact, WorkflowConfig, WorkflowState
 from .project_validator import INTERNAL_VALIDATOR_ROLES
 
@@ -473,6 +474,36 @@ def validate_artifact_promotion(config: WorkflowConfig, state: WorkflowState, ar
         return [f"artifact {artifact_id} candidate is missing"]
     if hashlib.sha256(candidate.read_bytes()).hexdigest() != artifact.candidate_hash:
         return [f"artifact {artifact_id} candidate hash mismatch"]
+    projection = []
+    if spec.promotion_policy != "EXTERNAL" and spec.accepted_path:
+        projection, projection_errors = candidate_projection(
+            Path(config.project_path),
+            candidate,
+            spec.accepted_path,
+            previous_accepted_sha256=artifact.accepted_hash,
+        )
+        if projection_errors:
+            return [f"artifact {artifact_id} candidate projection is invalid: {message}" for message in projection_errors]
+        target_errors = projection_target_errors(Path(config.project_path), projection)
+        if target_errors:
+            return [f"artifact {artifact_id} {message}" for message in target_errors]
+        protected: set[Path] = set()
+        project = Path(config.project_path).resolve()
+        for source in config.authoritative_sources:
+            path = Path(source.path)
+            protected.add((path if path.is_absolute() else project / path).resolve())
+        for member in config.authority_members:
+            protected.add((project / member.path).resolve())
+        if config.project_validators:
+            protected.add((project / config.project_validators.entrypoint).resolve())
+        for other_id, other in state.artifacts.items():
+            if other_id == artifact_id or not other.accepted_path:
+                continue
+            path = Path(other.accepted_path)
+            protected.add((path if path.is_absolute() else project / path).resolve())
+        collisions = [item.path for item in projection if not item.primary and (project / item.path).resolve() in protected]
+        if collisions:
+            return [f"artifact {artifact_id} linked candidate projection overlaps protected paths: {', '.join(sorted(collisions))}"]
     review = artifact.metadata.get("review")
     if artifact.review_required and (not isinstance(review, dict) or review.get("verdict") != "APPROVED"):
         return [f"artifact {artifact_id} has no approved semantic review evidence"]
@@ -486,6 +517,8 @@ def validate_artifact_promotion(config: WorkflowConfig, state: WorkflowState, ar
         return [f"artifact {artifact_id} validator role evidence is stale"]
     if external_validator and isinstance(validator, dict) and validator.get("source_sha256") != artifact.candidate_hash:
         return [f"artifact {artifact_id} validator candidate hash evidence is stale"]
+    if external_validator and len(projection) > 1 and validator.get("candidate_projection") != projection_evidence(projection):
+        return [f"artifact {artifact_id} validator linked candidate projection evidence is stale"]
     if not _dependencies_satisfied(config, state, spec):
         return [f"artifact {artifact_id} has unaccepted upstream dependencies"]
     expected_revisions = artifact.metadata.get("dependency_revisions")

@@ -235,6 +235,104 @@ class ArtifactPipelineTests(unittest.TestCase):
         self.assertEqual(repeated.artifacts["spec"].status, ArtifactStatus.ACCEPTED.value)
         self.assertEqual(len(repeated.artifacts["spec"].metadata["promotion_history"]), history_length)
 
+    def test_linked_candidate_projection_is_validated_and_promoted_transactionally(self):
+        config = self.config(
+            "    - id: contract\n"
+            "      kind: MACHINE_CONTRACT\n"
+            "      accepted_path: bundle/index.json\n"
+            "      review_required: false\n"
+        )
+        bundle = self.project / "bundle"
+        bundle.mkdir()
+        primary_before = b'{"old":true}\n'
+        linked_before = b"accepted baseline\n"
+        (bundle / "index.json").write_bytes(primary_before)
+        (bundle / "existing.txt").write_bytes(linked_before)
+        linked_after = "linked candidate\n"
+        created = "new candidate\n"
+        document = {
+            "components": [{
+                "path": "bundle/existing.txt",
+                "accepted_sha256": hashlib.sha256(linked_before).hexdigest(),
+            }],
+            "candidate_files": [
+                {
+                    "path": "bundle/existing.txt",
+                    "content": linked_after,
+                    "sha256": hashlib.sha256(linked_after.encode()).hexdigest(),
+                },
+                {
+                    "path": "bundle/created.txt",
+                    "content": created,
+                    "sha256": hashlib.sha256(created.encode()).hexdigest(),
+                },
+            ],
+        }
+        content = json.dumps(document, sort_keys=True, separators=(",", ":"))
+        store = StateStore(self.state_root)
+        candidate = store.save_artifact_candidate("contract", content)
+        artifact = EngineeringArtifact(
+            "contract", "MACHINE_CONTRACT", ArtifactStatus.PROMOTION_READY.value,
+            accepted_hash=hashlib.sha256(primary_before).hexdigest(),
+            candidate_hash=hashlib.sha256(content.encode()).hexdigest(),
+            candidate_path=str(candidate), accepted_path="bundle/index.json", review_required=False,
+        )
+        state = WorkflowState(project_path=str(self.project), artifacts={"contract": artifact})
+        interrupted = Orchestrator(config, store=store)
+        atomic_write = interrupted._atomic_write_bytes
+        writes = 0
+
+        def interrupt_after_second_write(destination, projected_content):
+            nonlocal writes
+            atomic_write(destination, projected_content)
+            writes += 1
+            if writes == 2:
+                raise OSError("simulated linked projection interruption")
+
+        interrupted._atomic_write_bytes = interrupt_after_second_write
+        with self.assertRaises(OSError):
+            interrupted._promote_artifact(state, "contract")
+        self.assertEqual(store.load_artifact_promotion("contract")["status"], "PREPARED")
+        promoted = Orchestrator(config, store=store)._promote_artifact(state, "contract")
+        self.assertEqual(promoted.artifacts["contract"].status, ArtifactStatus.ACCEPTED.value)
+        self.assertEqual((bundle / "index.json").read_text(), content)
+        self.assertEqual((bundle / "existing.txt").read_text(), linked_after)
+        self.assertEqual((bundle / "created.txt").read_text(), created)
+        record = store.load_artifact_promotion("contract")
+        self.assertEqual(record["status"], "COMMITTED")
+        self.assertEqual(len(record["files"]), 3)
+
+    def test_linked_candidate_creation_refuses_unpinned_existing_target(self):
+        config = self.config(
+            "    - id: contract\n"
+            "      kind: MACHINE_CONTRACT\n"
+            "      accepted_path: bundle/index.json\n"
+            "      review_required: false\n"
+        )
+        bundle = self.project / "bundle"
+        bundle.mkdir()
+        primary_before = b'{"old":true}\n'
+        (bundle / "index.json").write_bytes(primary_before)
+        (bundle / "collision.txt").write_text("user content\n")
+        linked = "candidate\n"
+        content = json.dumps(
+            {"candidate_files": [{"path": "bundle/collision.txt", "content": linked, "sha256": hashlib.sha256(linked.encode()).hexdigest()}]},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        store = StateStore(self.state_root)
+        candidate = store.save_artifact_candidate("contract", content)
+        artifact = EngineeringArtifact(
+            "contract", "MACHINE_CONTRACT", ArtifactStatus.PROMOTION_READY.value,
+            accepted_hash=hashlib.sha256(primary_before).hexdigest(),
+            candidate_hash=hashlib.sha256(content.encode()).hexdigest(),
+            candidate_path=str(candidate), accepted_path="bundle/index.json", review_required=False,
+        )
+        state = WorkflowState(project_path=str(self.project), artifacts={"contract": artifact})
+        errors = validate_artifact_promotion(config, state, "contract")
+        self.assertTrue(any("creation target already exists" in error for error in errors))
+        self.assertEqual((bundle / "collision.txt").read_text(), "user content\n")
+
     def test_prepared_promotion_recovers_without_accepting_half_a_revision(self):
         config = self.config("    - id: spec\n      kind: ENGINEERING_SPEC\n      review_required: false\n")
         store = StateStore(self.state_root)

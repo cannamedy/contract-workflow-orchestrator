@@ -378,6 +378,13 @@ Candidate artifact 的成功完成还必须有确定的内容来源：Agent 返�
 store 中已存在且 hash 完全匹配的内容，才允许用于恢复路径；candidate path、hash 声明、partial
 output 或文件存在本身都不能被当作语义成功。
 
+若主 candidate 是 JSON 并声明 `candidate_files`，CWO 把它视为同一 Artifact 的 linked-file
+projection。这不允许 candidate 自行授权任意 project path：linked files 只能位于 configured
+`accepted_path` 的目录树内，已有文件必须匹配显式 accepted baseline hash，无 baseline 的文件只能
+新建。Validator 必须看到主文件和全部 linked files 的精确投影；promotion 先持久化每个 target 的
+before/new hash，再以可恢复的多文件事务提交。任意部分提交或第三种 target hash 都不得进入
+`ACCEPTED`。
+
 ## 10. Scheduling、Gate 与 Recovery
 
 CWO 使用依赖感知 scheduler 维护 work item 状态。直接受影响的 work 可进入
