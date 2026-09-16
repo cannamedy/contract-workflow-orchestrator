@@ -7,7 +7,7 @@
 当作运行时真相。
 
 ```text
-Documented version: 0.8.18
+Documented version: 0.8.19
 Runtime implementation baseline: e5e7944eb098bbaa14812bcfe8481862df20fa6e
 Architecture memory baseline: 3902849022da3898c1139e2b4c56fb4481806438
 Repository snapshot observed for this state update:
@@ -27,6 +27,9 @@ Repository snapshot observed for this state update:
 - Python 3.11+ package 与 `cwo` CLI。
 - Workflow YAML 加载、schema 校验、workflow digest 和持久化 `WorkflowState`。
 - bounded Agent stages、结构化 `outcome.json`、独立 stdout/stderr 和 run metadata。
+- `max_total_steps` 是单次 `cwo run` invocation 的 scheduler-step budget；持久化 `total_steps`
+  仅作跨 invocation telemetry。预算耗尽形成可恢复 `MAX_TOTAL_STEPS`，不会让长期 workflow 在
+  累计计数到达阈值后永久停止。
 - `READY`、`WAITING_DEPENDENCY`、`BLOCKED_BY_HUMAN_DECISION`、
   `BLOCKED_BY_AUTHORITY_CHANGE`、`SUPERSEDED` 等 work-item 状态及依赖感知 scheduler。
 - scoped HumanDecision、Decision Request、ADR 持久化、`cwo decide` 和局部重新调度。

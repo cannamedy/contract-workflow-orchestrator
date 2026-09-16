@@ -7,11 +7,12 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from contract_workflow.config import load_workflow
 from contract_workflow.git_audit import GitClassification, audit_git, source_integrity, working_tree_paths
-from contract_workflow.models import ArtifactSpec, ArtifactStatus, AuthoritativeSource, DecisionStatus, EngineeringArtifact, Stage, Verdict, WorkItemStatus, WorkflowState
+from contract_workflow.models import ArtifactSpec, ArtifactStatus, AuthoritativeSource, DecisionStatus, EngineeringArtifact, Stage, StepResult, Verdict, WorkItemStatus, WorkflowState
 from contract_workflow.orchestrator import Orchestrator, OrchestratorError
 from contract_workflow.outcome import make_outcome, validate_outcome
 from contract_workflow.prompt_builder import PromptBuilder
@@ -151,6 +152,55 @@ groups:
         self.assertEqual(recovered.status, "RUNNING")
         self.assertEqual(recovered.workflow_digest, changed_config.digest)
         self.assertEqual(recovered.current_stage, Stage.INITIALIZING.value)
+
+    def test_persisted_total_steps_is_telemetry_not_a_step_guard(self):
+        config = self.workflow("autonomous")
+        store = StateStore(self.state)
+        store.save(WorkflowState(
+            project=config.project_name,
+            project_path=config.project_path,
+            workflow_file=config.workflow_file,
+            workflow_digest=config.digest,
+            current_stage=Stage.READY.value,
+            total_steps=config.policy.max_total_steps,
+            status="RUNNING",
+        ))
+
+        advanced = Orchestrator(config, store=store, runner=MockRunner()).step().state
+
+        self.assertNotEqual(advanced.current_stage, Stage.HARD_STOP.value)
+        self.assertIsNone(advanced.stop_code)
+
+    def test_run_step_budget_is_per_invocation_and_explicitly_recoverable(self):
+        config = self.workflow("autonomous")
+        config = replace(config, policy=replace(config.policy, max_total_steps=2))
+        store = StateStore(self.state)
+        running = WorkflowState(
+            project=config.project_name,
+            project_path=config.project_path,
+            workflow_file=config.workflow_file,
+            workflow_digest=config.digest,
+            current_stage=Stage.READY.value,
+            total_steps=37,
+            status="RUNNING",
+        )
+        store.save(running)
+
+        class NoProgressOrchestrator(Orchestrator):
+            def step(self):
+                return StepResult(self.store.load(), "no_progress")
+
+        stopped = NoProgressOrchestrator(config, store=store, runner=MockRunner()).run()
+        self.assertEqual(stopped.current_stage, Stage.HARD_STOP.value)
+        self.assertEqual(stopped.stop_code, "MAX_TOTAL_STEPS")
+        self.assertEqual(stopped.blocked_stage, Stage.READY.value)
+        self.assertTrue(stopped.recoverable)
+        self.assertEqual(stopped.total_steps, 37)
+
+        recovered = Orchestrator(config, store=store, runner=MockRunner()).recover()
+        self.assertEqual(recovered.status, "RUNNING")
+        self.assertEqual(recovered.current_stage, Stage.READY.value)
+        self.assertEqual(recovered.total_steps, 37)
 
     def test_runner_failure_recovery_retries_without_an_outcome_artifact(self):
         config = self.workflow("autonomous")

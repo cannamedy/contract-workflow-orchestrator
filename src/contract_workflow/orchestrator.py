@@ -753,9 +753,6 @@ class Orchestrator:
 
     def step(self) -> StepResult:
         state = self._load_or_initialize()
-        if state.total_steps >= self.config.policy.max_total_steps and state.status == WorkflowStatus.RUNNING.value:
-            state = replace(state, current_stage=Stage.HARD_STOP.value, status=WorkflowStatus.HARD_STOPPED.value, stop_reason="max_total_steps exceeded", stop_code="MAX_TOTAL_STEPS", blocked_stage=state.current_stage, recoverable=False, updated_at=now_iso())
-            return StepResult(self._save(state), "hard_stop")
         authority_result = self._authority_gate(state)
         if authority_result:
             return authority_result
@@ -2172,7 +2169,7 @@ class Orchestrator:
     def run(self, dry_run: bool = False) -> WorkflowState | dict[str, Any]:
         if dry_run:
             return self.dry_run()
-        for _ in range(self.config.policy.max_total_steps + 1):
+        for _ in range(self.config.policy.max_total_steps):
             result = self.step()
             if result.retry_delay:
                 import time
@@ -2181,7 +2178,21 @@ class Orchestrator:
                 return result.state
             if result.state.current_stage in HUMAN_GATES:
                 return result.state
-        return self._load_or_initialize()
+        state = self._load_or_initialize()
+        if state.status != WorkflowStatus.RUNNING.value:
+            return state
+        stopped = replace(
+            state,
+            current_stage=Stage.HARD_STOP.value,
+            status=WorkflowStatus.HARD_STOPPED.value,
+            stop_reason=f"bounded run exceeded max_total_steps={self.config.policy.max_total_steps}",
+            stop_code="MAX_TOTAL_STEPS",
+            blocked_stage=state.current_stage,
+            recoverable=True,
+            updated_at=now_iso(),
+        )
+        self.logger.emit("hard_stop_entered", reason=stopped.stop_reason, stop_code=stopped.stop_code, blocked_stage=stopped.blocked_stage)
+        return self._save(stopped)
 
     def approve(self, gate: str | None = None) -> WorkflowState:
         state = self._load_or_initialize()
@@ -2761,6 +2772,13 @@ class Orchestrator:
             and state.current_stage == Stage.HARD_STOP.value
             and state.run_id is None
         )
+        step_budget_recovery = (
+            state.stop_code == "MAX_TOTAL_STEPS"
+            and state.current_stage == Stage.HARD_STOP.value
+            and bool(state.blocked_stage)
+            and state.blocked_stage != Stage.HARD_STOP.value
+            and state.run_id is None
+        )
         runner_recovery = (
             state.stop_code == "RETRY_EXHAUSTED"
             and isinstance(state.last_outcome, dict)
@@ -2813,7 +2831,7 @@ class Orchestrator:
                 reason="; ".join(artifact_patch_result_errors),
             )
             raise OrchestratorError("; ".join(artifact_patch_result_errors))
-        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or candidate_validation_recovery or workspace_setup_recovery or artifact_patch_result_recovery or schema_recovery or workflow_digest_recovery):
+        if state.current_stage != Stage.HARD_STOP.value or not (legacy_recovery or runner_recovery or interrupted_recovery or artifact_workspace_recovery or typed_promotion_recovery or candidate_validation_recovery or workspace_setup_recovery or artifact_patch_result_recovery or schema_recovery or workflow_digest_recovery or step_budget_recovery):
             self.logger.emit("recovery_validation_failed", stop_code=state.stop_code, blocked_stage=state.blocked_stage, reason="stop is not recoverable")
             raise OrchestratorError("hard stop is not recoverable")
 
